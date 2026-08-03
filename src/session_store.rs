@@ -451,6 +451,48 @@ pub(crate) fn normalize_subagent_snapshots(session: &mut Session) {
         normalize_subagent_snapshots_for_messages(&session.messages, &session.subagent_snapshots);
 }
 
+fn remap_plan_indices_for_message_rewrite(
+    session: &mut Session,
+    old_messages: &[ChatMessage],
+    new_messages: &[ChatMessage],
+) {
+    let Some(plan) = session.pending_plan.as_mut() else {
+        return;
+    };
+    let old = old_messages
+        .iter()
+        .map(serde_json::to_vec)
+        .collect::<Result<Vec<_>, _>>();
+    let new = new_messages
+        .iter()
+        .map(serde_json::to_vec)
+        .collect::<Result<Vec<_>, _>>();
+    let (Ok(old), Ok(new)) = (old, new) else {
+        plan.original_user_message_index = 0;
+        plan.assistant_plan_message_index = 0;
+        return;
+    };
+    let retained = (1..old.len()).find_map(|old_start| {
+        let suffix_len = old.len() - old_start;
+        if suffix_len > new.len().saturating_sub(1) {
+            return None;
+        }
+        (1..=new.len() - suffix_len)
+            .find(|&new_start| old[old_start..] == new[new_start..new_start + suffix_len])
+            .map(|new_start| (old_start, new_start))
+    });
+    let (old_start, new_start) = retained.unwrap_or((old.len(), new.len()));
+    let remap = |index: usize| {
+        if index >= old_start {
+            new_start.saturating_add(index - old_start)
+        } else {
+            0
+        }
+    };
+    plan.original_user_message_index = remap(plan.original_user_message_index);
+    plan.assistant_plan_message_index = remap(plan.assistant_plan_message_index);
+}
+
 pub(crate) fn replace_session_messages(session: &mut Session, new_messages: Vec<ChatMessage>) {
     let old_messages = session.messages.clone();
     session.subagent_snapshots = remap_subagent_snapshots_for_message_rewrite(
@@ -458,6 +500,7 @@ pub(crate) fn replace_session_messages(session: &mut Session, new_messages: Vec<
         &new_messages,
         &session.subagent_snapshots,
     );
+    remap_plan_indices_for_message_rewrite(session, &old_messages, &new_messages);
     session.messages = new_messages;
     retain_failed_tool_results(session);
 }
@@ -550,8 +593,32 @@ async fn save_session_to_disk_inner(session: &Session) -> Result<(), String> {
     }
 }
 
+async fn reset_session_context_on_disk_inner(session: &Session) -> Result<(), String> {
+    #[cfg(not(test))]
+    {
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .reset_session_context(session)
+            .await
+            .map_err(|error| error.to_string())?;
+        SESSION_SAVE_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    {
+        // Unit tests retain the legacy JSON persistence shim. A reset writes
+        // the already-cleared Session snapshot, which contains no plan history.
+        save_session_to_disk_inner(session).await
+    }
+}
+
 pub(crate) async fn save_session_to_disk_locked(session: &Session) -> Result<(), String> {
     save_session_to_disk_inner(session).await
+}
+
+pub(crate) async fn reset_session_context_on_disk_locked(session: &Session) -> Result<(), String> {
+    reset_session_context_on_disk_inner(session).await
 }
 
 #[cfg(test)]
@@ -1077,7 +1144,13 @@ pub(crate) fn build_history_payload_with_s3(
                 {
                     for tc in tcs {
                         tool_names_by_id.insert(tc.id.clone(), tc.function.name.clone());
-                        if tc.function.name == crate::tools::TOOL_NAME_TODOS {
+                        if tc.function.name == crate::tools::TOOL_NAME_TODOS
+                            || matches!(
+                                tc.function.name.as_str(),
+                                crate::plan::TOOL_NAME_SUBMIT_PLAN
+                                    | crate::plan::TOOL_NAME_UPDATE_PLAN
+                            )
+                        {
                             continue;
                         }
                         msgs.push(json!({
@@ -1097,9 +1170,14 @@ pub(crate) fn build_history_payload_with_s3(
                     && let Some(c) = &msg.content
                 {
                     let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("");
-                    if tool_names_by_id.get(tool_call_id).map(String::as_str)
-                        == Some(crate::tools::TOOL_NAME_TODOS)
-                    {
+                    if matches!(
+                        tool_names_by_id.get(tool_call_id).map(String::as_str),
+                        Some(
+                            crate::tools::TOOL_NAME_TODOS
+                                | crate::plan::TOOL_NAME_SUBMIT_PLAN
+                                | crate::plan::TOOL_NAME_UPDATE_PLAN
+                        )
+                    ) {
                         continue;
                     }
                     let snapshot_key = if tool_call_id.is_empty() {
@@ -1157,11 +1235,15 @@ pub(crate) fn build_history_payload_with_s3(
     }
     let mut payload = json!({"type":"history","messages":msgs});
     if let Some(plan) = session.pending_plan.as_ref() {
-        payload["pending_plan"] = json!({
-            "plan_id": &plan.id,
-            "message_index": plan.assistant_plan_message_index,
-            "created_at": plan.created_at,
-        });
+        payload["plans"] = json!([plan.to_live_value()]);
+        if plan.status == crate::plan::PlanStatus::Ready {
+            payload["pending_plan"] = json!({
+                "plan_id": &plan.id,
+                "revision": plan.revision,
+                "message_index": plan.assistant_plan_message_index,
+                "created_at": plan.created_at,
+            });
+        }
     }
     payload
 }

@@ -634,7 +634,7 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
 - `subAgentTimeout = 0` 表示不限时
 - `maxLlmRetries`: 非负整数
 - `enableStateDigest` 默认可开启
-- `enableTaskPlan` 默认关闭；开启后运行期才生成 `TaskPlan`、注入 `## Task Plan` 动态上下文并发送 `task_plan` live event
+- `enableTaskPlan` 默认关闭；界面名称为“自动执行提纲”。开启后仅在没有批准计划的普通 Execute run 中生成 `TaskPlan`、注入 `## Task Plan` 动态上下文并发送 `task_plan` live event；Plan-only 与批准计划执行期间抑制
 
 #### models.providers
 
@@ -1481,7 +1481,9 @@ Group socket 初始化顺序通常为：
 }
 ```
 
-`plan_mode` 为可选布尔值：`true` 表示启动 plan_mode 计划模式，服务端只允许只读探索工具，最终 assistant 消息只产出执行计划，不写文件、不运行命令、不提交推送；`false` 或省略表示直接进入正常执行模式。只规划完成后，服务端会保存一个 `pending_plan` 并发送 `plan_ready`，客户端可再发送 `execute_plan_id` 启动执行。
+`plan_mode` 为可选布尔值：`true` 表示为当前 Session 启动新的结构化计划流程，服务端只允许只读探索工具，并要求模型通过内部 `submit_plan` 返回 `needs_input` 或 `ready`；`false` 或省略表示直接进入正常执行模式。计划流程使用 `plan_id + revision` 乐观并发，状态通过 `plan_state` 持续同步。
+
+每个 Session 同时只允许一个 `planning`、`needs_input`、`ready` 或 `executing` 计划。存在活动计划时，新的普通 Execute 消息会以 `plan_already_active` 拒绝；客户端应先执行、修订或丢弃当前计划。Group socket 不支持 `plan_mode`。
 
 ### 5.2.2 Slash 命令
 
@@ -1539,31 +1541,50 @@ Group socket 初始化顺序通常为：
 - 最多 `10` 张图
 - `plan_mode` 语义同普通消息 JSON；开启时只生成计划，关闭或省略时直接执行
 
-### 5.2.4 执行已批准计划
+### 5.2.4 计划操作
 
-只规划模式完成后，客户端可发送：
+结构化计划的统一请求格式：
 
 ```json
 {
-  "execute_plan_id": "plan_..."
+  "plan_action": {
+    "action": "execute",
+    "plan_id": "plan_...",
+    "revision": 2,
+    "allow_stale": false
+  }
 }
 ```
 
-说明：
+`action` 支持：
 
-- `execute_plan_id` 必须匹配当前 session 的 `pending_plan`
-- 不能与 `text`、`images` 或 `plan_mode` 同时出现；同时出现会返回 `system` 错误
-- 匹配成功后，服务端会清除 `pending_plan`，追加一条内容为 `Proceed with the approved plan.` 的短确认 user 消息，然后以正常执行模式启动 agent
-- 不匹配、已过期或跨 session 使用时会被拒绝
+- `feedback`：回答问题或请求修订；可附带 `text`，以及 `{question_id: answer}` 形式的 `answers`
+- `execute`：执行 `ready` revision；本地证据过期时，用户确认后必须同时回传 `allow_stale: true` 和最近一次 `plan_stale.confirmation_token`
+- `refresh`：重新检查非终态、非执行中的计划并生成新 revision
+- `discard`：丢弃非终态、非执行中的计划
+- `resume`：从已批准且至少开始过一次执行的 `failed` 或 `stopped` 计划继续剩余步骤；规划阶段中断产生的 `stopped` 计划不允许 Resume
+
+所有操作都必须携带当前 `plan_id` 和 `revision`。`plan_action` 不能与 `text`、`images`、`plan_mode` 或 `execute_plan_id` 同时出现。批准、反馈和刷新都不会向历史追加合成 user 消息。反馈/回答会暂存在当前活动计划中，直到模型提交新 revision；若规划在此之前中断，`plan_state.plan.pending_feedback` 会返回该草稿供用户检查并重新提交。刷新提示仍只属于对应 Plan-only run。Runtime 会把精确 revision 作为执行契约注入每个 Agent cycle，并通过 `plan_state` 更新进度。History 的 `plans[]` 最多同步最近 50 个 revision，并始终包含当前 revision。LingClaw 启动时会把数据库中遗留的 `planning`/`executing` 状态恢复为 `stopped`；其中只有保留批准时间和执行次数的执行中断计划可以 Resume。
+
+兼容旧客户端的 `{ "execute_plan_id": "plan_..." }` 仅可执行尚未修订的 revision 1 ready 计划；计划产生新 revision 后必须改用携带明确 revision 的 `plan_action`，避免旧页面批准未展示过的内容。新客户端始终应使用 `plan_action`。稳定错误 code 包括：
+
+- `stale_plan_revision`：页面携带的 revision 已过期，或旧兼容入口尝试执行已修订计划；响应会在 `plan` 字段附带当前 `plan_state` 快照，客户端应立即同步后再操作
+- `plan_not_ready`：当前状态不允许该操作
+- `plan_already_active`：Session 已有活动计划或 run
+- `group_plan_mode_unsupported`：Group 请求规划模式
+- `plan_evidence_verification_failed`：批准或恢复前未能在限定时间内完成本地证据校验
 
 ### 5.2.5 只规划模式工具边界
 
 `plan_mode: true` 的运行会调用大模型，但工具集合受限：
 
-- 内置工具只暴露 `think`、`read_file`、`list_dir`、`search_files`、`http_fetch`
-- MCP 工具只暴露当前 session policy 已启用、且缓存描述符被判定为只读的工具
+- 内置工具只暴露 `think`、`read_file`、`list_dir`、`search_files`、`http_fetch`、受限 `git_inspect`，以及满足图片模型/S3 条件的 `view_image`
+- `git_inspect` 只接受 `status`、`diff`、`log`、`show`，不接受任意 Shell 参数
+- MCP 工具只暴露当前 Session policy 已启用、`annotations.readOnlyHint=true` 且 `annotations.destructiveHint!=true` 的工具；缺少 annotations 时默认禁用。第三方 annotations 属于 LingClaw 信任的服务器声明
 - 不暴露 `todos`、`exec`、`write_file`、`patch_file`、`delete_file`、`task`、`orchestrate`
 - 如果模型仍尝试调用非只读工具，后端会拒绝该调用，不执行对应 handler
+- Plan-only 必须通过内部 `submit_plan` 终结；`needs_input` 包含 1–5 个阻塞问题，`ready` 包含 1–12 个稳定 ID 步骤。结构总量上限 64KB，校验失败时模型可在同一 loop 内修正
+- 不支持 Tool Calling 的 Provider 退化为单步骤 legacy plan，并保留原始 Markdown
 
 ### 5.2.6 忙碌期干预
 
@@ -1592,7 +1613,7 @@ Group socket 初始化顺序通常为：
 
 - `target_mode`: `all` 使用 group 全部成员；`selected` 使用 `targets[]`；`mentions` 从消息中的 `@session-id` 提取，未命中时返回错误，不会回退成全员广播
 - `start_runs`: `true` 时立即派发到目标 session；`false` 仅写入 group 消息
-- `run_mode`: `execute` 正常执行，`plan_only` 使用目标 session 的只规划模式
+- `run_mode`: 当前只支持 `execute`；`plan_only` 返回稳定错误 `group_plan_mode_unsupported`
 - 只有 `@session-id` 是派发协议；前端可把合法 token 显示为 `@Session Name`，但显示名本身不参与解析
 - `@all` 需要 owner/admin 语义；当前浏览器 group UI 使用 `session=main` owner 连接，因此可广播。直接 `@session-id` 的成员必须回复；`@all` 覆盖但未直接点名的成员以可选回复派发，成员返回空或 `NO_REPLY` 时不会写入 group message
 - 成员最终回复中的 `@session-id` 会触发一次后续派发；普通成员回复最多触发一个其他成员，避免无限互相唤起
@@ -1616,7 +1637,7 @@ Group socket 初始化顺序通常为：
 }
 ```
 
-派发是跨 session 异步并发、同一目标 session 串行排队。目标 session 使用自己的模型覆盖、MCP session policy、Skills 和 `settings.enableTaskPlan` 设置；group 不提升任何权限。每个目标 session 收到的用户消息格式固定为 group 上下文摘要加 main 指令，避免修改系统提示。
+派发是跨 session 异步并发、同一目标 session 串行排队。目标 session 使用自己的模型覆盖、MCP session policy 和 Skills；group 不提升任何权限。Group 只运行 Execute，因此 `enableTaskPlan` 仅按普通 Execute run 的兼容规则生效。每个目标 session 收到的用户消息格式固定为 group 上下文摘要加 main 指令，避免修改系统提示。
 
 ### 5.2.8 `session_control` 工具
 
@@ -1635,7 +1656,7 @@ Group socket 初始化顺序通常为：
 - `promote_group_admin`: 把 group 成员升级为 promoted admin；`main` 始终是隐式 owner
 - `remove_group_member`: 移除 group 成员；省略 `requester_session_id` 或传 `main` 时直接移除，传 promoted admin id 时进入/追加 2/3 投票，达到阈值后自动移除
 - `post_group_message`: 只向 group 历史写入 main 消息
-- `dispatch`: 向 `targets[]` 或 `group_id` 成员派发任务，支持 `run_mode=execute|plan_only`、`wait` 和 `summary_budget`
+- `dispatch`: 向 `targets[]` 或 `group_id` 成员派发任务，支持 `run_mode=execute`、`wait` 和 `summary_budget`；兼容字段传入 `plan_only` 时返回 `group_plan_mode_unsupported`
 - `collect`: 汇总指定 group 的最近消息和 run 状态
 - `stop`: 停止指定 targets 或 group 内 queued/running run
 
@@ -1875,10 +1896,56 @@ Group socket 初始化顺序通常为：
 - `tool_call`
 - `tool_result`
 
+History 顶层还可包含结构化计划历史：
+
+```json
+{
+  "plans": [
+    {
+      "plan_id": "plan_...",
+      "revision": 1,
+      "historical": true,
+      "status": "ready",
+      "message_index": 12,
+      "created_at": 1710000000,
+      "updated_at": 1710000010,
+      "artifact": {
+        "title": "更新存储层",
+        "goal": "完成迁移并保持兼容",
+        "summary": "先核验 schema，再实现并验证。",
+        "steps": [
+          { "id": "inspect", "title": "核验现状", "description": "检查 schema 与调用方" }
+        ],
+        "assumptions": [],
+        "risks": [],
+        "verification": ["运行完整测试"],
+        "acceptance_criteria": ["迁移可回滚"],
+        "questions": []
+      },
+      "progress": [
+        { "id": "inspect", "title": "核验现状", "status": "pending", "note": "" }
+      ]
+    }
+  ],
+  "pending_plan": {
+    "plan_id": "plan_...",
+    "revision": 2,
+    "message_index": 14,
+    "created_at": 1710000000
+  }
+}
+```
+
+- `plans[]` 按计划消息位置与 revision 排序；旧 revision 带 `historical:true`，客户端必须只读折叠展示。当前 revision 带 `historical:false`
+- `status` 取值为 `planning`、`needs_input`、`ready`、`executing`、`completed`、`failed`、`stopped`、`discarded`
+- `progress[].status` 取值为 `pending`、`in_progress`、`completed`、`blocked`、`skipped`；适应性步骤可能只存在于 `progress[]`，并携带 `deviation_reason`
+- `unfinished_steps` 与 `run_finished_with_unreported_steps` 表示运行结束后仍未被 Agent 报告完成的步骤；服务端不会自动补成 completed
+- `pending_plan` 仅作为旧客户端兼容入口，在当前计划为 `ready` 时出现；新客户端以 `plans[]` 为准
+
 补充说明：
 
 - `todos` 工具的 `tool_call` / `tool_result` 不会进入这里的可见历史列表
-- `user` / `assistant` 项会包含 `message_index`，用于把 `pending_plan.message_index` 定位回原始 session messages 中的 assistant 计划消息
+- `user` / `assistant` 项会包含 `message_index`，用于把 `plans[].message_index` 定位回对应 assistant 计划消息
 - 顶层 `tool_result.images` 以及 `subagent_snapshot.tools[].images` 为可选字段；每项只包含新鲜签名的 `url`、展示 `name` 和经过校验的 `mime_type`，不会暴露 object key、S3 配置身份或 Base64。若历史图片所属的 S3 配置身份已失效，该图片会被跳过，文本结果仍正常回放
 - 前端应使用 `todos_state` 渲染 todo 面板，而不是从 `history.messages` 反推
 
@@ -1961,7 +2028,7 @@ Group socket 初始化顺序通常为：
 
 ### `task_plan`
 
-启用 `settings.enableTaskPlan` 后，当前顶层主代理 round/cycle 会发送临时规则计划。该事件由规则生成，不调用 LLM；输入包括当前用户请求、运行期 `WorkingState`、任务记忆、最近工具结果、已发现子代理以及当前 session policy 允许的内置/MCP 工具。`task_plan` 进入 live replay，刷新或重连后会恢复当前计划面板；它不会写入 session messages，也不会自动执行其中的验证命令。它和 `plan_mode` 计划模式不是同一个概念：`task_plan` 是运行期软指导，`plan_mode: true` 是“先只规划、不执行”的运行模式。
+启用 `settings.enableTaskPlan`（界面名称“自动执行提纲”）后，没有批准计划的普通 Execute run 会发送临时规则提纲。该事件由规则生成，不调用 LLM；输入包括当前用户请求、运行期 `WorkingState`、任务记忆、最近工具结果、已发现子代理以及当前 Session policy 允许的内置/MCP 工具。`task_plan` 进入 live replay，但不会写入 Session messages，也不会自动执行验证命令。Plan-only 与批准计划执行期间完全抑制该机制，避免与用户批准的结构化计划形成第二套计划。
 
 ```json
 {
@@ -2010,14 +2077,77 @@ Group socket 初始化顺序通常为：
 - `verificationSuggestions[]` 只表示建议模型在合适时机选择执行，runtime 不会自动运行、弹确认或改变工具权限模型
 - `status` 为当前计划状态，通常为 `active` 或 `ready`；收到 `done` 后前端可将面板标记为 complete/stale
 
-### `plan_ready`
+### `plan_state`
 
-只规划模式完成并把 assistant 计划消息写入会话历史后发送。该事件也会通过 `history.pending_plan` 恢复，便于刷新或重连后继续显示“开始执行”按钮。
+计划创建、提问、修订、批准、步骤更新和终态变化都会发送完整快照：
+
+```json
+{
+  "type": "plan_state",
+  "plan": {
+    "plan_id": "plan_...",
+    "revision": 2,
+    "status": "executing",
+    "message_index": 14,
+    "created_at": 1710000000,
+    "updated_at": 1710000100,
+    "approved_at": 1710000090,
+    "execution_attempt": 1,
+    "artifact": {
+      "title": "更新存储层",
+      "goal": "完成迁移并保持兼容",
+      "summary": "按已确认步骤执行。",
+      "steps": [{ "id": "inspect", "title": "核验现状", "description": "" }],
+      "assumptions": [],
+      "risks": [],
+      "verification": ["运行完整测试"],
+      "acceptance_criteria": ["迁移可回滚"],
+      "questions": []
+    },
+    "progress": [
+      { "id": "inspect", "title": "核验现状", "status": "in_progress", "note": "正在检查" }
+    ],
+    "evidence_count": 3,
+    "evidence_truncated": false,
+    "stale_override_paths": [],
+    "stale_override_confirmed_at": null,
+    "initial_submission_pending": false,
+    "initial_request_image_only": false,
+    "unfinished_steps": 1,
+    "run_finished_with_unreported_steps": false
+  }
+}
+```
+
+`initial_submission_pending=true` 表示模型尚未通过 `submit_plan` 交付首个计划 revision，客户端应把 artifact 中的初始占位标题视为内部数据并使用本地化状态文案展示。`initial_request_image_only=true` 进一步表示该初始请求只有图片输入，客户端可显示本地化的图片规划提示。两个字段在已提交的正式 revision 中均为 `false`。Artifact 中使用 `skip_serializing_if` 的空数组字段（例如初始或提问阶段的 `steps`）可能省略，客户端应按空数组处理。
+
+### `plan_stale`
+
+执行或恢复前发现本地证据变化时发送，且不会启动 run：
+
+```json
+{
+  "type": "plan_stale",
+  "code": "plan_stale",
+  "plan_id": "plan_...",
+  "revision": 2,
+  "paths": ["src/main.rs", "frontend/src"],
+  "evidence_incomplete": false,
+  "confirmation_token": "8f4b..."
+}
+```
+
+客户端应让用户选择 `refresh`，或再次发送 `execute/resume`，并同时设置 `allow_stale:true` 与原样回传 `stale_confirmation_token`。确认令牌绑定当前 Plan revision 和本次实际读取到的证据快照；缺少令牌、令牌不匹配，或警告后证据再次变化时，Runtime 会返回新的 `plan_stale`，不会开始执行。确认成功后，Runtime 会在 `stale_override_paths` 记录被覆盖的变化路径，并在 `stale_override_confirmed_at` 持久化本次明确确认的秒级 Unix 时间；即使 `paths` 为空，该时间仍会记录。`evidence_incomplete=true` 表示部分本地证据因采集错误或数量上限未能完整记录，此时 `paths` 可以为空，但仍必须刷新或明确覆盖。本地证据最多记录 256 项；文件/目录使用工作区相对路径与内容指纹，受限 `git_inspect` 使用原查询参数与结果指纹，从而覆盖与该查询相关的工作树、索引和提交变化。MCP/HTTP 外部数据不进入可重新验证路径列表。
+
+### `plan_ready`（兼容事件）
+
+结构化计划进入 `ready` 后仍发送该事件供旧客户端使用。新客户端应使用 `plan_state` 与 History `plans[]`。
 
 ```json
 {
   "type": "plan_ready",
   "plan_id": "plan_...",
+  "revision": 2,
   "message_index": 12,
   "created_at": 1710000000
 }
@@ -2025,7 +2155,8 @@ Group socket 初始化顺序通常为：
 
 字段说明：
 
-- `plan_id`: 当前 session 内待执行计划 id
+- `plan_id`: 当前 Session 内待执行计划 id
+- `revision`: 当前可执行 revision
 - `message_index`: assistant 计划消息在 session messages 中的位置
 - `created_at`: 创建时间戳，秒级 Unix time
 
@@ -2719,7 +2850,7 @@ Provider 映射如下：
 1. 轮询或请求 `GET /api/health`，确认服务可用
 2. 建立 `/ws` 连接
 3. 收到 `session`、`view_state`、`todos_state`、`history` 后初始化 UI
-4. 发送纯文本，或发送带 `text` / `plan_mode` / `images` 的 JSON 消息；若收到 `plan_ready`，可发送 `execute_plan_id` 执行已批准计划
+4. 发送纯文本，或发送带 `text` / `plan_mode` / `images` 的 JSON 消息；通过 `plan_state` 驱动提问、修订与进度 UI，并使用带 `plan_id + revision` 的 `plan_action` 执行计划
 5. 处理 `start -> delta/thinking/tool/* -> done`
 6. 如需本地上传图片：
    - 先调用 `GET /api/client-config`
@@ -2733,7 +2864,7 @@ Provider 映射如下：
 - `/api/config` 在配置文件语法错误时不会返回 4xx，而是返回可恢复信息
 - `/api/sessions` 返回当前已知 session 摘要列表，`main` 固定置顶；`POST /api/session` 创建随机 6 位 id 的新 session，`PUT /api/session` 只修改 session 显示名称
 - `/api/todos` 使用整表替换 + revision 冲突语义；冲突时返回 `409 + 当前快照`
-- 普通 session WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片或运行选项消息 / execute_plan_id”自动分流；group WebSocket 使用 `type:"group_message"`
+- 普通 Session WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片或运行选项消息 / plan_action / 兼容 execute_plan_id”自动分流；Group WebSocket 使用 `type:"group_message"`，并拒绝 Plan Mode
 - 忙碌时普通文本会进入 deferred intervention 队列，不会立即中断主执行
 
 ## 9. 文档维护建议

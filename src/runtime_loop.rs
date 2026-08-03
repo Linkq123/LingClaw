@@ -198,6 +198,8 @@ pub(crate) struct AgentRunReservation {
     connection_id: u64,
     run_cancel: CancellationToken,
     deferred_interventions: Arc<Mutex<DeferredInterventionState>>,
+    reset_plan_evidence: bool,
+    plan_action_prompt: Option<String>,
 }
 
 pub(crate) async fn try_reserve_agent_run(
@@ -226,6 +228,8 @@ pub(crate) async fn try_reserve_agent_run(
         connection_id,
         run_cancel,
         deferred_interventions,
+        reset_plan_evidence: false,
+        plan_action_prompt: None,
     })
 }
 
@@ -318,6 +322,22 @@ struct AgentPhaseState {
     /// multimodal observations following tool results.
     tool_images_disabled: bool,
     tool_images_attached_in_batch: usize,
+    /// Structured plan submitted by the model during a plan-only run.
+    plan_submission: Option<crate::plan::PlanSubmission>,
+    /// The provider explicitly rejected Tool Calling and the runtime retried
+    /// this planning run under the text-only compatibility contract.
+    plan_text_fallback_used: bool,
+    /// Local workspace evidence actually read while producing this revision.
+    plan_evidence: Vec<crate::plan::PlanEvidence>,
+    plan_evidence_truncated: bool,
+    /// Refresh runs replace the prior revision's evidence only after a new
+    /// revision has been submitted successfully.
+    replace_plan_evidence: bool,
+    /// Immutable approved revision injected into every execution cycle.
+    approved_plan: Option<crate::PendingPlan>,
+    /// Ephemeral control context for actions such as refresh. This is never
+    /// persisted as a user message.
+    plan_action_prompt: Option<String>,
 }
 
 /// Minimum interval between observe-phase incremental saves.
@@ -325,12 +345,6 @@ const OBSERVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const AUTO_TOOL_HISTORY_CAP: usize = 12;
 const DYNAMIC_PROMPT_OPTIONAL_SECTIONS_CHAR_BUDGET: usize = 4_000;
 const DYNAMIC_PROMPT_TRUNCATION_MARKER: &str = "\n*(additional dynamic context truncated)*";
-const PLAN_ONLY_PROMPT_SECTION: &str = "## Plan Mode\n\
-You are in plan-only mode. Explore with read-only tools when helpful, then stop with a concrete implementation plan.\n\
-- Do not modify files, execute shell commands, update todos, delegate to agents, or claim work has been performed.\n\
-- The final answer must be a plan with goal, key implementation steps, affected areas, verification suggestions, and risks or open questions.\n\
-- Wait for the user to approve execution before making changes.";
-
 #[derive(Debug)]
 enum AgentPhaseControl {
     Continue,
@@ -747,6 +761,80 @@ fn append_required_dynamic_prompt_section(content: &mut String, section: &str) -
     true
 }
 
+fn append_plan_action_user_context(messages: &mut Vec<ChatMessage>, prompt: Option<&str>) {
+    let Some(prompt) = prompt.map(str::trim).filter(|prompt| !prompt.is_empty()) else {
+        return;
+    };
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: Some(format!("Plan revision request from the user:\n\n{prompt}")),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+}
+
+fn apply_plan_tool_calling_fallback(
+    messages: &mut Vec<ChatMessage>,
+    tools: &mut Vec<serde_json::Value>,
+) -> bool {
+    if tools.is_empty() {
+        return false;
+    }
+    tools.clear();
+    let instruction = "This endpoint does not support Tool Calling. Do not call or describe calling tools. Return exactly one concrete implementation plan in Markdown. Include the goal, ordered steps, assumptions or risks, and verification. Do not execute any changes.";
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        let content = system.content.get_or_insert_with(String::new);
+        content.push_str("\n\n## Tool Calling compatibility fallback\n");
+        content.push_str(instruction);
+    } else {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(instruction.to_string()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        );
+    }
+    true
+}
+
+fn plan_tool_calling_fallback_event() -> serde_json::Value {
+    json!({
+        "type": "progress",
+        "level": "warning",
+        "code": "plan_tool_calling_fallback",
+        "content": "This endpoint could not complete structured Tool Calling. LingClaw is using a text-only plan; step progress will be less detailed."
+    })
+}
+
+fn activate_plan_text_fallback_for_plain_response(
+    phase_state: &mut AgentPhaseState,
+    message: &ChatMessage,
+) -> bool {
+    if !phase_state.run_mode.is_plan_only()
+        || phase_state.plan_submission.is_some()
+        || phase_state.plan_text_fallback_used
+        || phase_state.react_ctx.tool_calls > 0
+        || !message.has_nonempty_content()
+        || message.has_tool_calls()
+    {
+        return false;
+    }
+
+    phase_state.plan_text_fallback_used = true;
+    true
+}
+
 async fn prepare_analyze_snapshot(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -816,7 +904,10 @@ async fn prepare_analyze_snapshot(
         false,
     );
     let discovered_agents = crate::subagents::discovery::discover_all_agents(&session.workspace);
-    let task_plan = if config.enable_task_plan {
+    let task_plan = if config.enable_task_plan
+        && !phase_state.run_mode.is_plan_only()
+        && phase_state.approved_plan.is_none()
+    {
         let available_tools = if phase_state.run_mode.is_plan_only() {
             available_tool_names_for_plan_only(&config, &session.workspace, view_image_available)
         } else {
@@ -849,10 +940,10 @@ async fn prepare_analyze_snapshot(
     if let Some(ref mut content) = fresh_system.content {
         let todos_section = crate::todos::render_prompt_section(&session.todos);
         let _ = append_required_dynamic_prompt_section(content, &todos_section);
-        if phase_state.run_mode.is_plan_only() {
-            let _ = append_required_dynamic_prompt_section(content, PLAN_ONLY_PROMPT_SECTION);
+        if let Some(approved_plan) = phase_state.approved_plan.as_ref() {
+            let approved_plan_section = approved_plan.approved_prompt_section();
+            let _ = append_required_dynamic_prompt_section(content, &approved_plan_section);
         }
-
         let mut remaining_budget = DYNAMIC_PROMPT_OPTIONAL_SECTIONS_CHAR_BUDGET;
         append_owned_dynamic_prompt_section(
             content,
@@ -1010,6 +1101,9 @@ async fn fit_messages_to_request_budget(
         );
         let after = session.messages.len();
         if before != after {
+            if let Some(plan) = session.pending_plan.as_mut() {
+                plan.rebase_message_indices_after_prefix_prune(before.saturating_sub(after));
+            }
             session.updated_at = now_epoch();
         }
         before.saturating_sub(after)
@@ -1115,7 +1209,7 @@ async fn build_cycle_tools(
 ) -> Vec<serde_json::Value> {
     let config = ctx.config.clone();
     let mut definitions = if phase_state.run_mode.is_plan_only() {
-        build_plan_only_tools(&config, resolved.provider, &phase_state.cycle_workspace)
+        build_plan_only_tools(&config, resolved.provider, &phase_state.cycle_workspace).await
     } else {
         build_runtime_tools(
             &config,
@@ -1127,6 +1221,21 @@ async fn build_cycle_tools(
     };
     if tool_images_available_for_consumer(&config, &ctx.model, phase_state.tool_images_disabled) {
         definitions.push(tools::conditional_view_image_definition(resolved.provider));
+    }
+    if phase_state.run_mode.is_plan_only() {
+        definitions.push(crate::plan::tool_definition(
+            resolved.provider,
+            crate::plan::TOOL_NAME_SUBMIT_PLAN,
+            "Finish the current planning revision. Use needs_input only for decisions that materially change the plan; otherwise submit a ready, executable plan.",
+            crate::plan::submit_plan_tool_parameters(),
+        ));
+    } else if phase_state.approved_plan.is_some() {
+        definitions.push(crate::plan::tool_definition(
+            resolved.provider,
+            crate::plan::TOOL_NAME_UPDATE_PLAN,
+            "Report progress against the exact approved plan. Existing steps may be updated; adaptive steps require an explicit deviation reason.",
+            crate::plan::update_plan_tool_parameters(),
+        ));
     }
     definitions
 }
@@ -1147,31 +1256,62 @@ fn tool_definition_name(value: &serde_json::Value) -> Option<&str> {
         .or_else(|| value.get("name").and_then(serde_json::Value::as_str))
 }
 
-pub(crate) fn build_plan_only_tools(
+pub(crate) async fn build_plan_only_tools(
     config: &Config,
     provider: Provider,
     workspace: &Path,
 ) -> Vec<serde_json::Value> {
     let mut definitions = tools::read_only_tool_definitions_for_provider(provider);
     let mcp_policy = tools::mcp::load_session_policy(workspace);
-    let mut mcp_tools = match provider {
-        Provider::Anthropic => {
-            tools::mcp::cached_tool_definitions_anthropic_for_policy(config, workspace, &mcp_policy)
-        }
-        Provider::OpenAI | Provider::OpenAIResponses => {
-            tools::mcp::cached_tool_definitions_openai_for_policy(config, workspace, &mcp_policy)
-        }
-        Provider::Ollama => {
-            tools::mcp::cached_tool_definitions_ollama_for_policy(config, workspace, &mcp_policy)
-        }
-        Provider::Gemini => {
-            tools::mcp::cached_tool_definitions_gemini_for_policy(config, workspace, &mcp_policy)
-        }
+    let (cached_servers, enabled_servers) =
+        tools::mcp::cached_server_counts_for_policy(config, workspace, &mcp_policy);
+    let mut mcp_tools = match (enabled_servers > 0, cached_servers == enabled_servers) {
+        (false, _) => Vec::new(),
+        (true, true) => match provider {
+            Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic_for_policy(
+                config,
+                workspace,
+                &mcp_policy,
+            ),
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::mcp::cached_tool_definitions_openai_for_policy(
+                    config,
+                    workspace,
+                    &mcp_policy,
+                )
+            }
+            Provider::Ollama => tools::mcp::cached_tool_definitions_ollama_for_policy(
+                config,
+                workspace,
+                &mcp_policy,
+            ),
+            Provider::Gemini => tools::mcp::cached_tool_definitions_gemini_for_policy(
+                config,
+                workspace,
+                &mcp_policy,
+            ),
+        },
+        (true, false) => match provider {
+            Provider::Anthropic => {
+                tools::mcp::tool_definitions_anthropic_for_policy(config, workspace, &mcp_policy)
+                    .await
+            }
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::mcp::tool_definitions_openai_for_policy(config, workspace, &mcp_policy).await
+            }
+            Provider::Ollama => {
+                tools::mcp::tool_definitions_ollama_for_policy(config, workspace, &mcp_policy).await
+            }
+            Provider::Gemini => {
+                tools::mcp::tool_definitions_gemini_for_policy(config, workspace, &mcp_policy).await
+            }
+        },
     }
     .into_iter()
     .filter(|definition| {
-        tool_definition_name(definition)
-            .is_some_and(|name| tools::mcp::is_read_only_tool_name(name, config, workspace))
+        tool_definition_name(definition).is_some_and(|name| {
+            tools::mcp::is_read_only_tool_name_for_policy(name, config, workspace, &mcp_policy)
+        })
     })
     .collect::<Vec<_>>();
     definitions.append(&mut mcp_tools);
@@ -1441,6 +1581,9 @@ async fn apply_llm_response(
         &resp,
     )
     .await;
+    if activate_plan_text_fallback_for_plain_response(phase_state, &resp.message) {
+        let _ = live_send(ctx.live_tx, plan_tool_calling_fallback_event()).await;
+    }
     persist_assistant_message(ctx, &resp.message).await;
     advance_after_llm_response(ctx.live_tx, phase_state, &resp.message, latest_query).await;
 }
@@ -2162,12 +2305,131 @@ fn runtime_timeout_for_tool(tool_name: &str, config: &Config) -> Option<Duration
 }
 
 fn is_plan_only_allowed_tool(tool_name: &str, config: &Config, workspace: &Path) -> bool {
+    if tool_name == crate::plan::TOOL_NAME_SUBMIT_PLAN {
+        return true;
+    }
     if tools::is_read_only_tool(tool_name) {
         return true;
     }
 
     let mcp_policy = tools::mcp::load_session_policy(workspace);
     tools::mcp::is_read_only_tool_name_for_policy(tool_name, config, workspace, &mcp_policy)
+}
+
+fn is_internal_plan_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        crate::plan::TOOL_NAME_SUBMIT_PLAN | crate::plan::TOOL_NAME_UPDATE_PLAN
+    )
+}
+
+fn plan_tool_outcome(output: impl Into<String>, is_error: bool) -> tools::ToolOutcome {
+    tools::ToolOutcome {
+        output: output.into(),
+        is_error,
+        duration_ms: 0,
+        subagent_snapshot: None,
+        images: Vec::new(),
+    }
+}
+
+async fn execute_internal_plan_tool(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &mut AgentPhaseState,
+    tc: &ToolCall,
+) -> Option<tools::ToolOutcome> {
+    if tc.function.name == crate::plan::TOOL_NAME_SUBMIT_PLAN {
+        if !phase_state.run_mode.is_plan_only() {
+            return Some(plan_tool_outcome(
+                "submit_plan is only available while planning",
+                true,
+            ));
+        }
+        return Some(
+            match crate::plan::validate_submission_json(&tc.function.arguments) {
+                Ok(submission) => {
+                    phase_state.plan_submission = Some(submission);
+                    plan_tool_outcome(
+                        "Plan revision accepted. The runtime will now present it for user review.",
+                        false,
+                    )
+                }
+                Err(error) => plan_tool_outcome(
+                    format!(
+                        "submit_plan validation failed: {error}. Correct the arguments and call submit_plan again."
+                    ),
+                    true,
+                ),
+            },
+        );
+    }
+
+    if tc.function.name != crate::plan::TOOL_NAME_UPDATE_PLAN {
+        return None;
+    }
+    if phase_state.run_mode.is_plan_only() || phase_state.approved_plan.is_none() {
+        return Some(plan_tool_outcome(
+            "update_plan is only available while executing an approved plan",
+            true,
+        ));
+    }
+    let update = match crate::plan::validate_progress_json(&tc.function.arguments) {
+        Ok(update) => update,
+        Err(error) => {
+            return Some(plan_tool_outcome(
+                format!("update_plan validation failed: {error}"),
+                true,
+            ));
+        }
+    };
+
+    let persist_gate = session_store::session_persist_gate(ctx.current_session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let mutation = {
+        let mut sessions = ctx.state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(ctx.current_session_id) else {
+            return Some(plan_tool_outcome("current session no longer exists", true));
+        };
+        let previous = session.clone();
+        let updated_plan = {
+            let Some(plan) = session.pending_plan.as_mut() else {
+                return Some(plan_tool_outcome(
+                    "the approved plan no longer exists",
+                    true,
+                ));
+            };
+            match crate::plan::apply_progress_update(plan, update) {
+                Ok(()) => {
+                    plan.updated_at = now_epoch();
+                    plan.clone()
+                }
+                Err(error) => return Some(plan_tool_outcome(error, true)),
+            }
+        };
+        session.updated_at = updated_plan.updated_at;
+        Ok::<_, String>((previous, session.clone(), updated_plan))
+    };
+    let (previous, session_to_save, updated_plan) = match mutation {
+        Ok(mutation) => mutation,
+        Err(error) => return Some(plan_tool_outcome(error, true)),
+    };
+    if let Err(error) = session_store::save_session_to_disk_locked(&session_to_save).await {
+        let mut sessions = ctx.state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(ctx.current_session_id) {
+            *session = previous;
+        }
+        return Some(plan_tool_outcome(
+            format!("update_plan could not be saved: {error}"),
+            true,
+        ));
+    }
+    phase_state.approved_plan = Some(updated_plan.clone());
+    let _ = live_send(
+        ctx.live_tx,
+        json!({"type":"plan_state", "plan": updated_plan.to_live_value()}),
+    )
+    .await;
+    Some(plan_tool_outcome("Plan progress saved.", false))
 }
 
 fn unavailable_view_image_outcome(
@@ -2193,23 +2455,57 @@ fn unavailable_view_image_outcome(
     })
 }
 
-/// Returns `(outcome, effective_args)` where `effective_args` is `None` when
-/// the tool was rejected by a BeforeToolExec hook (signals record_tool_result
-/// to skip AfterToolExec), or `Some(args_json)` with the actually-executed args.
+#[derive(Default)]
+struct PlanEvidenceCapture {
+    evidence: Vec<crate::plan::PlanEvidence>,
+    failed: bool,
+    truncated: bool,
+    deadline: Option<std::time::Instant>,
+}
+
+impl PlanEvidenceCapture {
+    fn failed(deadline: std::time::Instant) -> Self {
+        Self {
+            evidence: Vec::new(),
+            failed: true,
+            truncated: false,
+            deadline: Some(deadline),
+        }
+    }
+
+    fn remaining_timeout(&self, fallback: Option<Duration>) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+            .or(fallback)
+    }
+}
+
+/// Returns `(outcome, effective_args, evidence_before)` where `effective_args`
+/// is `None` when the tool was rejected by a BeforeToolExec hook (signals
+/// record_tool_result to skip AfterToolExec), or `Some(args_json)` with the
+/// actually-executed args. `evidence_before` brackets local read-only tools so
+/// the post-execution snapshot can prove the observation was stable.
 async fn execute_tool_call(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
     image_budget: &tools::mcp::ToolImageBudget,
-) -> Result<(tools::ToolOutcome, Option<String>), AgentPhaseControl> {
+) -> Result<(tools::ToolOutcome, Option<String>, PlanEvidenceCapture), AgentPhaseControl> {
     let config = ctx.config.clone();
+    if let Some(outcome) = execute_internal_plan_tool(ctx, phase_state, tc).await {
+        return Ok((
+            outcome,
+            Some(tc.function.arguments.clone()),
+            PlanEvidenceCapture::default(),
+        ));
+    }
     if let Some(outcome) = unavailable_view_image_outcome(
         &config,
         &ctx.model,
         phase_state.tool_images_disabled,
         &tc.function.name,
     ) {
-        return Ok((outcome, None));
+        return Ok((outcome, None, PlanEvidenceCapture::default()));
     }
     if phase_state.run_mode.is_plan_only()
         && !is_plan_only_allowed_tool(&tc.function.name, &config, &phase_state.cycle_workspace)
@@ -2240,6 +2536,7 @@ async fn execute_tool_call(
                 images: Vec::new(),
             },
             None,
+            PlanEvidenceCapture::default(),
         ));
     }
 
@@ -2293,6 +2590,7 @@ async fn execute_tool_call(
                     images: Vec::new(),
                 },
                 None, // rejected — skip AfterToolExec
+                PlanEvidenceCapture::default(),
             ));
         }
         hooks::HookOutput::ModifyToolArgs { args } => {
@@ -2304,6 +2602,7 @@ async fn execute_tool_call(
 
     // Send tool_call event with the effective (possibly hook-modified) arguments.
     if !tools::is_todos_tool(&tc.function.name)
+        && !is_internal_plan_tool(&tc.function.name)
         && !live_send(
             ctx.live_tx,
             json!({
@@ -2317,6 +2616,17 @@ async fn execute_tool_call(
     {
         return Err(AgentPhaseControl::Break);
     }
+
+    let evidence_before = capture_plan_tool_evidence(
+        phase_state.run_mode,
+        &tc.function.name,
+        &effective_args,
+        &phase_state.cycle_workspace,
+        config.tool_timeout,
+        None,
+        ctx.run_cancel,
+    )
+    .await;
 
     let run_state = if tools::is_task_tool(&tc.function.name) {
         // Sub-agent task: no outer timeout — the sub-agent enforces its own
@@ -2377,6 +2687,7 @@ async fn execute_tool_call(
                     images: Vec::new(),
                 },
                 None,
+                PlanEvidenceCapture::default(),
             ));
         }
         run_tool_with_feedback(
@@ -2398,7 +2709,7 @@ async fn execute_tool_call(
             ctx.run_cancel,
             &tc.id,
             &tc.function.name,
-            runtime_timeout_for_tool(&tc.function.name, &config),
+            evidence_before.remaining_timeout(runtime_timeout_for_tool(&tc.function.name, &config)),
             execute_todos_tool(ctx.state, ctx.current_session_id, &effective_args),
         )
         .await
@@ -2408,7 +2719,7 @@ async fn execute_tool_call(
             ctx.run_cancel,
             &tc.id,
             &tc.function.name,
-            runtime_timeout_for_tool(&tc.function.name, &config),
+            evidence_before.remaining_timeout(runtime_timeout_for_tool(&tc.function.name, &config)),
             execute_tool_with_live_output(
                 ctx.live_tx,
                 &tc.id,
@@ -2429,7 +2740,7 @@ async fn execute_tool_call(
     };
 
     match run_state {
-        ToolRunState::Completed(result) => Ok((result, Some(effective_args))),
+        ToolRunState::Completed(result) => Ok((result, Some(effective_args), evidence_before)),
         ToolRunState::Abort => {
             apply_run_cancel_outcome(ctx, phase_state).await;
             Err(AgentPhaseControl::Break)
@@ -2450,15 +2761,110 @@ struct MaterializedToolImageBatch {
     stop_after_recording: bool,
 }
 
+async fn capture_plan_tool_evidence(
+    run_mode: AgentRunMode,
+    tool_name: &str,
+    args: &str,
+    workspace: &Path,
+    timeout: Duration,
+    deadline: Option<std::time::Instant>,
+    run_cancel: &CancellationToken,
+) -> PlanEvidenceCapture {
+    if !run_mode.is_plan_only() || !crate::plan::supports_tool_evidence(tool_name) {
+        return PlanEvidenceCapture::default();
+    }
+    let now = std::time::Instant::now();
+    let deadline = deadline.unwrap_or_else(|| now.checked_add(timeout).unwrap_or(now));
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        eprintln!("WARN: plan evidence capture exceeded the tool timeout");
+        return PlanEvidenceCapture::failed(deadline);
+    }
+    let tool_name = tool_name.to_string();
+    let args = args.to_string();
+    let workspace = workspace.to_path_buf();
+    let worker_cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&worker_cancelled);
+    let mut worker = tokio::task::spawn_blocking(move || {
+        crate::plan::try_capture_tool_evidence_with_timeout(
+            &tool_name,
+            &args,
+            &workspace,
+            remaining,
+            &worker_cancel,
+        )
+    });
+    let result = tokio::select! {
+        biased;
+        _ = run_cancel.cancelled() => {
+            worker_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            worker.abort();
+            return PlanEvidenceCapture::failed(deadline);
+        }
+        result = tokio::time::timeout(remaining, &mut worker) => result,
+    };
+    match result {
+        Ok(Ok(Ok(capture))) => PlanEvidenceCapture {
+            evidence: capture.evidence,
+            failed: false,
+            truncated: capture.truncated,
+            deadline: Some(deadline),
+        },
+        Ok(Ok(Err(error))) => {
+            eprintln!("WARN: plan evidence could not be captured: {error}");
+            PlanEvidenceCapture::failed(deadline)
+        }
+        Ok(Err(error)) => {
+            eprintln!("ERROR: plan evidence worker failed: {error}");
+            PlanEvidenceCapture::failed(deadline)
+        }
+        Err(_) => {
+            worker_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            worker.abort();
+            eprintln!("WARN: plan evidence capture exceeded the tool timeout");
+            PlanEvidenceCapture::failed(deadline)
+        }
+    }
+}
+
 async fn prepare_tool_result(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
     mut result: tools::ToolOutcome,
     effective_args: Option<&str>,
+    evidence_before: PlanEvidenceCapture,
+    precomputed_evidence_after: Option<PlanEvidenceCapture>,
 ) -> PreparedToolResult {
-    // ── AfterToolExec hook (skipped when tool was rejected) ──────────────
     let config = ctx.config.clone();
+    let evidence_after = if phase_state.run_mode.is_plan_only()
+        && !result.is_error
+        && !is_internal_plan_tool(&tc.function.name)
+    {
+        if let Some(eff_args) = effective_args {
+            Some(match precomputed_evidence_after {
+                Some(capture) => capture,
+                None => {
+                    capture_plan_tool_evidence(
+                        phase_state.run_mode,
+                        &tc.function.name,
+                        eff_args,
+                        &phase_state.cycle_workspace,
+                        config.tool_timeout,
+                        evidence_before.deadline,
+                        ctx.run_cancel,
+                    )
+                    .await
+                }
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // ── AfterToolExec hook (skipped when tool was rejected) ──────────────
     if let Some(eff_args) = effective_args {
         let after_input = ToolHookInput {
             tool_name: tc.function.name.clone(),
@@ -2480,6 +2886,18 @@ async fn prepare_tool_result(
         .await;
         if let hooks::HookOutput::ModifyToolResult { result: new_output } = hook_output {
             result.output = new_output;
+        }
+        if let Some(evidence_after) = evidence_after {
+            phase_state.plan_evidence_truncated |= evidence_before.failed
+                || evidence_before.truncated
+                || evidence_after.failed
+                || evidence_after.truncated;
+            let evidence = crate::plan::reconcile_tool_evidence(
+                evidence_before.evidence,
+                evidence_after.evidence,
+            );
+            phase_state.plan_evidence_truncated |=
+                crate::plan::merge_evidence(&mut phase_state.plan_evidence, evidence);
         }
     }
 
@@ -2632,8 +3050,18 @@ async fn record_tool_result(
     tc: &ToolCall,
     result: tools::ToolOutcome,
     effective_args: Option<&str>,
+    evidence_before: PlanEvidenceCapture,
 ) -> AgentPhaseControl {
-    let prepared = prepare_tool_result(ctx, phase_state, tc, result, effective_args).await;
+    let prepared = prepare_tool_result(
+        ctx,
+        phase_state,
+        tc,
+        result,
+        effective_args,
+        evidence_before,
+        None,
+    )
+    .await;
     let mut batch = vec![Some(prepared)];
     let mut image_batch = materialize_tool_image_batch(ctx, phase_state, &mut batch).await;
     let prepared = batch.pop().flatten().expect("single prepared tool result");
@@ -2666,22 +3094,23 @@ async fn record_materialized_tool_result(
         .map(crate::image_uploads::public_image_payload)
         .collect::<Vec<_>>();
 
-    let live_event = if !tools::is_todos_tool(&tc.function.name) {
-        let mut event = json!({
-            "type":"tool_result",
-            "id": tc.id,
-            "name": tc.function.name,
-            "result": result.output,
-            "duration_ms": result.duration_ms,
-            "is_error": result.is_error,
-        });
-        if !public_images.is_empty() {
-            event["images"] = json!(public_images);
-        }
-        Some(event)
-    } else {
-        None
-    };
+    let live_event =
+        if !tools::is_todos_tool(&tc.function.name) && !is_internal_plan_tool(&tc.function.name) {
+            let mut event = json!({
+                "type":"tool_result",
+                "id": tc.id,
+                "name": tc.function.name,
+                "result": result.output,
+                "duration_ms": result.duration_ms,
+                "is_error": result.is_error,
+            });
+            if !public_images.is_empty() {
+                event["images"] = json!(public_images);
+            }
+            Some(event)
+        } else {
+            None
+        };
 
     let trace = tools::build_tool_execution_trace(&tc.function.name, effective_args);
     let call_summary = trace
@@ -2771,8 +3200,15 @@ fn summarize_effective_tool_args(tool_name: &str, effective_args: Option<&str>) 
 }
 
 async fn finish_act_phase(live_tx: &LiveTx, phase_state: &mut AgentPhaseState, tc_count: usize) {
-    phase_state.react_ctx.transition_to_observe(tc_count);
-    send_react_phase_event(live_tx, &phase_state.react_ctx, "observe").await;
+    if phase_state.run_mode.is_plan_only() && phase_state.plan_submission.is_some() {
+        phase_state
+            .react_ctx
+            .transition_to_finish(agent::FinishReason::Complete);
+        send_react_phase_event(live_tx, &phase_state.react_ctx, "finish").await;
+    } else {
+        phase_state.react_ctx.transition_to_observe(tc_count);
+        send_react_phase_event(live_tx, &phase_state.react_ctx, "observe").await;
+    }
 }
 
 async fn update_working_state(
@@ -3111,6 +3547,7 @@ async fn run_analyze_phase(
 ) -> AgentPhaseControl {
     let config = ctx.config.clone();
     if phase_state.round >= AGENT_HARD_CAP_ROUNDS {
+        phase_state.run_failed = true;
         let (system_event, mut done_event) = build_agent_hard_cap_events(
             AGENT_HARD_CAP_ROUNDS,
             phase_state.react_ctx.cycles,
@@ -3202,11 +3639,15 @@ async fn run_analyze_phase(
         };
     let total_pruned_count = snapshot.pruned_count.saturating_add(extra_pruned_count);
 
-    let final_msgs_snapshot =
+    let mut final_msgs_snapshot =
         match send_before_analyze_events(ctx, before_analyze_events, total_pruned_count).await {
             Some(msgs) => msgs,
             None => return AgentPhaseControl::Break,
         };
+    append_plan_action_user_context(
+        &mut final_msgs_snapshot,
+        phase_state.plan_action_prompt.as_deref(),
+    );
     // ── BeforeLlmCall hook (before budget check so estimate includes hook changes) ──
     let llm_hook_input = LlmHookInput {
         messages: final_msgs_snapshot.clone(),
@@ -3384,6 +3825,7 @@ async fn run_analyze_phase(
     // modify system prompt / think level which shouldn't change between retries of
     // the same logical request.
     let mut agent_llm_attempt = 0u8;
+    let mut plan_tool_fallback_used = false;
     let mut retry_messages = final_msgs_snapshot;
     let mut retry_tools = extra_tools;
     let llm_result = loop {
@@ -3418,6 +3860,25 @@ async fn run_analyze_phase(
         let result = call_outcome.result;
 
         match &result {
+            Err(error)
+                if phase_state.run_mode.is_plan_only()
+                    && !plan_tool_fallback_used
+                    && providers::is_tool_calling_compatibility_error(error) =>
+            {
+                plan_tool_fallback_used =
+                    apply_plan_tool_calling_fallback(&mut retry_messages, &mut retry_tools);
+                if !plan_tool_fallback_used {
+                    break result;
+                }
+                phase_state.plan_text_fallback_used = true;
+                request_estimate = crate::context::estimate_request_tokens_for_provider(
+                    resolved.provider,
+                    &retry_messages,
+                    &retry_tools,
+                );
+                let _ = live_send(ctx.live_tx, plan_tool_calling_fallback_event()).await;
+                continue;
+            }
             Err(e) if agent_llm_attempt == 0 && providers::is_transient_llm_error(e) => {
                 agent_llm_attempt += 1;
                 let _ = live_send(
@@ -3498,14 +3959,22 @@ async fn run_act_phase(
             }
 
             let call_image_budget = image_budget.for_call(call_index);
-            let (result, eff_args) =
+            let (result, eff_args, evidence_before) =
                 match execute_tool_call(ctx, phase_state, tc, &call_image_budget).await {
                     Ok(pair) => pair,
                     Err(control) => return control,
                 };
 
             if matches!(
-                record_tool_result(ctx, phase_state, tc, result, eff_args.as_deref()).await,
+                record_tool_result(
+                    ctx,
+                    phase_state,
+                    tc,
+                    result,
+                    eff_args.as_deref(),
+                    evidence_before,
+                )
+                .await,
                 AgentPhaseControl::Break
             ) {
                 return AgentPhaseControl::Break;
@@ -3521,6 +3990,7 @@ async fn run_act_phase(
             effective_args: Option<String>,
             rejected: Option<tools::ToolOutcome>,
             reject_events: Vec<serde_json::Value>,
+            evidence_before: PlanEvidenceCapture,
         }
         let mut hook_results: Vec<HookEvalResult> = Vec::with_capacity(tool_calls.len());
         for tc in &tool_calls {
@@ -3534,6 +4004,7 @@ async fn run_act_phase(
                     effective_args: None,
                     rejected: Some(outcome),
                     reject_events: Vec::new(),
+                    evidence_before: PlanEvidenceCapture::default(),
                 });
                 continue;
             }
@@ -3566,6 +4037,7 @@ async fn run_act_phase(
                         images: Vec::new(),
                     }),
                     reject_events: events,
+                    evidence_before: PlanEvidenceCapture::default(),
                 },
                 hooks::HookOutput::ModifyToolArgs { args } => HookEvalResult {
                     effective_args: Some(
@@ -3574,11 +4046,13 @@ async fn run_act_phase(
                     ),
                     rejected: None,
                     reject_events: Vec::new(),
+                    evidence_before: PlanEvidenceCapture::default(),
                 },
                 _ => HookEvalResult {
                     effective_args: Some(tc.function.arguments.clone()),
                     rejected: None,
                     reject_events: Vec::new(),
+                    evidence_before: PlanEvidenceCapture::default(),
                 },
             });
         }
@@ -3618,12 +4092,45 @@ async fn run_act_phase(
             }
         }
 
+        // Bracket local read-only operations after hooks finalize their
+        // arguments. Snapshot each call concurrently so a parallel batch is
+        // not serialized by evidence collection.
+        let evidence_futures = tool_calls
+            .iter()
+            .zip(hook_results.iter())
+            .map(|(tc, hr)| async {
+                let Some(args) = hr.effective_args.as_deref() else {
+                    return PlanEvidenceCapture::default();
+                };
+                capture_plan_tool_evidence(
+                    phase_state.run_mode,
+                    &tc.function.name,
+                    args,
+                    &phase_state.cycle_workspace,
+                    config.tool_timeout,
+                    None,
+                    ctx.run_cancel,
+                )
+                .await
+            });
+        let evidence_captures = futures::future::join_all(evidence_futures).await;
+        for (hr, evidence) in hook_results.iter_mut().zip(evidence_captures) {
+            hr.evidence_before = evidence;
+        }
+        if ctx.run_cancel.is_cancelled() {
+            apply_run_cancel_outcome(ctx, phase_state).await;
+            return AgentPhaseControl::Break;
+        }
+
         // 3. Launch non-rejected tool futures concurrently.
+        let run_mode = phase_state.run_mode;
+        let cycle_workspace = &phase_state.cycle_workspace;
         let futures: Vec<_> = tool_calls
             .iter()
             .zip(hook_results.iter())
             .enumerate()
             .map(|(call_index, (tc, hr))| {
+                let config = Arc::clone(&config);
                 let call_image_budget = image_budget.for_call(call_index);
                 if hr.rejected.is_some() {
                     // Rejected by hook — return a no-op future.
@@ -3631,13 +4138,16 @@ async fn run_act_phase(
                         // Advance the ordered image budget so later calls do
                         // not wait forever behind a hook-rejected call.
                         drop(call_image_budget);
-                        ToolRunState::Completed(tools::ToolOutcome {
-                            output: String::new(), // placeholder, replaced below
-                            is_error: true,
-                            duration_ms: 0,
-                            subagent_snapshot: None,
-                            images: Vec::new(),
-                        })
+                        (
+                            ToolRunState::Completed(tools::ToolOutcome {
+                                output: String::new(), // placeholder, replaced below
+                                is_error: true,
+                                duration_ms: 0,
+                                subagent_snapshot: None,
+                                images: Vec::new(),
+                            }),
+                            None,
+                        )
                     });
                 }
                 let args = hr
@@ -3645,29 +4155,52 @@ async fn run_act_phase(
                     .as_deref()
                     .unwrap_or(&tc.function.arguments);
                 let image_wait = call_image_budget.subscribe_waiting();
-                futures::future::Either::Right(run_tool_with_feedback_with_image_wait(
-                    ctx.live_tx,
-                    ctx.run_cancel,
-                    &tc.id,
-                    &tc.function.name,
-                    runtime_timeout_for_tool(&tc.function.name, &config),
-                    image_wait,
-                    execute_tool_with_live_output(
+                let evidence_deadline = hr.evidence_before.deadline;
+                let runtime_timeout = hr
+                    .evidence_before
+                    .remaining_timeout(runtime_timeout_for_tool(&tc.function.name, &config));
+                futures::future::Either::Right(async move {
+                    let run_state = run_tool_with_feedback_with_image_wait(
                         ctx.live_tx,
+                        ctx.run_cancel,
                         &tc.id,
                         &tc.function.name,
-                        args,
-                        &config,
-                        &ctx.state.http,
-                        &phase_state.cycle_workspace,
-                        true,
-                        Some(crate::LiveOutputReplayCtx {
-                            state: Arc::clone(ctx.state),
-                            session_id: ctx.current_session_id.to_string(),
-                        }),
-                        Some(call_image_budget),
-                    ),
-                ))
+                        runtime_timeout,
+                        image_wait,
+                        execute_tool_with_live_output(
+                            ctx.live_tx,
+                            &tc.id,
+                            &tc.function.name,
+                            args,
+                            &config,
+                            &ctx.state.http,
+                            cycle_workspace,
+                            true,
+                            Some(crate::LiveOutputReplayCtx {
+                                state: Arc::clone(ctx.state),
+                                session_id: ctx.current_session_id.to_string(),
+                            }),
+                            Some(call_image_budget),
+                        ),
+                    )
+                    .await;
+                    let evidence_after = match &run_state {
+                        ToolRunState::Completed(result) if !result.is_error => Some(
+                            capture_plan_tool_evidence(
+                                run_mode,
+                                &tc.function.name,
+                                args,
+                                cycle_workspace,
+                                config.tool_timeout,
+                                evidence_deadline,
+                                ctx.run_cancel,
+                            )
+                            .await,
+                        ),
+                        _ => None,
+                    };
+                    (run_state, evidence_after)
+                })
             })
             .collect();
 
@@ -3678,22 +4211,36 @@ async fn run_act_phase(
         //    Events and persisted tool messages remain ordered by tool call.
         let mut should_break = false;
         let mut prepared_batch = Vec::with_capacity(tool_calls.len());
-        for (tc, (run_state, hr)) in tool_calls
+        for (tc, ((run_state, evidence_after), hr)) in tool_calls
             .iter()
             .zip(results.into_iter().zip(hook_results.into_iter()))
         {
+            let HookEvalResult {
+                effective_args,
+                rejected,
+                reject_events: _,
+                evidence_before,
+            } = hr;
             // Use the pre-rejected outcome if the hook rejected this tool.
             // For rejected tools, effective_args is None → AfterToolExec hooks are skipped.
-            let (effective_run_state, after_args) = if let Some(outcome) = hr.rejected {
+            let (effective_run_state, after_args) = if let Some(outcome) = rejected {
                 (ToolRunState::Completed(outcome), None)
             } else {
-                (run_state, hr.effective_args)
+                (run_state, effective_args)
             };
             match effective_run_state {
                 ToolRunState::Completed(result) => {
                     prepared_batch.push(Some(
-                        prepare_tool_result(ctx, phase_state, tc, result, after_args.as_deref())
-                            .await,
+                        prepare_tool_result(
+                            ctx,
+                            phase_state,
+                            tc,
+                            result,
+                            after_args.as_deref(),
+                            evidence_before,
+                            evidence_after,
+                        )
+                        .await,
                     ));
                 }
                 ToolRunState::Abort => {
@@ -3854,50 +4401,221 @@ async fn run_observe_phase(
 
 async fn register_pending_plan(
     ctx: &AgentRunCtx<'_>,
-    phase_state: &AgentPhaseState,
-) -> Option<serde_json::Value> {
+    phase_state: &mut AgentPhaseState,
+) -> Vec<serde_json::Value> {
     if phase_state.react_ctx.finish_reason != Some(agent::FinishReason::Complete) {
-        return None;
+        return Vec::new();
     }
 
     let mut sessions = ctx.state.sessions.lock().await;
-    let session = sessions.get_mut(ctx.current_session_id)?;
-    let original_user_message_index = session
+    let Some(session) = sessions.get_mut(ctx.current_session_id) else {
+        return Vec::new();
+    };
+    let latest_user_message_index = session
         .messages
         .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, message)| message.role == "user")
-        .map(|(index, _)| index)?;
-    let assistant_plan_message_index = session
-        .messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(index, message)| {
-            *index > original_user_message_index
-                && message.role == "assistant"
-                && message.has_nonempty_content()
+        .rposition(|message| message.role == "user");
+    let Some(latest_user_message_index) = latest_user_message_index else {
+        return Vec::new();
+    };
+    let previous = session.pending_plan.take();
+    let now = now_epoch();
+
+    let (artifact, status, assistant_plan_message_index) =
+        if let Some(submission) = phase_state.plan_submission.take() {
+            let status = match submission.state {
+                crate::plan::PlanSubmissionState::NeedsInput => crate::plan::PlanStatus::NeedsInput,
+                crate::plan::PlanSubmissionState::Ready => crate::plan::PlanStatus::Ready,
+            };
+            let markdown = crate::plan::canonical_markdown(&submission.artifact);
+            let submission_message_index =
+                session
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(index, message)| {
+                        (index > latest_user_message_index
+                            && message.role == "assistant"
+                            && message.tool_calls.as_ref().is_some_and(|tool_calls| {
+                                tool_calls.iter().any(|tool_call| {
+                                    tool_call.function.name == crate::plan::TOOL_NAME_SUBMIT_PLAN
+                                })
+                            }))
+                        .then_some(index)
+                    });
+            let assistant_plan_message_index = if let Some(index) = submission_message_index {
+                // A provider may emit prose alongside the submit_plan call. Reuse the
+                // same Assistant message for the canonical artifact so history contains
+                // one plan representation instead of a prose message plus a plan card.
+                session.messages[index].content = Some(markdown);
+                index
+            } else {
+                // Direct/unit callers and legacy non-tool submissions still need a
+                // durable Assistant anchor for the structured plan card.
+                session.messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(markdown),
+                    images: None,
+                    thinking: None,
+                    anthropic_thinking_blocks: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Some(now),
+                });
+                session.messages.len() - 1
+            };
+            (submission.artifact, status, assistant_plan_message_index)
+        } else if phase_state.plan_text_fallback_used {
+            let assistant_plan_message_index = session
+                .messages
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(index, message)| {
+                    *index > latest_user_message_index
+                        && message.role == "assistant"
+                        && message.has_nonempty_content()
+                })
+                .map(|(index, _)| index);
+            let Some(assistant_plan_message_index) = assistant_plan_message_index else {
+                session.pending_plan = previous;
+                return Vec::new();
+            };
+            let markdown = session.messages[assistant_plan_message_index]
+                .content
+                .as_deref()
+                .unwrap_or_default();
+            let artifact = crate::plan::legacy_artifact(markdown);
+            if crate::plan::validate_legacy_artifact(&artifact).is_err() {
+                session.pending_plan = previous;
+                return Vec::new();
+            }
+            (
+                artifact,
+                crate::plan::PlanStatus::Ready,
+                assistant_plan_message_index,
+            )
+        } else {
+            // A tool-capable model that omits submit_plan has not produced an
+            // approvable revision. Preserve the current planning artifact so
+            // the finish phase can transition it to an explicit failed state.
+            session.pending_plan = previous;
+            return Vec::new();
+        };
+
+    let original_user_message_index = previous
+        .as_ref()
+        .map(|plan| plan.original_user_message_index)
+        .unwrap_or(latest_user_message_index);
+    let created_at = previous.as_ref().map(|plan| plan.created_at).unwrap_or(now);
+    let revision = previous
+        .as_ref()
+        .map(|plan| {
+            if plan.initial_submission_pending {
+                plan.revision.max(1)
+            } else {
+                plan.revision.saturating_add(1)
+            }
         })
-        .map(|(index, _)| index)?;
-    let created_at = now_epoch();
-    let plan_id = format!(
-        "plan_{}_{}_{}",
-        created_at, original_user_message_index, assistant_plan_message_index
-    );
-    session.pending_plan = Some(crate::PendingPlan {
-        id: plan_id.clone(),
+        .unwrap_or(1);
+    let plan_id = previous
+        .as_ref()
+        .map(|plan| plan.id.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "plan_{created_at}_{original_user_message_index}_{assistant_plan_message_index}"
+            )
+        });
+    let mut evidence = if phase_state.replace_plan_evidence {
+        Vec::new()
+    } else {
+        previous
+            .as_ref()
+            .map(|plan| plan.evidence.clone())
+            .unwrap_or_default()
+    };
+    let evidence_truncated = (!phase_state.replace_plan_evidence
+        && previous
+            .as_ref()
+            .is_some_and(|plan| plan.evidence_truncated))
+        | phase_state.plan_evidence_truncated
+        | crate::plan::merge_evidence(
+            &mut evidence,
+            std::mem::take(&mut phase_state.plan_evidence),
+        );
+    let mut plan = crate::PendingPlan::new(
+        plan_id,
         original_user_message_index,
         assistant_plan_message_index,
         created_at,
-    });
-    session.updated_at = created_at;
-    Some(json!({
-        "type": "plan_ready",
-        "plan_id": plan_id,
-        "message_index": assistant_plan_message_index,
-        "created_at": created_at,
-    }))
+        revision,
+        status,
+        artifact,
+        evidence,
+        evidence_truncated,
+    );
+    if let Some(previous) = previous {
+        plan.execution_attempt = previous.execution_attempt;
+    }
+    plan.updated_at = now;
+    session.updated_at = now;
+    session.pending_plan = Some(plan.clone());
+
+    let mut events = vec![json!({"type":"plan_state", "plan": plan.to_live_value()})];
+    if plan.status == crate::plan::PlanStatus::Ready {
+        events.push(json!({
+            "type": "plan_ready",
+            "plan_id": plan.id,
+            "revision": plan.revision,
+            "message_index": plan.assistant_plan_message_index,
+            "created_at": plan.created_at,
+        }));
+    }
+    events
+}
+
+async fn mark_execution_plan_terminal(
+    state: &Arc<AppState>,
+    session_id: &str,
+    approved_plan: Option<&crate::PendingPlan>,
+    status: crate::plan::PlanStatus,
+) -> Option<crate::PendingPlan> {
+    let approved_plan = approved_plan?;
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(session_id)?;
+    let plan = session.pending_plan.as_mut()?;
+    if plan.id != approved_plan.id
+        || plan.revision != approved_plan.revision
+        || plan.status != crate::plan::PlanStatus::Executing
+    {
+        return None;
+    }
+    let now = now_epoch();
+    plan.status = status;
+    plan.updated_at = now;
+    plan.finished_at = Some(now);
+    session.updated_at = now;
+    Some(plan.clone())
+}
+
+async fn mark_planning_plan_terminal(
+    state: &Arc<AppState>,
+    session_id: &str,
+    status: crate::plan::PlanStatus,
+) -> Option<crate::PendingPlan> {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(session_id)?;
+    let plan = session.pending_plan.as_mut()?;
+    if plan.status != crate::plan::PlanStatus::Planning {
+        return None;
+    }
+    let now = now_epoch();
+    plan.status = status;
+    plan.updated_at = now;
+    plan.finished_at = Some(now);
+    session.updated_at = now;
+    Some(plan.clone())
 }
 
 async fn run_finish_phase(
@@ -3905,15 +4623,78 @@ async fn run_finish_phase(
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
     let config = ctx.config.clone();
-    let plan_ready_event = if phase_state.run_mode.is_plan_only() {
-        register_pending_plan(ctx, phase_state).await
+    let plan_registration_rollback = if phase_state.run_mode.is_plan_only() {
+        let sessions = ctx.state.sessions.lock().await;
+        sessions.get(ctx.current_session_id).cloned()
     } else {
         None
+    };
+    let mut plan_events = if phase_state.run_mode.is_plan_only() {
+        register_pending_plan(ctx, phase_state).await
+    } else {
+        Vec::new()
+    };
+    if phase_state.run_mode.is_plan_only()
+        && plan_events.is_empty()
+        && let Some(plan) = mark_planning_plan_terminal(
+            ctx.state,
+            ctx.current_session_id,
+            crate::plan::PlanStatus::Failed,
+        )
+        .await
+    {
+        phase_state.run_failed = true;
+        plan_events.push(json!({"type":"plan_state", "plan": plan.to_live_value()}));
+    }
+    let completion_rollback = if phase_state.run_mode.is_plan_only() {
+        None
+    } else {
+        let sessions = ctx.state.sessions.lock().await;
+        sessions.get(ctx.current_session_id).and_then(|session| {
+            let plan = session.pending_plan.as_ref()?;
+            let approved = phase_state.approved_plan.as_ref()?;
+            (plan.id == approved.id
+                && plan.revision == approved.revision
+                && plan.status == crate::plan::PlanStatus::Executing)
+                .then(|| (plan.clone(), session.updated_at))
+        })
+    };
+    let completed_plan = if phase_state.run_mode.is_plan_only() {
+        None
+    } else {
+        mark_execution_plan_terminal(
+            ctx.state,
+            ctx.current_session_id,
+            phase_state.approved_plan.as_ref(),
+            crate::plan::PlanStatus::Completed,
+        )
+        .await
     };
 
     if let Err(error) =
         session_store::save_current_session_to_disk(ctx.state, ctx.current_session_id).await
     {
+        if let Some(previous_session) = plan_registration_rollback {
+            let mut sessions = ctx.state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(ctx.current_session_id) {
+                *session = previous_session;
+            }
+        } else if let (Some(completed), Some((previous_plan, previous_session_updated_at))) =
+            (completed_plan.as_ref(), completion_rollback)
+        {
+            let mut sessions = ctx.state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(ctx.current_session_id)
+                && session.pending_plan.as_ref().is_some_and(|plan| {
+                    plan.id == completed.id
+                        && plan.revision == completed.revision
+                        && plan.status == crate::plan::PlanStatus::Completed
+                        && plan.finished_at == completed.finished_at
+                })
+            {
+                session.pending_plan = Some(previous_plan);
+                session.updated_at = previous_session_updated_at;
+            }
+        }
         eprintln!("ERROR: failed to save session at finish phase: {error}");
         phase_state.run_failed = true;
         if ctx.state.storage_is_writable() {
@@ -3953,8 +4734,16 @@ async fn run_finish_phase(
         let _ = live_send(ctx.live_tx, event).await;
     }
 
-    if let Some(event) = plan_ready_event {
+    for event in plan_events {
         let _ = live_send(ctx.live_tx, event).await;
+    }
+    if let Some(plan) = completed_plan {
+        phase_state.approved_plan = Some(plan.clone());
+        let _ = live_send(
+            ctx.live_tx,
+            json!({"type":"plan_state", "plan": plan.to_live_value()}),
+        )
+        .await;
     }
 
     // Enqueue structured memory update (async, non-blocking).
@@ -4151,12 +4940,44 @@ pub(crate) async fn run_agent_session(
     reservation: Option<AgentRunReservation>,
     model_snapshot: Option<crate::SessionModelSnapshot>,
 ) -> AgentRunOutcome {
-    let show_react = {
+    let reset_plan_evidence = reservation
+        .as_ref()
+        .is_some_and(|reservation| reservation.reset_plan_evidence);
+    let (show_react, approved_plan, initial_plan_evidence, initial_evidence_truncated) = {
         let sessions = state.sessions.lock().await;
-        sessions
-            .get(current_session_id)
-            .map(|s| s.show_react)
-            .unwrap_or(false)
+        let session = sessions.get(current_session_id);
+        let approved_plan = session
+            .and_then(|session| session.pending_plan.as_ref())
+            .filter(|plan| {
+                run_mode == AgentRunMode::Execute
+                    && plan.status == crate::plan::PlanStatus::Executing
+            })
+            .cloned();
+        let plan_evidence = if reset_plan_evidence {
+            Vec::new()
+        } else {
+            session
+                .and_then(|session| session.pending_plan.as_ref())
+                .filter(|plan| {
+                    run_mode.is_plan_only() && plan.status == crate::plan::PlanStatus::Planning
+                })
+                .map(|plan| plan.evidence.clone())
+                .unwrap_or_default()
+        };
+        let evidence_truncated = !reset_plan_evidence
+            && session
+                .and_then(|session| session.pending_plan.as_ref())
+                .is_some_and(|plan| {
+                    run_mode.is_plan_only()
+                        && plan.status == crate::plan::PlanStatus::Planning
+                        && plan.evidence_truncated
+                });
+        (
+            session.map(|session| session.show_react).unwrap_or(false),
+            approved_plan,
+            plan_evidence,
+            evidence_truncated,
+        )
     };
 
     let reservation = match reservation {
@@ -4215,6 +5036,7 @@ pub(crate) async fn run_agent_session(
             run_failed: true,
         };
     };
+    let plan_action_prompt = reservation.plan_action_prompt.clone();
     let run_cancel = reservation.run_cancel;
     let deferred_interventions = reservation.deferred_interventions;
 
@@ -4262,6 +5084,13 @@ pub(crate) async fn run_agent_session(
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: initial_plan_evidence,
+        plan_evidence_truncated: initial_evidence_truncated,
+        replace_plan_evidence: reset_plan_evidence,
+        approved_plan,
+        plan_action_prompt,
     };
 
     // Snapshot token counts at loop start so we can compute per-round delta.
@@ -4326,6 +5155,43 @@ pub(crate) async fn run_agent_session(
         &mut phase_state.pending_interventions,
     )
     .await;
+
+    if phase_state.run_failed
+        || phase_state.run_stopped
+        || phase_state.run_detached
+        || phase_state.shutting_down
+    {
+        let terminal_status = if phase_state.run_failed {
+            crate::plan::PlanStatus::Failed
+        } else {
+            crate::plan::PlanStatus::Stopped
+        };
+        let terminal_plan = if phase_state.run_mode.is_plan_only() {
+            mark_planning_plan_terminal(state, current_session_id, terminal_status).await
+        } else {
+            mark_execution_plan_terminal(
+                state,
+                current_session_id,
+                phase_state.approved_plan.as_ref(),
+                terminal_status,
+            )
+            .await
+        };
+        if let Some(plan) = terminal_plan {
+            if let Err(error) =
+                session_store::save_current_session_to_disk(state, current_session_id).await
+            {
+                eprintln!("ERROR: failed to save terminal plan state: {error}");
+            } else {
+                let _ = live_send(
+                    live_tx,
+                    json!({"type":"plan_state", "plan": plan.to_live_value()}),
+                )
+                .await;
+            }
+            phase_state.approved_plan = Some(plan);
+        }
+    }
 
     {
         let mut runs = state.active_runs.lock().await;

@@ -1754,6 +1754,44 @@ fn is_openai_tool_image_compatibility_error(error: &str) -> bool {
     client_schema_error && mentions_image
 }
 
+/// Detects only explicit client-side capability errors for Tool Calling.
+/// Authentication, rate limiting, transient failures, and generic schema
+/// errors must not silently downgrade a request to text-only planning.
+pub(crate) fn is_tool_calling_compatibility_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    let client_capability_error = ["api 400", "api 404", "api 405", "api 422"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+    if !client_capability_error {
+        return false;
+    }
+
+    [
+        "tools are not supported",
+        "tools not supported",
+        "does not support tools",
+        "tool calling is not supported",
+        "tool calling not supported",
+        "function calling is not supported",
+        "function calling not supported",
+        "unsupported parameter: tools",
+        "unsupported parameter: 'tools'",
+        "unsupported parameter: \"tools\"",
+        "unknown field: tools",
+        "unknown field 'tools'",
+        "unknown field \"tools\"",
+        "unknown parameter: tools",
+        "unrecognized field: tools",
+        "unrecognized request argument supplied: tools",
+        "tool_choice is not supported",
+        "unsupported parameter: tool_choice",
+        "unsupported parameter: 'tool_choice'",
+        "unsupported parameter: \"tool_choice\"",
+    ]
+    .iter()
+    .any(|token| lower.contains(token))
+}
+
 fn is_trusted_uploaded_image(
     image: &crate::ImageAttachment,
     s3_cfg: Option<&crate::config::S3Config>,

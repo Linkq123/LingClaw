@@ -284,15 +284,20 @@ async fn collect_file_paths(
                 break;
             }
             let path = entry.path();
-            let Ok(meta) = entry.metadata().await else {
+            let Ok(file_type) = entry.file_type().await else {
                 continue;
             };
+            // Never follow a descendant symlink: the requested search root was
+            // workspace-checked, but a nested link could otherwise escape it.
+            if file_type.is_symlink() {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
-            if meta.is_dir() {
+            if file_type.is_dir() {
                 if !name.starts_with('.') && !skip_dirs.contains(&name.as_str()) {
                     stack.push((path, depth + 1));
                 }
-            } else if meta.is_file() {
+            } else if file_type.is_file() {
                 if let Some(glob) = file_glob {
                     if matches_glob(&name, glob) {
                         files.push(path);

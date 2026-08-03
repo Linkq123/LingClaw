@@ -64,6 +64,49 @@ fn test_group_run(status: &str) -> GroupRun {
     }
 }
 
+#[tokio::test]
+async fn group_dispatch_rejects_plan_mode_before_loading_the_group() {
+    let state = Arc::new(test_app_state());
+    let error = handle_group_socket_message(
+        &state,
+        "missing-group",
+        GroupSocketDispatch {
+            text: "Plan this change".into(),
+            targets: Vec::new(),
+            target_mode: "all".into(),
+            start_runs: true,
+            run_mode: "plan_only".into(),
+        },
+    )
+    .await
+    .expect_err("Group Plan Mode must be rejected");
+    assert_eq!(error, "group_plan_mode_unsupported");
+
+    let tool_error = dispatch_from_tool(
+        &state,
+        &serde_json::json!({
+            "group_id": "missing-group",
+            "message": "Plan this change",
+            "run_mode": "plan_only"
+        }),
+    )
+    .await
+    .expect_err("tool dispatch must reject Group Plan Mode");
+    assert_eq!(tool_error, "group_plan_mode_unsupported");
+
+    let direct_tool_error = dispatch_from_tool(
+        &state,
+        &serde_json::json!({
+            "targets": ["missing-session"],
+            "message": "Plan this change",
+            "run_mode": "plan_only"
+        }),
+    )
+    .await
+    .expect_err("direct tool dispatch must reject delegated Plan Mode");
+    assert_eq!(direct_tool_error, "group_plan_mode_unsupported");
+}
+
 fn test_session_with_workspace(id: &str, name: &str, workspace: std::path::PathBuf) -> Session {
     Session {
         id: id.to_string(),
@@ -108,6 +151,83 @@ fn unique_temp_workspace(label: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).expect("temp workspace should be created");
     path
+}
+
+#[tokio::test]
+async fn delegated_execute_work_cannot_bypass_an_active_plan() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("active-plan-target-{}", now_epoch());
+    let workspace = unique_temp_workspace("active-plan-target");
+    let mut session = test_session_with_workspace(&session_id, "Active plan", workspace.clone());
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-active".into(),
+        revision: 4,
+        status: crate::plan::PlanStatus::Ready,
+        created_at: 1,
+        updated_at: 2,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let error = append_target_session_message(&state, &session_id, "new delegated work".into())
+        .await
+        .expect_err("delegated work must respect the active plan gate");
+    assert!(error.contains("active plan 'plan-active' revision 4"));
+    let sessions = state.sessions.lock().await;
+    assert!(sessions[&session_id].messages.is_empty());
+    assert_eq!(
+        sessions[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.id.as_str()),
+        Some("plan-active")
+    );
+    drop(sessions);
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn delegated_execute_work_preserves_a_resumable_terminal_plan() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("stopped-plan-target-{}", now_epoch());
+    let workspace = unique_temp_workspace("stopped-plan-target");
+    let mut session = test_session_with_workspace(&session_id, "Stopped plan", workspace.clone());
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-stopped".into(),
+        revision: 5,
+        status: crate::plan::PlanStatus::Stopped,
+        approved_at: Some(2),
+        execution_attempt: 1,
+        created_at: 1,
+        updated_at: 2,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    append_target_session_message(&state, &session_id, "new delegated work".into())
+        .await
+        .expect("terminal resumable plans should not block delegated work");
+
+    let sessions = state.sessions.lock().await;
+    let session = &sessions[&session_id];
+    assert_eq!(session.messages.len(), 1);
+    let plan = session
+        .pending_plan
+        .as_ref()
+        .expect("stopped plan should remain resumable");
+    assert_eq!(plan.id, "plan-stopped");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Stopped);
+    assert_eq!(plan.execution_attempt, 1);
+    drop(sessions);
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[test]

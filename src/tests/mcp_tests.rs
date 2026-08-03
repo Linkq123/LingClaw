@@ -202,7 +202,11 @@ async fn streamable_http_test_handler(
                     "tools": [{
                         "name": "search",
                         "description": "Search records",
-                        "inputSchema": {"type": "object", "properties": {}}
+                        "inputSchema": {"type": "object", "properties": {}},
+                        "annotations": {
+                            "readOnlyHint": true,
+                            "destructiveHint": false
+                        }
                     }]
                 }
             });
@@ -1463,6 +1467,51 @@ async fn cached_tool_definitions_do_not_start_server_on_cache_miss() {
 }
 
 #[tokio::test]
+async fn plan_only_tools_rediscover_policy_enabled_read_only_tools_after_cache_clear() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-plan-cold-cache");
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("normal", &log_path);
+    let discovered = list_tools(&config, &workspace).await;
+    let exposed_name = discovered
+        .first()
+        .expect("mock server should expose a tool")
+        .exposed_name
+        .clone();
+    save_session_policy(
+        &workspace,
+        &McpSessionPolicy {
+            enabled_servers: HashSet::from(["mock".to_string()]),
+            enabled_tools: HashSet::from([exposed_name.clone()]),
+            ..Default::default()
+        },
+    )
+    .expect("session policy should save");
+    clear_mcp_caches_for_test().await;
+
+    let definitions =
+        crate::runtime_loop::build_plan_only_tools(&config, Provider::OpenAI, &workspace).await;
+    let names = definitions
+        .iter()
+        .filter_map(|definition| {
+            definition
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&exposed_name.as_str()));
+    assert!(log_line_count(&log_path, "tools/list") >= 2);
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn cached_server_counts_for_policy_ignores_servers_without_enabled_tools() {
     let _guard = acquire_mcp_test_guard().await;
     clear_mcp_caches_for_test().await;
@@ -1506,6 +1555,7 @@ async fn cached_server_counts_for_policy_ignores_servers_without_enabled_tools()
                 exposed_name: exposed_tool.clone(),
                 description: "Search".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
+                annotations: Default::default(),
             }],
             loaded_at: Instant::now(),
         },
@@ -1546,6 +1596,8 @@ async fn streamable_http_tools_list_uses_session_header_and_sse_response() {
 
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].raw_name, "search");
+    assert_eq!(tools[0].annotations.read_only_hint, Some(true));
+    assert_eq!(tools[0].annotations.destructive_hint, Some(false));
     let calls = log.lock().await.clone();
     assert!(calls.iter().any(|call| call["method"] == "initialize"));
     assert!(
@@ -2281,6 +2333,7 @@ async fn complete_oauth_authorization_clears_cached_runtime_state() {
                 exposed_name: "mcp__http__old__00000000".to_string(),
                 description: "old".to_string(),
                 input_schema: json!({}),
+                annotations: Default::default(),
             }],
             loaded_at: Instant::now(),
         },
@@ -2962,6 +3015,7 @@ async fn cached_server_counts_for_policy_requires_enabled_tools_in_cache() {
                 exposed_name: cached_tool,
                 description: "Search".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),
+                annotations: Default::default(),
             }],
             loaded_at: Instant::now(),
         },

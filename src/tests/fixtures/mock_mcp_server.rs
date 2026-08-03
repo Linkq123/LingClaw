@@ -51,12 +51,20 @@ fn initialize_response(id: &str) -> String {
     )
 }
 
-fn tools_list_response(id: &str, tool_name: &str, description: &str) -> String {
+fn tools_list_response(
+    id: &str,
+    tool_name: &str,
+    description: &str,
+    read_only: bool,
+    destructive: bool,
+) -> String {
     format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"tools\":[{{\"name\":\"{}\",\"description\":\"{}\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{}}}}}}]}}}}",
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"tools\":[{{\"name\":\"{}\",\"description\":\"{}\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{}}}},\"annotations\":{{\"readOnlyHint\":{},\"destructiveHint\":{}}}}}]}}}}",
         id,
         tool_name,
-        description
+        description,
+        read_only,
+        destructive,
     )
 }
 
@@ -133,7 +141,17 @@ fn main() {
                             ),
                         );
                     }
-                    write_line(&mut stdout, &tools_list_response(id, tool_name, description));
+                    let mutating = mode == "mutating";
+                    write_line(
+                        &mut stdout,
+                        &tools_list_response(
+                            id,
+                            tool_name,
+                            description,
+                            !mutating,
+                            mutating,
+                        ),
+                    );
                 }
                 if mode == "tool-change" && tools_list_count == 1 {
                     write_line(

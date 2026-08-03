@@ -4597,6 +4597,34 @@ fn transient_error_rejects_unrecognized() {
     assert!(!is_transient_llm_error(""));
 }
 
+#[test]
+fn tool_calling_compatibility_detection_is_precise() {
+    for error in [
+        "API 400 Bad Request: unsupported parameter: 'tools'",
+        "API 404 Not Found: tool calling is not supported by this endpoint",
+        "API 422 Unprocessable Entity: unknown field \"tools\"",
+        "API 400 Bad Request: tool_choice is not supported",
+    ] {
+        assert!(
+            is_tool_calling_compatibility_error(error),
+            "expected compatibility fallback for {error}"
+        );
+    }
+
+    for error in [
+        "API 401 Unauthorized: invalid key",
+        "API 403 Forbidden: tools are not supported for this account",
+        "API 429 Too Many Requests: tool calling is not supported right now",
+        "API 400 Bad Request: invalid messages schema",
+        "API 500 Internal Server Error: tools are not supported",
+    ] {
+        assert!(
+            !is_tool_calling_compatibility_error(error),
+            "must not downgrade for {error}"
+        );
+    }
+}
+
 // ── Image attachment conversion tests ──────────────────────────
 
 const TOOL_IMAGE_TEST_PNG_BASE64: &str =

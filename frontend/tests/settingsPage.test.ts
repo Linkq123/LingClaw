@@ -1382,7 +1382,7 @@ describe('SettingsPage shell layout and dirty state', () => {
     expect(save.disabled).toBe(true);
 
     await act(async () => {
-      setSelectValue(findSelectBySettingsLabel('Task Plan'), 'true');
+      setSelectValue(findSelectBySettingsLabel('Automatic Execution Outline'), 'true');
       await flushMicrotasks();
     });
 

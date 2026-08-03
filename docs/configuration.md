@@ -79,7 +79,7 @@ Settings 保存配置时会先校验、原子写入并应用新的运行时快�
 | `structuredMemory` | `false` | 启用 Structured Memory |
 | `dailyReflection` | `false` | 启用 Daily Reflection |
 | `enableStateDigest` | `true` | 启用工具观察后的工作状态摘要 |
-| `enableTaskPlan` | `false` | 启用运行期规则 Task Plan |
+| `enableTaskPlan` | `false` | 启用普通 Execute run 的“自动执行提纲”；Plan-only 与已批准计划执行期间自动抑制 |
 | `enableS3` | 存在 `s3` 时启用 | 总开关，可覆盖 S3 配置存在状态 |
 
 服务始终绑定 `127.0.0.1:<port>`。修改防火墙不会让 LingClaw 直接监听外网；远程访问应使用受保护的反向代理或 SSH tunnel。

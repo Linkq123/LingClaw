@@ -9,6 +9,7 @@ vi.mock('../src/renderers/chat.js', () => ({
 
 vi.mock('../src/images.js', () => ({
   renderImagePreviews: vi.fn(),
+  setPlanMode: vi.fn(),
   uploadLocalImages: vi.fn(),
 }));
 
@@ -423,6 +424,29 @@ describe('input slash command menu', () => {
     expect(input.value).toBe('');
   });
 
+  it('switches context-reset commands back to Execute mode before dispatch', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+
+    const { setPlanMode } = await import('../src/images.js');
+    const { send } = await import('../src/input.js');
+    for (const command of ['/clear', '/new']) {
+      stateModule.dom.input!.value = command;
+      send();
+    }
+
+    expect(setPlanMode).toHaveBeenNthCalledWith(1, false);
+    expect(setPlanMode).toHaveBeenNthCalledWith(2, false);
+    expect(sendMock.mock.calls).toEqual([['/clear'], ['/new']]);
+  });
+
   it('lets arrow keys fall back to input history when the slash query has no matches', async () => {
     const stateModule = await import('../src/state.js');
     stateModule.initDomRefs();
@@ -464,6 +488,78 @@ describe('input slash command menu', () => {
 
     expect(sendMock).not.toHaveBeenCalled();
     expect(stateModule.dom.input?.value).toBe('should not be sent');
+  });
+
+  it('keeps ordinary input local while an active plan awaits a decision', async () => {
+    const stateModule = await import('../src/state.js');
+    const chat = await import('../src/renderers/chat.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.activePlan = {
+      plan_id: 'plan-active',
+      revision: 1,
+      status: 'ready',
+      message_index: 2,
+      created_at: 1,
+      updated_at: 1,
+      artifact: {
+        title: 'Active plan',
+        goal: 'Keep the approved scope explicit',
+        steps: [{ id: 'inspect', title: 'Inspect' }],
+      },
+      progress: [{ id: 'inspect', title: 'Inspect', status: 'pending' }],
+    };
+    vi.mocked(chat.addMsg).mockClear();
+    vi.mocked(chat.addSystem).mockClear();
+    stateModule.dom.input!.value = 'do something else';
+
+    const { send } = await import('../src/input.js');
+    send();
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(chat.addMsg).not.toHaveBeenCalled();
+    expect(chat.addSystem).toHaveBeenCalledWith(
+      'Execute, revise, or discard the active plan first.',
+    );
+    expect(stateModule.dom.input?.value).toBe('do something else');
+  });
+
+  it('sends ordinary input as a busy intervention while an approved plan is executing', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.busy = true;
+    stateModule.state.pendingImages = [];
+    stateModule.state.activePlan = {
+      plan_id: 'plan-executing',
+      revision: 2,
+      status: 'executing',
+      message_index: 2,
+      created_at: 1,
+      updated_at: 2,
+      approved_at: 2,
+      execution_attempt: 1,
+      artifact: {
+        title: 'Executing plan',
+        goal: 'Allow runtime steering',
+        steps: [{ id: 'inspect', title: 'Inspect' }],
+      },
+      progress: [{ id: 'inspect', title: 'Inspect', status: 'in_progress' }],
+    };
+    stateModule.dom.input!.value = 'also verify the fallback path';
+
+    const { send } = await import('../src/input.js');
+    send();
+
+    expect(sendMock).toHaveBeenCalledWith(
+      JSON.stringify({
+        text: 'also verify the fallback path',
+        plan_mode: false,
+      }),
+    );
+    expect(stateModule.dom.input?.value).toBe('');
   });
 
   it('still dispatches slash commands while the Agent model is unconfigured', async () => {

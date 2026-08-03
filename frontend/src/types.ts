@@ -154,6 +154,7 @@ export interface SessionEvent {
 export interface HistoryEvent {
   type: 'history';
   messages?: HistoryMessage[];
+  plans?: PlanStatePayload[];
   pending_plan?: PlanReadyPayload;
 }
 
@@ -225,6 +226,7 @@ export interface TaskEvent {
 export interface SystemEvent {
   type: 'system' | 'success' | 'error' | 'progress';
   content: string;
+  code?: string;
 }
 
 export interface ReactPhaseEvent {
@@ -373,12 +375,102 @@ export interface TaskPlanEvent {
 
 export interface PlanReadyPayload {
   plan_id: string;
+  revision?: number;
   message_index: number;
   created_at: number;
 }
 
 export interface PlanReadyEvent extends PlanReadyPayload {
   type: 'plan_ready';
+}
+
+export interface PlanStateEvent {
+  type: 'plan_state';
+  plan: PlanStatePayload;
+}
+
+export interface PlanStaleEvent {
+  type: 'plan_stale';
+  code: 'plan_stale';
+  plan_id: string;
+  revision: number;
+  paths: string[];
+  confirmation_token: string;
+}
+
+export type PlanStatus =
+  | 'planning'
+  | 'needs_input'
+  | 'ready'
+  | 'executing'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+  | 'discarded';
+
+export type PlanStepStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'skipped';
+
+export interface PlanQuestionOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface PlanQuestion {
+  id: string;
+  prompt: string;
+  options?: PlanQuestionOption[];
+}
+
+export interface PlanArtifact {
+  schema_version?: number;
+  title: string;
+  goal: string;
+  summary?: string;
+  steps?: Array<{
+    id: string;
+    title: string;
+    description?: string;
+    affected_areas?: string[];
+  }>;
+  assumptions?: string[];
+  risks?: string[];
+  verification?: string[];
+  acceptance_criteria?: string[];
+  questions?: PlanQuestion[];
+  legacy_markdown?: string;
+}
+
+export interface PlanProgressStep {
+  id: string;
+  title: string;
+  status: PlanStepStatus;
+  note?: string;
+  deviation_reason?: string;
+}
+
+export interface PlanStatePayload {
+  plan_id: string;
+  revision: number;
+  status: PlanStatus;
+  message_index: number;
+  created_at: number;
+  updated_at: number;
+  approved_at?: number | null;
+  finished_at?: number | null;
+  execution_attempt?: number;
+  artifact: PlanArtifact;
+  progress: PlanProgressStep[];
+  evidence_count?: number;
+  evidence_truncated?: boolean;
+  stale_override_paths?: string[];
+  stale_override_confirmed_at?: number | null;
+  pending_feedback?: string | null;
+  initial_submission_pending?: boolean;
+  initial_request_image_only?: boolean;
+  unfinished_steps?: number;
+  run_finished_with_unreported_steps?: boolean;
+  historical?: boolean;
 }
 
 export interface UsageEvent {
@@ -454,6 +546,9 @@ export type WebSocketMessage =
   | ToolOutputEvent
   | ToolResultEvent
   | ToolImageCompatibilityWarningEvent
+  | PlanReadyEvent
+  | PlanStateEvent
+  | PlanStaleEvent
   | TaskEvent
   | SystemEvent
   | ReactPhaseEvent
@@ -465,7 +560,6 @@ export type WebSocketMessage =
   | ThinkingDoneEvent
   | AutoTraceEvent
   | TaskPlanEvent
-  | PlanReadyEvent
   | ContextCompressedEvent
   | ContextPrunedEvent
   | ContextCompressSkippedEvent

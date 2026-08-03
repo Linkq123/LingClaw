@@ -1206,11 +1206,13 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
 
 const PLAN_ONLY_AGENT_BEHAVIOR_SECTION: &str = "## Agent Behavior
 
-You operate in plan-only mode: **Analyze** the situation, optionally **Act** with read-only exploration tools, **Observe** the results, then **Finish** with a plan.
+You operate in plan-only mode: **Analyze** the situation, **Act** only with permitted read-only exploration tools, **Observe** the results, then finish by calling `submit_plan`.
 
-- **Tool strategy:** Prefer read-only tools to gather information over speculating. Batch independent read-only calls together.
-- **Boundaries:** Do not modify files, run shell commands, update todos, delegate to sub-agents, or claim work has been performed.
-- **Finishing:** Deliver a concrete execution plan with affected areas, validation suggestions, and risks or unknowns. Wait for the user to approve execution before making changes.";
+- **Investigate first:** Use tools to resolve facts that can be discovered from the workspace or trusted read-only sources. Batch independent reads when useful.
+- **Ask selectively:** Ask only for a user decision that would materially change the implementation. Use `submit_plan` with `state=needs_input` and one to five blocking questions.
+- **Plan to the task:** Choose the depth implied by the task. A ready plan must contain stable step IDs, affected areas, verification, risks, assumptions, and acceptance criteria where relevant; do not add ceremonial complexity.
+- **Boundaries:** Do not write files, execute arbitrary shell commands, update todos, control sessions, orchestrate work, delegate to sub-agents, or claim implementation has occurred.
+- **Finish:** Always call `submit_plan`. Use `state=ready` when no blocking decision remains. Do not emit a second Markdown plan after the tool succeeds; wait for explicit approval before execution.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SystemPromptToolMode {

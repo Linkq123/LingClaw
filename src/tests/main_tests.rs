@@ -2049,6 +2049,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
             original_user_message_index: 0,
             assistant_plan_message_index: 1,
             created_at: 456,
+            ..Default::default()
         }),
         version: 0,
         workspace: PathBuf::new(),
@@ -8132,7 +8133,10 @@ async fn runtime_config_file_snapshot_keeps_config_revision_and_file_atomic() {
 
     let (config, revision, content) = task.await.expect("reader task should join");
     assert_eq!(config.model, "new-model");
-    assert_eq!(revision, expected_revision);
+    // CONFIG_REVISION is process-wide, so another AppState exercised by a
+    // parallel test may advance it after this state's replacement. The
+    // snapshot must never precede the revision that installed this config.
+    assert!(revision >= expected_revision);
     assert_eq!(content, r#"{"model":"new-model"}"#);
 
     let _ = std::fs::remove_dir_all(&base);
@@ -8890,6 +8894,7 @@ fn handle_command_persists_clear_changes() {
         original_user_message_index: 1,
         assistant_plan_message_index: 2,
         created_at: 123,
+        ..Default::default()
     });
 
     let state = test_app_state();

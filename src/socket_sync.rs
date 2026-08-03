@@ -19,6 +19,39 @@ fn default_todos_state_payload() -> serde_json::Value {
     crate::todos::build_todos_state_event(&crate::todos::TodoSnapshot::default())
 }
 
+#[cfg(not(test))]
+async fn attach_plan_history(
+    tx: &WsTx,
+    state: &AppState,
+    session_id: &str,
+    mut payload: serde_json::Value,
+) -> serde_json::Value {
+    match crate::storage::Database::global() {
+        Ok(database) => match database.load_plan_history(session_id).await {
+            Ok(plans) if !plans.is_empty() => payload["plans"] = json!(plans),
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("ERROR: failed to load plan history for {session_id}: {error}");
+                crate::send_storage_status(tx, state).await;
+            }
+        },
+        Err(error) => {
+            eprintln!("ERROR: LingClaw storage is unavailable while loading plans: {error}");
+        }
+    }
+    payload
+}
+
+#[cfg(test)]
+async fn attach_plan_history(
+    _tx: &WsTx,
+    _state: &AppState,
+    _session_id: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    payload
+}
+
 pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, session_id: &str) {
     let model_status_guard = crate::CONFIG_FILE_LOCK.read().await;
     let (config, config_revision) = state.config_snapshot_with_revision();
@@ -69,6 +102,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
     let s3_config_id = config.s3.as_ref().map(crate::image_uploads::s3_config_id);
     let session_payload = json!({"type":"session","id":session_id,"name":name,"explicitPrimaryModelConfigured":config.explicit_primary_model_configured,"modelOverridePresent":model_override_present,"modelOverrideConfigured":model_override_configured,"effectiveModelConfigured":effective_model_configured,"configRevision":config_revision,"capabilities":{"image":supports_image,"s3":s3_available,"s3_config_id":s3_config_id},"usage":usage});
     drop(model_status_guard);
+    let history = attach_plan_history(tx, state, session_id, history).await;
 
     ws_send(tx, &session_payload).await;
     ws_send(tx, &view_state).await;
@@ -299,6 +333,7 @@ pub(crate) async fn send_command_refresh(
         ws_send(tx, &view_state).await;
         ws_send(tx, &todos_state).await;
         if let Some(history_payload) = history {
+            let history_payload = attach_plan_history(tx, state, session_id, history_payload).await;
             ws_send(tx, &history_payload).await;
         }
     }

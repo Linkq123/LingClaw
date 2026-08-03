@@ -808,4 +808,131 @@ describe('main model payload ordering', () => {
       )?.disabled,
     ).toBe(true);
   });
+
+  it('does not restore plans from an obsolete deferred history render', () => {
+    const currentSocket = FakeWebSocket.instances.at(-1)!;
+    const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+    const pendingFrames: FrameRequestCallback[] = [];
+    globalThis.requestAnimationFrame = ((callback: FrameRequestCallback) => {
+      pendingFrames.push(callback);
+      return pendingFrames.length;
+    }) as typeof requestAnimationFrame;
+
+    try {
+      stateModule.state.activeGroupId = '';
+      stateModule.state.activeSessionId = 'main';
+      currentSocket.receive({
+        type: 'history',
+        messages: [
+          {
+            role: 'assistant',
+            content: 'Obsolete plan body',
+            message_index: 2,
+            timestamp: 1710000000,
+          },
+        ],
+        plans: [
+          {
+            plan_id: 'obsolete-plan',
+            revision: 1,
+            status: 'ready',
+            message_index: 2,
+            created_at: 1710000000,
+            updated_at: 1710000001,
+            artifact: {
+              title: 'Obsolete plan',
+              goal: 'Must not be restored',
+              steps: [{ id: 'inspect', title: 'Inspect' }],
+            },
+            progress: [{ id: 'inspect', title: 'Inspect', status: 'pending' }],
+          },
+        ],
+      });
+      expect(pendingFrames.length).toBeGreaterThan(0);
+
+      currentSocket.receive({ type: 'history', messages: [], plans: [] });
+      for (const callback of pendingFrames.splice(0)) callback(0);
+
+      expect(stateModule.state.activePlan).toBeNull();
+      expect(stateModule.state.planHistory).toEqual([]);
+      expect(document.querySelector('.plan-artifact-card')).toBeNull();
+      expect(stateModule.state.bulkRenderingChat).toBe(false);
+    } finally {
+      globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+    }
+  });
+
+  it('does not let deferred history overwrite a newer live plan state', () => {
+    const currentSocket = FakeWebSocket.instances.at(-1)!;
+    const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+    const pendingFrames: FrameRequestCallback[] = [];
+    globalThis.requestAnimationFrame = ((callback: FrameRequestCallback) => {
+      pendingFrames.push(callback);
+      return pendingFrames.length;
+    }) as typeof requestAnimationFrame;
+
+    try {
+      stateModule.state.activeGroupId = '';
+      stateModule.state.activeSessionId = 'main';
+      currentSocket.receive({
+        type: 'history',
+        messages: [
+          {
+            role: 'assistant',
+            content: 'Plan body',
+            message_index: 2,
+            timestamp: 1710000000,
+          },
+        ],
+        plans: [
+          {
+            plan_id: 'live-plan',
+            revision: 2,
+            status: 'ready',
+            message_index: 2,
+            created_at: 1710000000,
+            updated_at: 1710000001,
+            artifact: {
+              title: 'Older history plan',
+              goal: 'Do not restore this state',
+              steps: [{ id: 'implement', title: 'Implement' }],
+            },
+            progress: [{ id: 'implement', title: 'Implement', status: 'pending' }],
+          },
+        ],
+      });
+      expect(pendingFrames.length).toBeGreaterThan(0);
+
+      currentSocket.receive({
+        type: 'plan_state',
+        plan: {
+          plan_id: 'live-plan',
+          revision: 2,
+          status: 'executing',
+          message_index: 2,
+          created_at: 1710000000,
+          updated_at: 1710000002,
+          approved_at: 1710000002,
+          execution_attempt: 1,
+          artifact: {
+            title: 'Current live plan',
+            goal: 'Keep the live state',
+            steps: [{ id: 'implement', title: 'Implement' }],
+          },
+          progress: [{ id: 'implement', title: 'Implement', status: 'in_progress' }],
+        },
+      });
+      for (const callback of pendingFrames.splice(0)) callback(0);
+
+      expect(stateModule.state.activePlan?.status).toBe('executing');
+      expect(stateModule.state.activePlan?.artifact.title).toBe('Current live plan');
+      expect(stateModule.state.activePlan?.progress[0]?.status).toBe('in_progress');
+      expect(document.querySelector('.plan-artifact-card')?.textContent).toContain(
+        'Current live plan',
+      );
+      expect(stateModule.state.bulkRenderingChat).toBe(false);
+    } finally {
+      globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+    }
+  });
 });

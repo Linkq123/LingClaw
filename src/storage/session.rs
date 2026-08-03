@@ -7,9 +7,12 @@ use sha2::{Digest, Sha256};
 use super::{Database, StorageError};
 use crate::{
     ChatMessage, DailyUsageSnapshot, PendingPlan, Session, SubagentHistorySnapshot,
+    plan::{PlanArtifact, PlanEvidence, PlanProgressStep, PlanStatus, PlanStepStatus},
     session_store::{SessionSummary, sanitized_non_system_message_count},
     todos::{TodoItem, TodoSnapshot, TodoStatus, TodoUpdatedBy},
 };
+
+const MAX_SYNCED_PLAN_REVISIONS: i64 = 50;
 
 #[derive(Clone)]
 struct StoredMessage {
@@ -71,10 +74,32 @@ struct LoadedSession {
     subagent_snapshots: Vec<(String, String)>,
     todo_state: Option<(i64, String, i64)>,
     todos: Vec<(String, String, String)>,
-    pending_plan: Option<(String, i64, i64, i64)>,
+    pending_plan: Option<LoadedPlan>,
     usage: Option<(i64, i64, i64, i64, String, String, String)>,
     usage_days: Vec<(String, i64, i64)>,
     usage_labels: Vec<(String, String, String, i64, i64)>,
+}
+
+#[derive(Default)]
+struct LoadedPlan {
+    id: String,
+    original_user_message_index: i64,
+    assistant_plan_message_index: i64,
+    created_at: i64,
+    revision: i64,
+    status: String,
+    artifact_json: String,
+    evidence_json: String,
+    evidence_truncated: i64,
+    updated_at: i64,
+    approved_at: Option<i64>,
+    finished_at: Option<i64>,
+    execution_attempt: i64,
+    stale_override_json: Option<String>,
+    stale_override_confirmed_at: Option<i64>,
+    pending_feedback: Option<String>,
+    initial_submission_pending: i64,
+    progress: Vec<(i64, String, String, String, String, Option<String>)>,
 }
 
 fn json_string<T: Serialize>(value: &T) -> Result<String, StorageError> {
@@ -136,6 +161,81 @@ fn message_fingerprint(message: &ChatMessage) -> Result<String, StorageError> {
     let payload =
         serde_json::to_vec(message).map_err(|error| StorageError::new(error.to_string()))?;
     Ok(format!("{:x}", Sha256::digest(payload)))
+}
+
+fn retained_message_suffix(
+    persisted: &[(i64, String)],
+    current: &[StoredMessage],
+    common_prefix: usize,
+) -> Option<(usize, usize)> {
+    if persisted.len() <= 1 || current.len() <= 1 {
+        return None;
+    }
+    let first_suffix_index = common_prefix.max(1);
+    for old_start in first_suffix_index..persisted.len() {
+        let suffix_len = persisted.len() - old_start;
+        if suffix_len > current.len().saturating_sub(first_suffix_index) {
+            continue;
+        }
+        for new_start in first_suffix_index..=current.len() - suffix_len {
+            if persisted[old_start..]
+                .iter()
+                .zip(&current[new_start..new_start + suffix_len])
+                .all(|((_, old), new)| old == &new.fingerprint)
+            {
+                return Some((old_start, new_start));
+            }
+        }
+    }
+    None
+}
+
+fn rebase_persisted_plan_message_indices(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    persisted: &[(i64, String)],
+    current: &[StoredMessage],
+) -> Result<(), StorageError> {
+    let common_prefix = persisted
+        .iter()
+        .zip(current)
+        .take_while(|((_, fingerprint), message)| fingerprint == &message.fingerprint)
+        .count();
+    if common_prefix == persisted.len() && common_prefix == current.len() {
+        return Ok(());
+    }
+
+    let (old_start, new_start) = retained_message_suffix(persisted, current, common_prefix)
+        .unwrap_or((persisted.len(), current.len()));
+    let common_prefix = i64::try_from(common_prefix)
+        .map_err(|_| StorageError::new("Too many common session messages"))?;
+    let old_start = i64::try_from(old_start)
+        .map_err(|_| StorageError::new("Too many persisted session messages"))?;
+    let new_start =
+        i64::try_from(new_start).map_err(|_| StorageError::new("Too many session messages"))?;
+    connection.execute(
+        r#"UPDATE session_plans
+           SET original_user_message_index =
+             CASE WHEN original_user_message_index < ?2
+                  THEN original_user_message_index
+                  WHEN original_user_message_index >= ?3
+                  THEN ?4 + original_user_message_index - ?3
+                  ELSE 0 END
+           WHERE session_id=?1"#,
+        params![session_id, common_prefix, old_start, new_start],
+    )?;
+    connection.execute(
+        r#"UPDATE session_plan_revisions
+           SET assistant_plan_message_index =
+             CASE WHEN assistant_plan_message_index < ?2
+                  THEN assistant_plan_message_index
+                  WHEN assistant_plan_message_index >= ?3
+                  THEN ?4 + assistant_plan_message_index - ?3
+                  ELSE 0 END
+           WHERE session_id=?1"#,
+        params![session_id, common_prefix, old_start, new_start],
+    )?;
+    Ok(())
 }
 
 fn prepare_session(session: &Session) -> Result<StoredSession, StorageError> {
@@ -284,6 +384,12 @@ fn save_prepared_session(
             )));
         }
     }
+    rebase_persisted_plan_message_indices(
+        connection,
+        &session.id,
+        &persisted_messages,
+        &stored.messages,
+    )?;
     let common_prefix = persisted_messages
         .iter()
         .zip(stored.messages.iter())
@@ -379,25 +485,149 @@ fn save_prepared_session(
         )?;
     }
 
-    connection.execute(
-        "DELETE FROM session_pending_plans WHERE session_id=?1",
-        [&session.id],
-    )?;
     if let Some(plan) = &session.pending_plan {
+        let revision = i64::from(plan.revision);
+        let artifact_json = json_string(&plan.artifact)?;
+        let evidence_json = json_string(&plan.evidence)?;
+        let existing_plan_state = connection
+            .query_row(
+                "SELECT current_revision, initial_submission_pending FROM session_plans WHERE session_id=?1 AND plan_id=?2",
+                params![session.id, plan.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let existing_revision_payload = connection
+            .query_row(
+                "SELECT artifact_json, evidence_json FROM session_plan_revisions WHERE session_id=?1 AND plan_id=?2 AND revision=?3",
+                params![session.id, plan.id, revision],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let may_finalize_initial_placeholder = matches!(
+            existing_plan_state,
+            Some((1, 1)) if revision == 1 && !plan.initial_submission_pending
+        );
+        if let Some((existing_artifact, existing_evidence)) = existing_revision_payload
+            && (existing_artifact != artifact_json || existing_evidence != evidence_json)
+            && !may_finalize_initial_placeholder
+        {
+            return Err(StorageError::new(format!(
+                "Plan revision is immutable: session={}, plan={}, revision={}",
+                session.id, plan.id, plan.revision
+            )));
+        }
         connection.execute(
-            r#"INSERT INTO session_pending_plans(
-                session_id, plan_id, original_user_message_index,
-                assistant_plan_message_index, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            r#"UPDATE session_plans
+               SET status='discarded', updated_at=?2, finished_at=COALESCE(finished_at, ?2)
+               WHERE session_id=?1 AND plan_id<>?3
+                 AND status IN ('planning', 'needs_input', 'ready', 'executing')"#,
+            params![
+                session.id,
+                to_i64(plan.updated_at.max(plan.created_at), "plan updated_at")?,
+                plan.id,
+            ],
+        )?;
+        connection.execute(
+            r#"INSERT INTO session_plans(
+                session_id, plan_id, original_user_message_index, current_revision,
+                status, created_at, updated_at, approved_at, finished_at,
+                execution_attempt, evidence_truncated, stale_override_json,
+                stale_override_confirmed_at, pending_feedback, initial_submission_pending
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            ON CONFLICT(session_id, plan_id) DO UPDATE SET
+                original_user_message_index=excluded.original_user_message_index,
+                current_revision=excluded.current_revision,
+                status=excluded.status,
+                updated_at=excluded.updated_at,
+                approved_at=excluded.approved_at,
+                finished_at=excluded.finished_at,
+                execution_attempt=excluded.execution_attempt,
+                evidence_truncated=excluded.evidence_truncated,
+                stale_override_json=excluded.stale_override_json,
+                stale_override_confirmed_at=excluded.stale_override_confirmed_at,
+                pending_feedback=excluded.pending_feedback,
+                initial_submission_pending=excluded.initial_submission_pending"#,
             params![
                 session.id,
                 plan.id,
                 i64::try_from(plan.original_user_message_index)
                     .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                i64::from(plan.revision),
+                plan.status.label(),
+                to_i64(plan.created_at, "plan created_at")?,
+                to_i64(plan.updated_at.max(plan.created_at), "plan updated_at")?,
+                plan.approved_at
+                    .map(|value| to_i64(value, "plan approved_at"))
+                    .transpose()?,
+                plan.finished_at
+                    .map(|value| to_i64(value, "plan finished_at"))
+                    .transpose()?,
+                i64::from(plan.execution_attempt),
+                i64::from(plan.evidence_truncated),
+                (!plan.stale_override_paths.is_empty())
+                    .then(|| json_string(&plan.stale_override_paths))
+                    .transpose()?,
+                plan.stale_override_confirmed_at
+                    .map(|value| to_i64(value, "plan stale_override_confirmed_at"))
+                    .transpose()?,
+                plan.pending_feedback.as_deref(),
+                i64::from(plan.initial_submission_pending),
+            ],
+        )?;
+        connection.execute(
+            r#"INSERT INTO session_plan_revisions(
+                session_id, plan_id, revision, assistant_plan_message_index,
+                artifact_json, evidence_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(session_id, plan_id, revision) DO UPDATE SET
+                assistant_plan_message_index=excluded.assistant_plan_message_index,
+                artifact_json=excluded.artifact_json,
+                evidence_json=excluded.evidence_json"#,
+            params![
+                session.id,
+                plan.id,
+                revision,
                 i64::try_from(plan.assistant_plan_message_index)
                     .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                to_i64(plan.created_at, "pending plan created_at")?,
+                artifact_json,
+                evidence_json,
+                to_i64(
+                    plan.updated_at.max(plan.created_at),
+                    "plan revision created_at"
+                )?,
             ],
+        )?;
+        connection.execute(
+            "DELETE FROM session_plan_progress WHERE session_id=?1 AND plan_id=?2",
+            params![session.id, plan.id],
+        )?;
+        for (position, step) in plan.progress.iter().enumerate() {
+            connection.execute(
+                r#"INSERT INTO session_plan_progress(
+                    session_id, plan_id, position, step_id, title, status, note, deviation_reason
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                params![
+                    session.id,
+                    plan.id,
+                    i64::try_from(position).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    step.id,
+                    step.title,
+                    step.status.label(),
+                    step.note,
+                    step.deviation_reason,
+                ],
+            )?;
+        }
+    } else {
+        let updated_at = to_i64(session.updated_at, "session updated_at")?;
+        connection.execute(
+            r#"UPDATE session_plans
+               SET status='discarded',
+                   updated_at=MAX(updated_at, ?2),
+                   finished_at=COALESCE(finished_at, ?2)
+               WHERE session_id=?1
+                 AND status IN ('planning', 'needs_input', 'ready', 'executing')"#,
+            params![session.id, updated_at],
         )?;
     }
 
@@ -511,6 +741,27 @@ impl Database {
         })
         .await
     }
+
+    /// Replace the current conversation state and remove every plan artifact
+    /// that belonged to the cleared transcript in the same transaction.
+    pub(crate) async fn reset_session_context(
+        &self,
+        session: &Session,
+    ) -> Result<(), StorageError> {
+        let session = session.clone();
+        self.call(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            save_session_record(&transaction, &session)?;
+            transaction.execute(
+                "DELETE FROM session_plans WHERE session_id=?1",
+                [&session.id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
     #[cfg(test)]
     pub(crate) async fn load_session(&self, id: &str) -> Result<Option<Session>, StorageError> {
         let id = id.to_string();
@@ -521,6 +772,20 @@ impl Database {
             load_session_record(connection, &id)?
                 .map(rebuild_session)
                 .transpose()
+        })
+        .await
+    }
+
+    pub(crate) async fn load_plan_history(
+        &self,
+        id: &str,
+    ) -> Result<Vec<serde_json::Value>, StorageError> {
+        let id = id.to_string();
+        self.read(move |connection| {
+            let Some(id) = canonical_session_id_record(connection, &id)? else {
+                return Ok(Vec::new());
+            };
+            load_plan_history_values(connection, &id)
         })
         .await
     }
@@ -995,11 +1260,50 @@ fn load_session_record(
     };
     loaded.pending_plan = connection
         .query_row(
-            "SELECT plan_id, original_user_message_index, assistant_plan_message_index, created_at FROM session_pending_plans WHERE session_id=?1",
+            r#"SELECT p.plan_id, p.original_user_message_index,
+                      r.assistant_plan_message_index, p.created_at,
+                      p.current_revision, p.status, r.artifact_json, r.evidence_json,
+                      p.evidence_truncated, p.updated_at, p.approved_at, p.finished_at,
+                      p.execution_attempt, p.stale_override_json,
+                      p.stale_override_confirmed_at, p.pending_feedback,
+                      p.initial_submission_pending
+               FROM session_plans p
+               JOIN session_plan_revisions r
+                 ON r.session_id=p.session_id AND r.plan_id=p.plan_id
+                AND r.revision=p.current_revision
+               WHERE p.session_id=?1
+               ORDER BY CASE WHEN p.status IN ('planning', 'needs_input', 'ready', 'executing')
+                             THEN 0 ELSE 1 END,
+                        p.updated_at DESC, p.plan_id DESC
+               LIMIT 1"#,
             [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok(LoadedPlan {
+                    id: row.get(0)?,
+                    original_user_message_index: row.get(1)?,
+                    assistant_plan_message_index: row.get(2)?,
+                    created_at: row.get(3)?,
+                    revision: row.get(4)?,
+                    status: row.get(5)?,
+                    artifact_json: row.get(6)?,
+                    evidence_json: row.get(7)?,
+                    evidence_truncated: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    approved_at: row.get(10)?,
+                    finished_at: row.get(11)?,
+                    execution_attempt: row.get(12)?,
+                    stale_override_json: row.get(13)?,
+                    stale_override_confirmed_at: row.get(14)?,
+                    pending_feedback: row.get(15)?,
+                    initial_submission_pending: row.get(16)?,
+                    progress: Vec::new(),
+                })
+            },
         )
         .optional()?;
+    if let Some(plan) = loaded.pending_plan.as_mut() {
+        plan.progress = query_plan_progress(connection, id, &plan.id)?;
+    }
     loaded.usage = connection
         .query_row(
             "SELECT total_input, total_output, current_input, current_output, input_source, output_source, current_day FROM session_usage WHERE session_id=?1",
@@ -1034,6 +1338,138 @@ fn load_session_record(
     Ok(Some(loaded))
 }
 
+type StoredPlanProgress = (i64, String, String, String, String, Option<String>);
+
+fn query_plan_progress(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    plan_id: &str,
+) -> Result<Vec<StoredPlanProgress>, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT position, step_id, title, status, note, deviation_reason
+           FROM session_plan_progress
+           WHERE session_id=?1 AND plan_id=?2 ORDER BY position"#,
+    )?;
+    Ok(statement
+        .query_map(params![session_id, plan_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+fn load_plan_history_values(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<serde_json::Value>, StorageError> {
+    let primary_plan_id = connection
+        .query_row(
+            r#"SELECT plan_id FROM session_plans
+               WHERE session_id=?1
+               ORDER BY CASE WHEN status IN ('planning', 'needs_input', 'ready', 'executing')
+                             THEN 0 ELSE 1 END,
+                        updated_at DESC, plan_id DESC
+               LIMIT 1"#,
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(primary_plan_id) = primary_plan_id else {
+        return Ok(Vec::new());
+    };
+
+    let mut statement = connection.prepare(
+        r#"SELECT p.plan_id, p.original_user_message_index,
+                  r.assistant_plan_message_index, p.created_at,
+                  r.revision, p.current_revision, p.status,
+                  r.artifact_json, r.evidence_json, p.evidence_truncated,
+                  p.updated_at, p.approved_at, p.finished_at,
+                  p.execution_attempt, p.stale_override_json,
+                  p.stale_override_confirmed_at, p.pending_feedback,
+                  p.initial_submission_pending, r.created_at
+           FROM session_plans p
+           JOIN session_plan_revisions r
+             ON r.session_id=p.session_id AND r.plan_id=p.plan_id
+           WHERE p.session_id=?1
+           ORDER BY CASE WHEN p.plan_id=?2 AND r.revision=p.current_revision THEN 0 ELSE 1 END,
+                    r.created_at DESC, p.plan_id DESC, r.revision DESC
+           LIMIT ?3"#,
+    )?;
+    let mut rows = statement
+        .query_map(
+            params![session_id, primary_plan_id, MAX_SYNCED_PLAN_REVISIONS],
+            |row| {
+                Ok((
+                    LoadedPlan {
+                        id: row.get(0)?,
+                        original_user_message_index: row.get(1)?,
+                        assistant_plan_message_index: row.get(2)?,
+                        created_at: row.get(3)?,
+                        revision: row.get(4)?,
+                        status: row.get(6)?,
+                        artifact_json: row.get(7)?,
+                        evidence_json: row.get(8)?,
+                        evidence_truncated: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        approved_at: row.get(11)?,
+                        finished_at: row.get(12)?,
+                        execution_attempt: row.get(13)?,
+                        stale_override_json: row.get(14)?,
+                        stale_override_confirmed_at: row.get(15)?,
+                        pending_feedback: row.get(16)?,
+                        initial_submission_pending: row.get(17)?,
+                        progress: Vec::new(),
+                    },
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(18)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    rows.sort_by(|(left, _, _), (right, _, _)| {
+        left.assistant_plan_message_index
+            .cmp(&right.assistant_plan_message_index)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.revision.cmp(&right.revision))
+    });
+
+    rows.into_iter()
+        .map(|(mut loaded, current_revision, revision_created_at)| {
+            let is_current_revision = loaded.revision == current_revision;
+            let historical = loaded.id != primary_plan_id || !is_current_revision;
+            if is_current_revision {
+                loaded.progress = query_plan_progress(connection, session_id, &loaded.id)?;
+            } else {
+                loaded.updated_at = revision_created_at;
+                loaded.approved_at = None;
+                loaded.finished_at = None;
+                loaded.execution_attempt = 0;
+                loaded.evidence_truncated = 0;
+                loaded.stale_override_json = None;
+                loaded.stale_override_confirmed_at = None;
+                loaded.pending_feedback = None;
+            }
+            let plan = if is_current_revision {
+                rebuild_plan(loaded)?
+            } else {
+                rebuild_historical_plan(loaded)?
+            };
+            let mut value = plan.to_live_value();
+            value["historical"] = serde_json::Value::Bool(historical);
+            Ok(value)
+        })
+        .collect()
+}
+
 pub(super) fn validate_session_record(
     connection: &rusqlite::Connection,
     id: &str,
@@ -1063,6 +1499,183 @@ fn parse_optional_json<T: serde::de::DeserializeOwned>(
             serde_json::from_str(&json).map_err(|error| StorageError::new(error.to_string()))
         })
         .transpose()
+}
+
+fn parse_plan_status(value: &str) -> Result<PlanStatus, StorageError> {
+    match value {
+        "planning" => Ok(PlanStatus::Planning),
+        "needs_input" => Ok(PlanStatus::NeedsInput),
+        "ready" => Ok(PlanStatus::Ready),
+        "executing" => Ok(PlanStatus::Executing),
+        "completed" => Ok(PlanStatus::Completed),
+        "failed" => Ok(PlanStatus::Failed),
+        "stopped" => Ok(PlanStatus::Stopped),
+        "discarded" => Ok(PlanStatus::Discarded),
+        _ => Err(StorageError::new(format!(
+            "Invalid persisted plan status '{value}'"
+        ))),
+    }
+}
+
+fn parse_plan_step_status(value: &str) -> Result<PlanStepStatus, StorageError> {
+    match value {
+        "pending" => Ok(PlanStepStatus::Pending),
+        "in_progress" => Ok(PlanStepStatus::InProgress),
+        "completed" => Ok(PlanStepStatus::Completed),
+        "blocked" => Ok(PlanStepStatus::Blocked),
+        "skipped" => Ok(PlanStepStatus::Skipped),
+        _ => Err(StorageError::new(format!(
+            "Invalid persisted plan step status '{value}'"
+        ))),
+    }
+}
+
+fn rebuild_plan(loaded: LoadedPlan) -> Result<PendingPlan, StorageError> {
+    rebuild_plan_with_context(loaded, false)
+}
+
+fn rebuild_historical_plan(loaded: LoadedPlan) -> Result<PendingPlan, StorageError> {
+    // Progress is intentionally stored only for a plan's current revision.
+    // Superseded immutable revisions reconstruct their initial pending rows
+    // from the validated artifact for read-only history rendering.
+    rebuild_plan_with_context(loaded, true)
+}
+
+fn rebuild_plan_with_context(
+    loaded: LoadedPlan,
+    reconstruct_historical_progress: bool,
+) -> Result<PendingPlan, StorageError> {
+    let mut artifact: PlanArtifact = serde_json::from_str(&loaded.artifact_json)
+        .map_err(|error| StorageError::new(format!("Invalid plan artifact JSON: {error}")))?;
+    // Early development builds derived `Default` for PlanArtifact, which
+    // produced schema_version=0 for an initial planning placeholder. Treat
+    // that one representation as v1 compatibility; every other unsupported
+    // schema version is rejected by validate_persisted_plan below.
+    if artifact.schema_version == 0 {
+        artifact.schema_version = 1;
+    }
+    let evidence: Vec<PlanEvidence> = serde_json::from_str(&loaded.evidence_json)
+        .map_err(|error| StorageError::new(format!("Invalid plan evidence JSON: {error}")))?;
+    if evidence.len() > crate::plan::MAX_PLAN_EVIDENCE {
+        return Err(StorageError::new(
+            "Persisted plan evidence exceeds its limit",
+        ));
+    }
+    let revision = u32::try_from(loaded.revision)
+        .map_err(|_| StorageError::new("Invalid persisted plan revision"))?;
+    if revision == 0 {
+        return Err(StorageError::new(
+            "Persisted plan revision must be positive",
+        ));
+    }
+    // A plan row stores only the current lifecycle status, while immutable
+    // revision rows retain their own artifact shape. Reconstruct superseded
+    // revisions from that shape so a historical needs_input artifact is not
+    // mislabeled as ready (and subsequently rejected as corrupt storage).
+    let status = if reconstruct_historical_progress {
+        if artifact.questions.is_empty() {
+            PlanStatus::Ready
+        } else {
+            PlanStatus::NeedsInput
+        }
+    } else {
+        parse_plan_status(&loaded.status)?
+    };
+    let mut seen_ids = HashSet::new();
+    let progress = loaded
+        .progress
+        .into_iter()
+        .enumerate()
+        .map(
+            |(expected_position, (position, id, title, status, note, deviation_reason))| {
+                let expected_position = i64::try_from(expected_position)
+                    .map_err(|_| StorageError::new("Too many persisted plan steps"))?;
+                if position != expected_position {
+                    return Err(StorageError::new(format!(
+                        "Invalid plan progress position {position}; expected {expected_position}"
+                    )));
+                }
+                if !seen_ids.insert(id.clone()) {
+                    return Err(StorageError::new(format!(
+                        "Duplicate persisted plan step id '{id}'"
+                    )));
+                }
+                Ok(PlanProgressStep {
+                    id,
+                    title,
+                    status: parse_plan_step_status(&status)?,
+                    note,
+                    deviation_reason,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    let stale_override_paths = loaded
+        .stale_override_json
+        .map(|value| {
+            serde_json::from_str::<Vec<String>>(&value)
+                .map_err(|error| StorageError::new(format!("Invalid stale override JSON: {error}")))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut plan = PendingPlan {
+        id: loaded.id,
+        original_user_message_index: to_usize(
+            loaded.original_user_message_index,
+            "plan user index",
+        )?,
+        assistant_plan_message_index: to_usize(
+            loaded.assistant_plan_message_index,
+            "plan assistant index",
+        )?,
+        created_at: to_u64(loaded.created_at, "plan created_at")?,
+        revision,
+        status,
+        artifact,
+        progress,
+        evidence,
+        evidence_truncated: parse_session_flag(
+            loaded.evidence_truncated,
+            "plan evidence_truncated",
+        )?,
+        updated_at: to_u64(loaded.updated_at, "plan updated_at")?,
+        approved_at: loaded
+            .approved_at
+            .map(|value| to_u64(value, "plan approved_at"))
+            .transpose()?,
+        finished_at: loaded
+            .finished_at
+            .map(|value| to_u64(value, "plan finished_at"))
+            .transpose()?,
+        execution_attempt: u32::try_from(loaded.execution_attempt)
+            .map_err(|_| StorageError::new("Invalid plan execution attempt"))?,
+        stale_override_paths,
+        stale_override_confirmed_at: loaded
+            .stale_override_confirmed_at
+            .map(|value| to_u64(value, "plan stale_override_confirmed_at"))
+            .transpose()?,
+        pending_feedback: loaded.pending_feedback,
+        initial_submission_pending: parse_session_flag(
+            loaded.initial_submission_pending,
+            "plan initial_submission_pending",
+        )?,
+    };
+    if reconstruct_historical_progress && plan.progress.is_empty() {
+        plan.progress = plan
+            .artifact
+            .steps
+            .iter()
+            .map(|step| PlanProgressStep {
+                id: step.id.clone(),
+                title: step.title.clone(),
+                ..PlanProgressStep::default()
+            })
+            .collect();
+    }
+    crate::plan::validate_persisted_plan(&plan).map_err(|error| {
+        StorageError::new(format!("Invalid persisted plan '{}': {error}", plan.id))
+    })?;
+    Ok(plan)
 }
 
 fn rebuild_session(loaded: LoadedSession) -> Result<Session, StorageError> {
@@ -1181,20 +1794,7 @@ fn rebuild_session(loaded: LoadedSession) -> Result<Session, StorageError> {
             "Persisted Todo state is not in canonical form",
         ));
     }
-    let pending_plan = loaded
-        .pending_plan
-        .map(|(id, user_index, assistant_index, created_at)| {
-            Ok::<PendingPlan, StorageError>(PendingPlan {
-                id,
-                original_user_message_index: to_usize(user_index, "pending plan user index")?,
-                assistant_plan_message_index: to_usize(
-                    assistant_index,
-                    "pending plan assistant index",
-                )?,
-                created_at: to_u64(created_at, "pending plan created_at")?,
-            })
-        })
-        .transpose()?;
+    let pending_plan = loaded.pending_plan.map(rebuild_plan).transpose()?;
     let mut usage_history = loaded
         .usage_days
         .into_iter()

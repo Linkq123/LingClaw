@@ -79,7 +79,7 @@ Common fields:
 | `structuredMemory` | `false` | Enable Structured Memory |
 | `dailyReflection` | `false` | Enable Daily Reflection |
 | `enableStateDigest` | `true` | Enable working-state digests after observations |
-| `enableTaskPlan` | `false` | Enable rule-based runtime Task Plan guidance |
+| `enableTaskPlan` | `false` | Enable the automatic execution outline for ordinary Execute runs; suppressed during Plan-only and approved-plan execution |
 | `enableS3` | enabled when `s3` exists | Master switch overriding S3 presence |
 
 The service always binds `127.0.0.1:<port>`. Opening a firewall does not make LingClaw listen externally. Use a protected reverse proxy or SSH tunnel for remote access.

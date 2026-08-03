@@ -44,6 +44,14 @@ fn chat_message(role: &str, content: &str, timestamp: u64) -> crate::ChatMessage
     }
 }
 
+fn pending_plan_progress(id: &str, title: &str) -> Vec<crate::plan::PlanProgressStep> {
+    vec![crate::plan::PlanProgressStep {
+        id: id.to_string(),
+        title: title.to_string(),
+        ..Default::default()
+    }]
+}
+
 fn basic_session(id: &str, name: &str) -> crate::Session {
     crate::Session {
         id: id.to_string(),
@@ -177,6 +185,54 @@ fn populated_session() -> crate::Session {
         original_user_message_index: 1,
         assistant_plan_message_index: 2,
         created_at: 700,
+        revision: 2,
+        status: crate::plan::PlanStatus::Stopped,
+        artifact: crate::plan::PlanArtifact {
+            schema_version: 1,
+            title: "Inspect and summarize".into(),
+            goal: "Produce a verified image summary".into(),
+            summary: "Use the configured image workflow.".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "inspect".into(),
+                title: "Inspect the image".into(),
+                description: "Read the image through view_image.".into(),
+                affected_areas: vec!["diagram.png".into()],
+            }],
+            verification: vec!["Confirm the summary matches the image.".into()],
+            acceptance_criteria: vec!["The result names the visible components.".into()],
+            ..Default::default()
+        },
+        progress: vec![
+            crate::plan::PlanProgressStep {
+                id: "inspect".into(),
+                title: "Inspect the image".into(),
+                status: crate::plan::PlanStepStatus::Completed,
+                note: "Image inspected".into(),
+                deviation_reason: None,
+            },
+            crate::plan::PlanProgressStep {
+                id: "adapt".into(),
+                title: "Retry the unavailable preview".into(),
+                status: crate::plan::PlanStepStatus::Blocked,
+                note: "S3 identity changed".into(),
+                deviation_reason: Some("The original signed URL expired".into()),
+            },
+        ],
+        evidence: vec![crate::plan::PlanEvidence {
+            path: "diagram.png".into(),
+            kind: crate::plan::PlanEvidenceKind::File,
+            fingerprint: "sha256-fixture".into(),
+            selector: None,
+        }],
+        evidence_truncated: true,
+        updated_at: 710,
+        approved_at: Some(705),
+        finished_at: Some(710),
+        execution_attempt: 1,
+        stale_override_paths: vec!["diagram.png".into()],
+        stale_override_confirmed_at: Some(706),
+        pending_feedback: Some("Keep the storage recovery path explicit.".into()),
+        initial_submission_pending: false,
     });
     session
         .daily_provider_usage
@@ -208,9 +264,19 @@ fn create_current_database(path: &Path) {
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("current schema should initialize");
     connection
-        .execute(
-            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, 'initial_core_storage', 1)",
-            [schema::SCHEMA_VERSION],
+        .execute_batch(
+            r#"
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (1, 'initial_core_storage', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (2, 'plan_lifecycle', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (3, 'durable_plan_feedback', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (4, 'plan_initial_submission_marker', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (5, 'plan_stale_override_audit', 1);
+            "#,
         )
         .expect("migration ledger should initialize");
     connection
@@ -218,6 +284,154 @@ fn create_current_database(path: &Path) {
         .expect("application id should initialize");
     connection
         .pragma_update(None, "user_version", schema::SCHEMA_VERSION)
+        .expect("schema version should initialize");
+}
+
+fn create_v1_plan_database(path: &Path, include_assistant_message: bool) {
+    let connection = rusqlite::Connection::open(path).expect("test database should open");
+    connection
+        .execute_batch(schema::INITIAL_SCHEMA)
+        .expect("base schema should initialize");
+    connection
+        .execute_batch(
+            r#"
+            DROP TABLE session_plan_progress;
+            DROP TABLE session_plan_revisions;
+            DROP TABLE session_plans;
+            CREATE TABLE session_pending_plans (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                plan_id TEXT NOT NULL,
+                original_user_message_index INTEGER NOT NULL,
+                assistant_plan_message_index INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            "#,
+        )
+        .expect("v1 plan table should initialize");
+    connection
+        .execute(
+            r#"INSERT INTO sessions(
+                id, name, created_at, updated_at, tool_calls_count, model_override,
+                think_level, show_react, show_tools, show_reasoning,
+                visible_message_count, version
+            ) VALUES ('legacy-plan-session', 'Legacy plan', 1, 2, 0, NULL,
+                      'medium', 1, 1, 1, 2, 7)"#,
+            [],
+        )
+        .expect("session should insert");
+    if include_assistant_message {
+        connection
+            .execute(
+                r#"INSERT INTO session_messages(
+                    session_id, position, role, content, images_json, thinking,
+                    thinking_blocks_json, tool_calls_json, tool_call_id, timestamp, fingerprint
+                ) VALUES ('legacy-plan-session', 1, 'assistant', '# Legacy plan\n\n1. Inspect',
+                          NULL, NULL, NULL, NULL, NULL, 2, 'fixture')"#,
+                [],
+            )
+            .expect("assistant message should insert");
+    }
+    connection
+        .execute(
+            r#"INSERT INTO session_pending_plans(
+                session_id, plan_id, original_user_message_index,
+                assistant_plan_message_index, created_at
+            ) VALUES ('legacy-plan-session', 'legacy-plan-id', 0, 1, 2)"#,
+            [],
+        )
+        .expect("legacy plan should insert");
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (1, 'initial_core_storage', 1)",
+            [],
+        )
+        .expect("v1 migration ledger should initialize");
+    connection
+        .pragma_update(None, "application_id", schema::APPLICATION_ID)
+        .expect("application id should initialize");
+    connection
+        .pragma_update(None, "user_version", 1)
+        .expect("schema version should initialize");
+}
+
+fn create_v2_plan_database(path: &Path) {
+    let connection = rusqlite::Connection::open(path).expect("test database should open");
+    connection
+        .execute_batch(schema::INITIAL_SCHEMA)
+        .expect("base schema should initialize");
+    connection
+        .execute_batch(
+            r#"
+            ALTER TABLE session_plans DROP COLUMN initial_submission_pending;
+            ALTER TABLE session_plans DROP COLUMN pending_feedback;
+            ALTER TABLE session_plans DROP COLUMN stale_override_confirmed_at;
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (1, 'initial_core_storage', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (2, 'plan_lifecycle', 1);
+            "#,
+        )
+        .expect("v2 plan schema should initialize");
+    connection
+        .pragma_update(None, "application_id", schema::APPLICATION_ID)
+        .expect("application id should initialize");
+    connection
+        .pragma_update(None, "user_version", 2)
+        .expect("schema version should initialize");
+}
+
+fn create_v3_plan_database(path: &Path) {
+    let connection = rusqlite::Connection::open(path).expect("test database should open");
+    connection
+        .execute_batch(schema::INITIAL_SCHEMA)
+        .expect("base schema should initialize");
+    connection
+        .execute_batch(
+            r#"
+            ALTER TABLE session_plans DROP COLUMN initial_submission_pending;
+            ALTER TABLE session_plans DROP COLUMN stale_override_confirmed_at;
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (1, 'initial_core_storage', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (2, 'plan_lifecycle', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (3, 'durable_plan_feedback', 1);
+            "#,
+        )
+        .expect("v3 plan schema should initialize");
+    connection
+        .pragma_update(None, "application_id", schema::APPLICATION_ID)
+        .expect("application id should initialize");
+    connection
+        .pragma_update(None, "user_version", 3)
+        .expect("schema version should initialize");
+}
+
+fn create_v4_plan_database(path: &Path) {
+    let connection = rusqlite::Connection::open(path).expect("test database should open");
+    connection
+        .execute_batch(schema::INITIAL_SCHEMA)
+        .expect("base schema should initialize");
+    connection
+        .execute_batch(
+            r#"
+            ALTER TABLE session_plans DROP COLUMN stale_override_confirmed_at;
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (1, 'initial_core_storage', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (2, 'plan_lifecycle', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (3, 'durable_plan_feedback', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (4, 'plan_initial_submission_marker', 1);
+            "#,
+        )
+        .expect("v4 plan schema should initialize");
+    connection
+        .pragma_update(None, "application_id", schema::APPLICATION_ID)
+        .expect("application id should initialize");
+    connection
+        .pragma_update(None, "user_version", 4)
         .expect("schema version should initialize");
 }
 
@@ -318,6 +532,353 @@ async fn opens_an_empty_database_with_the_current_schema() {
         assert!(tables.contains(required), "missing table {required}");
     }
     drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_v1_migration_backs_up_and_converts_legacy_pending_plans() {
+    let home = temp_home("schema-v1-plan");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    create_v1_plan_database(&path, true);
+
+    let database = Database::open(path.clone())
+        .await
+        .expect("v1 database should migrate");
+    let converted = database
+        .read(|connection| {
+            let version =
+                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+            let plan = connection.query_row(
+                r#"SELECT p.status, p.current_revision, r.artifact_json
+                   FROM session_plans p
+                   JOIN session_plan_revisions r
+                     ON r.session_id=p.session_id AND r.plan_id=p.plan_id
+                    AND r.revision=p.current_revision
+                   WHERE p.session_id='legacy-plan-session'"#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            let legacy_table: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_pending_plans'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok((version, plan, legacy_table))
+        })
+        .await
+        .expect("converted plan should be queryable");
+    assert_eq!(converted.0, schema::SCHEMA_VERSION);
+    assert_eq!(converted.1.0, "ready");
+    assert_eq!(converted.1.1, 1);
+    assert!(converted.1.2.contains("# Legacy plan"));
+    assert_eq!(converted.2, 0);
+
+    let backups = std::fs::read_dir(home.join("backups"))
+        .expect("schema backup directory should exist")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("schema backups should be readable");
+    assert!(backups.iter().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("lingclaw-schema-v1-")
+    }));
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_v1_migration_preserves_legacy_plans_above_the_new_submission_limit() {
+    let home = temp_home("schema-v1-large-plan");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    create_v1_plan_database(&path, true);
+    let markdown = format!(
+        "# Large legacy plan\n\n{}",
+        "x".repeat(crate::plan::MAX_PLAN_BYTES / 2)
+    );
+    assert!(
+        serde_json::to_vec(&crate::plan::legacy_artifact(&markdown))
+            .expect("legacy artifact should serialize")
+            .len()
+            > crate::plan::MAX_PLAN_BYTES,
+        "fixture must exceed the limit applied to newly submitted plans"
+    );
+    {
+        let connection = rusqlite::Connection::open(&path).expect("v1 database should reopen");
+        connection
+            .execute(
+                "UPDATE session_messages SET content=?1 WHERE session_id='legacy-plan-session' AND position=1",
+                [&markdown],
+            )
+            .expect("legacy plan message should update");
+    }
+
+    let database = Database::open(path)
+        .await
+        .expect("an oversized v1 plan must not block schema migration");
+    let artifact_json = database
+        .read(|connection| {
+            connection
+                .query_row(
+                    "SELECT artifact_json FROM session_plan_revisions WHERE session_id='legacy-plan-session' AND revision=1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(StorageError::from)
+        })
+        .await
+        .expect("migrated artifact should be readable");
+    let artifact: crate::plan::PlanArtifact =
+        serde_json::from_str(&artifact_json).expect("migrated artifact should deserialize");
+    crate::plan::validate_persisted_legacy_artifact(&artifact)
+        .expect("migrated artifact should pass durable validation");
+    assert_eq!(artifact.legacy_markdown.as_deref(), Some(markdown.as_str()));
+    assert_eq!(artifact.steps[0].description, markdown);
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_v2_migration_adds_durable_plan_feedback() {
+    let home = temp_home("schema-v2-plan-feedback");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    create_v2_plan_database(&path);
+
+    let database = Database::open(path.clone())
+        .await
+        .expect("v2 database should migrate");
+    let (version, columns, migrations) = database
+        .read(|connection| {
+            let version =
+                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+            let columns = connection
+                .prepare("PRAGMA table_info(session_plans)")?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let migrations = connection
+                .prepare("SELECT version, name FROM schema_migrations ORDER BY version")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((version, columns, migrations))
+        })
+        .await
+        .expect("migrated schema should be queryable");
+    assert_eq!(version, schema::SCHEMA_VERSION);
+    assert!(columns.iter().any(|column| column == "pending_feedback"));
+    assert!(
+        columns
+            .iter()
+            .any(|column| column == "initial_submission_pending")
+    );
+    assert!(
+        columns
+            .iter()
+            .any(|column| column == "stale_override_confirmed_at")
+    );
+    assert_eq!(
+        migrations,
+        vec![
+            (1, "initial_core_storage".to_string()),
+            (2, "plan_lifecycle".to_string()),
+            (3, "durable_plan_feedback".to_string()),
+            (4, "plan_initial_submission_marker".to_string()),
+            (5, "plan_stale_override_audit".to_string()),
+        ]
+    );
+
+    let backups = std::fs::read_dir(home.join("backups"))
+        .expect("schema backup directory should exist")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("schema backups should be readable");
+    assert!(backups.iter().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("lingclaw-schema-v2-")
+    }));
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_v3_migration_adds_initial_submission_marker() {
+    let home = temp_home("schema-v3-initial-plan-marker");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    create_v3_plan_database(&path);
+
+    let database = Database::open(path.clone())
+        .await
+        .expect("v3 database should migrate");
+    let (version, marker_default, migration_name) = database
+        .read(|connection| {
+            let version =
+                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+            let marker_default = connection
+                .prepare("PRAGMA table_info(session_plans)")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(4)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .find(|(name, _)| name == "initial_submission_pending")
+                .and_then(|(_, default)| default);
+            let migration_name = connection.query_row(
+                "SELECT name FROM schema_migrations WHERE version=4",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            Ok((version, marker_default, migration_name))
+        })
+        .await
+        .expect("migrated marker should be queryable");
+    assert_eq!(version, schema::SCHEMA_VERSION);
+    assert_eq!(marker_default.as_deref(), Some("0"));
+    assert_eq!(migration_name, "plan_initial_submission_marker");
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_v4_migration_adds_plan_stale_override_audit() {
+    let home = temp_home("schema-v4-stale-override-audit");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    create_v4_plan_database(&path);
+
+    let database = Database::open(path.clone())
+        .await
+        .expect("v4 database should migrate");
+    let (version, override_default, migration_name) = database
+        .read(|connection| {
+            let version =
+                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+            let override_default = connection
+                .prepare("PRAGMA table_info(session_plans)")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(4)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .find(|(name, _)| name == "stale_override_confirmed_at")
+                .and_then(|(_, default)| default);
+            let migration_name = connection.query_row(
+                "SELECT name FROM schema_migrations WHERE version=5",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            Ok((version, override_default, migration_name))
+        })
+        .await
+        .expect("migrated audit field should be queryable");
+    assert_eq!(version, schema::SCHEMA_VERSION);
+    assert_eq!(override_default, None);
+    assert_eq!(migration_name, "plan_stale_override_audit");
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_migration_rolls_back_when_precommit_validation_finds_drift() {
+    let home = temp_home("schema-drift-rollback");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    create_v2_plan_database(&path);
+    {
+        let connection = rusqlite::Connection::open(&path).expect("fixture should open");
+        connection
+            .execute("CREATE TABLE unexpected_extension(value TEXT)", [])
+            .expect("schema drift should be installed");
+    }
+
+    let error = match Database::open(path.clone()).await {
+        Ok(_) => panic!("schema drift must abort migration"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unexpected_extension"));
+
+    let connection = rusqlite::Connection::open(&path).expect("original database should remain");
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(session_plans)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let migration_three: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=3",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 2);
+    assert!(!columns.iter().any(|column| column == "pending_feedback"));
+    assert!(
+        !columns
+            .iter()
+            .any(|column| column == "initial_submission_pending")
+    );
+    assert_eq!(migration_three, 0);
+    drop(connection);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_v1_plan_migration_rolls_back_when_legacy_message_is_missing() {
+    let home = temp_home("schema-v1-plan-rollback");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    create_v1_plan_database(&path, false);
+
+    let error = match Database::open(path.clone()).await {
+        Ok(_) => panic!("invalid legacy plan must abort migration"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("missing assistant message"));
+
+    let connection = rusqlite::Connection::open(&path).expect("original database should remain");
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    let legacy_table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_pending_plans'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let lifecycle_table: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_plans'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(legacy_table, 1);
+    assert_eq!(lifecycle_table, 0);
+    drop(connection);
+
     remove_home(&home);
 }
 
@@ -533,6 +1094,673 @@ async fn session_round_trip_preserves_fields_without_ephemeral_image_secrets() {
     let searchable = String::from_utf8_lossy(&database_bytes);
     assert!(!searchable.contains("private-image-marker"));
     assert!(!searchable.contains("base64-private-image-marker"));
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn initial_plan_submission_marker_survives_a_database_round_trip() {
+    let (home, database) = open_temp_database("initial-plan-marker-round-trip").await;
+    let mut session = basic_session("initial-plan-marker", "Initial plan marker");
+    session
+        .messages
+        .push(chat_message("user", "Plan this change", 2));
+    let mut plan = crate::PendingPlan::new(
+        "plan-initial-marker".into(),
+        1,
+        1,
+        2,
+        1,
+        crate::plan::PlanStatus::Planning,
+        crate::plan::PlanArtifact {
+            title: "Planning".into(),
+            goal: "Plan this change".into(),
+            ..Default::default()
+        },
+        Vec::new(),
+        false,
+    );
+    plan.initial_submission_pending = true;
+    session.pending_plan = Some(plan);
+
+    database.save_session(&session).await.unwrap();
+    let loaded = database.load_session(&session.id).await.unwrap().unwrap();
+
+    assert!(
+        loaded
+            .pending_plan
+            .as_ref()
+            .is_some_and(|plan| plan.initial_submission_pending)
+    );
+
+    let plan = session.pending_plan.as_mut().unwrap();
+    plan.initial_submission_pending = false;
+    plan.status = crate::plan::PlanStatus::Ready;
+    plan.artifact.title = "Final plan".into();
+    plan.artifact.steps.push(crate::plan::PlanStep {
+        id: "implement".into(),
+        title: "Implement the plan".into(),
+        ..Default::default()
+    });
+    plan.evidence.push(crate::plan::PlanEvidence {
+        path: "README.md".into(),
+        kind: crate::plan::PlanEvidenceKind::File,
+        fingerprint: "sha256-final".into(),
+        selector: None,
+    });
+    plan.updated_at = 3;
+    database.save_session(&session).await.unwrap();
+
+    let finalized = database.load_session(&session.id).await.unwrap().unwrap();
+    let finalized_plan = finalized.pending_plan.unwrap();
+    assert!(!finalized_plan.initial_submission_pending);
+    assert_eq!(finalized_plan.artifact.title, "Final plan");
+    assert_eq!(finalized_plan.evidence.len(), 1);
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn persisted_plan_revision_rejects_artifact_and_evidence_rewrites() {
+    let (home, database) = open_temp_database("immutable-plan-revision").await;
+    let mut session = basic_session("immutable-plan-revision", "Immutable plan revision");
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "immutable-plan".into(),
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        artifact: crate::plan::PlanArtifact {
+            title: "Original plan".into(),
+            goal: "Preserve the approved contract".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "inspect".into(),
+                title: "Inspect".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        updated_at: 2,
+        ..Default::default()
+    });
+    database.save_session(&session).await.unwrap();
+
+    let plan = session.pending_plan.as_mut().unwrap();
+    plan.artifact.title = "Rewritten plan".into();
+    plan.evidence.push(crate::plan::PlanEvidence {
+        path: "Cargo.toml".into(),
+        kind: crate::plan::PlanEvidenceKind::File,
+        fingerprint: "sha256-rewritten".into(),
+        selector: None,
+    });
+    plan.updated_at = 3;
+    let error = database
+        .save_session(&session)
+        .await
+        .expect_err("the same revision must remain immutable");
+    assert!(error.to_string().contains("Plan revision is immutable"));
+
+    let stored = database.load_session(&session.id).await.unwrap().unwrap();
+    let stored_plan = stored.pending_plan.unwrap();
+    assert_eq!(stored_plan.artifact.title, "Original plan");
+    assert!(stored_plan.evidence.is_empty());
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn plan_history_returns_superseded_revisions_as_read_only_entries() {
+    let (home, database) = open_temp_database("plan-history").await;
+    let mut session = basic_session("plan-history", "Plan history");
+    session
+        .messages
+        .push(chat_message("user", "Plan this change", 2));
+    session
+        .messages
+        .push(chat_message("assistant", "First plan", 3));
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-history-id".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        created_at: 2,
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        artifact: crate::plan::PlanArtifact {
+            title: "First revision".into(),
+            goal: "Ship the change".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "step-1".into(),
+                title: "Inspect".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        progress: pending_plan_progress("step-1", "Inspect"),
+        updated_at: 3,
+        ..Default::default()
+    });
+    database.save_session(&session).await.unwrap();
+
+    session
+        .messages
+        .push(chat_message("user", "Include verification", 4));
+    session
+        .messages
+        .push(chat_message("assistant", "Second plan", 5));
+    let plan = session.pending_plan.as_mut().unwrap();
+    plan.revision = 2;
+    plan.assistant_plan_message_index = 4;
+    plan.artifact.title = "Second revision".into();
+    plan.updated_at = 5;
+    database.save_session(&session).await.unwrap();
+
+    let history = database.load_plan_history(&session.id).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["revision"], 1);
+    assert_eq!(history[0]["artifact"]["title"], "First revision");
+    assert_eq!(history[0]["historical"], true);
+    assert_eq!(history[1]["revision"], 2);
+    assert_eq!(history[1]["artifact"]["title"], "Second revision");
+    assert_eq!(history[1]["historical"], false);
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn plan_history_preserves_a_superseded_needs_input_revision() {
+    let (home, database) = open_temp_database("plan-history-needs-input").await;
+    let mut session = basic_session("plan-history-needs-input", "Plan history needs input");
+    session
+        .messages
+        .push(chat_message("user", "Plan this change", 2));
+    session
+        .messages
+        .push(chat_message("assistant", "Which scope?", 3));
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-history-needs-input-id".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        created_at: 2,
+        revision: 1,
+        status: crate::plan::PlanStatus::NeedsInput,
+        artifact: crate::plan::PlanArtifact {
+            title: "Choose scope".into(),
+            goal: "Plan the selected scope".into(),
+            questions: vec![crate::plan::PlanQuestion {
+                id: "scope".into(),
+                prompt: "Which scope should the plan cover?".into(),
+                options: vec![
+                    crate::plan::PlanQuestionOption {
+                        id: "focused".into(),
+                        label: "Focused".into(),
+                        ..Default::default()
+                    },
+                    crate::plan::PlanQuestionOption {
+                        id: "complete".into(),
+                        label: "Complete".into(),
+                        ..Default::default()
+                    },
+                ],
+            }],
+            ..Default::default()
+        },
+        updated_at: 3,
+        ..Default::default()
+    });
+    database.save_session(&session).await.unwrap();
+
+    session
+        .messages
+        .push(chat_message("user", "Use the focused scope", 4));
+    session
+        .messages
+        .push(chat_message("assistant", "Focused plan", 5));
+    let plan = session.pending_plan.as_mut().unwrap();
+    plan.revision = 2;
+    plan.status = crate::plan::PlanStatus::Ready;
+    plan.assistant_plan_message_index = 4;
+    plan.artifact = crate::plan::PlanArtifact {
+        title: "Focused plan".into(),
+        goal: "Implement the focused change".into(),
+        steps: vec![crate::plan::PlanStep {
+            id: "implement".into(),
+            title: "Implement".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    plan.progress = pending_plan_progress("implement", "Implement");
+    plan.updated_at = 5;
+    database.save_session(&session).await.unwrap();
+
+    let history = database.load_plan_history(&session.id).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["revision"], 1);
+    assert_eq!(history[0]["status"], "needs_input");
+    assert_eq!(history[0]["historical"], true);
+    assert_eq!(history[1]["revision"], 2);
+    assert_eq!(history[1]["status"], "ready");
+    assert_eq!(history[1]["historical"], false);
+    assert_eq!(database.status().mode, crate::storage::StorageMode::Healthy);
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn plan_history_is_bounded_and_keeps_the_current_revision() {
+    let (home, database) = open_temp_database("bounded-plan-history").await;
+    let mut session = basic_session("bounded-plan-history", "Bounded plan history");
+    session
+        .messages
+        .push(chat_message("user", "Plan this change", 2));
+    session
+        .messages
+        .push(chat_message("assistant", "Plan revision", 3));
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "bounded-plan-id".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        created_at: 2,
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        artifact: crate::plan::PlanArtifact {
+            title: "Revision 1".into(),
+            goal: "Keep history bounded".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "step-1".into(),
+                title: "Inspect".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        progress: pending_plan_progress("step-1", "Inspect"),
+        updated_at: 3,
+        ..Default::default()
+    });
+
+    for revision in 1..=55_u32 {
+        let plan = session.pending_plan.as_mut().unwrap();
+        plan.revision = revision;
+        plan.artifact.title = format!("Revision {revision}");
+        plan.updated_at = u64::from(revision) + 2;
+        database.save_session(&session).await.unwrap();
+    }
+
+    let history = database.load_plan_history(&session.id).await.unwrap();
+    assert_eq!(history.len(), 50);
+    assert_eq!(
+        history.first().and_then(|plan| plan["revision"].as_u64()),
+        Some(6)
+    );
+    assert_eq!(
+        history.last().and_then(|plan| plan["revision"].as_u64()),
+        Some(55)
+    );
+    assert_eq!(
+        history.last().map(|plan| &plan["historical"]),
+        Some(&serde_json::json!(false))
+    );
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn plan_message_anchors_follow_context_prefix_pruning() {
+    let (home, database) = open_temp_database("plan-anchor-prune").await;
+    let mut session = basic_session("plan-anchor-prune", "Plan anchor prune");
+    session.messages.extend([
+        chat_message("user", "Plan this change", 2),
+        chat_message("assistant", "First plan", 3),
+        chat_message("user", "Add verification", 4),
+        chat_message("assistant", "Second plan", 5),
+        chat_message("user", "Keep going", 6),
+        chat_message("assistant", "Working", 7),
+    ]);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-anchor-id".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        created_at: 2,
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        artifact: crate::plan::PlanArtifact {
+            title: "First revision".into(),
+            goal: "Ship the change".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "step-1".into(),
+                title: "Inspect".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        progress: pending_plan_progress("step-1", "Inspect"),
+        updated_at: 3,
+        ..Default::default()
+    });
+    database.save_session(&session).await.unwrap();
+
+    let plan = session.pending_plan.as_mut().unwrap();
+    plan.revision = 2;
+    plan.original_user_message_index = 3;
+    plan.assistant_plan_message_index = 4;
+    plan.artifact.title = "Second revision".into();
+    plan.updated_at = 5;
+    database.save_session(&session).await.unwrap();
+
+    session.messages.drain(1..3);
+    session
+        .pending_plan
+        .as_mut()
+        .unwrap()
+        .rebase_message_indices_after_prefix_prune(2);
+    database.save_session(&session).await.unwrap();
+
+    let history = database.load_plan_history(&session.id).await.unwrap();
+    assert_eq!(history[0]["revision"], 1);
+    assert_eq!(history[0]["message_index"], 0);
+    assert_eq!(history[1]["revision"], 2);
+    assert_eq!(history[1]["message_index"], 2);
+    let loaded = database.load_session(&session.id).await.unwrap().unwrap();
+    let current = loaded.pending_plan.unwrap();
+    assert_eq!(current.original_user_message_index, 1);
+    assert_eq!(current.assistant_plan_message_index, 2);
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn plan_message_anchors_in_unchanged_prefix_survive_tail_rewrites() {
+    let (home, database) = open_temp_database("plan-anchor-tail-rewrite").await;
+    let mut session = basic_session("plan-anchor-tail-rewrite", "Plan anchor tail rewrite");
+    session.messages.extend([
+        chat_message("user", "Plan this change", 2),
+        chat_message("assistant", "First plan", 3),
+        chat_message("user", "Revise the plan", 4),
+        chat_message("assistant", "Second plan", 5),
+        chat_message("assistant", "Original tail", 6),
+    ]);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-anchor-tail-id".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        created_at: 2,
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        artifact: crate::plan::PlanArtifact {
+            title: "First revision".into(),
+            goal: "Preserve historical anchors".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "inspect".into(),
+                title: "Inspect".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        progress: pending_plan_progress("inspect", "Inspect"),
+        updated_at: 3,
+        ..Default::default()
+    });
+    database.save_session(&session).await.unwrap();
+
+    let plan = session.pending_plan.as_mut().unwrap();
+    plan.revision = 2;
+    plan.original_user_message_index = 3;
+    plan.assistant_plan_message_index = 4;
+    plan.artifact.title = "Second revision".into();
+    plan.updated_at = 5;
+    database.save_session(&session).await.unwrap();
+
+    session.messages[5].content = Some("Rewritten tail".into());
+    database.save_session(&session).await.unwrap();
+
+    let history = database.load_plan_history(&session.id).await.unwrap();
+    let first = history
+        .iter()
+        .find(|plan| plan["revision"] == 1)
+        .expect("first revision should remain in history");
+    let second = history
+        .iter()
+        .find(|plan| plan["revision"] == 2)
+        .expect("second revision should remain in history");
+    assert_eq!(first["message_index"], 2);
+    assert_eq!(second["message_index"], 4);
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn plan_message_anchor_rebase_does_not_reuse_an_identical_prefix_message() {
+    let (home, database) = open_temp_database("plan-anchor-repeated-message").await;
+    let mut session = basic_session(
+        "plan-anchor-repeated-message",
+        "Plan anchor repeated message",
+    );
+    session.messages.extend([
+        chat_message("user", "Plan this change", 2),
+        chat_message("assistant", "Repeated message", 3),
+        chat_message("assistant", "Repeated message", 3),
+        chat_message("assistant", "Current plan", 4),
+    ]);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-anchor-repeated-id".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 3,
+        created_at: 2,
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        artifact: crate::plan::PlanArtifact {
+            title: "Removed revision".into(),
+            goal: "Do not reuse an identical prefix message".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "inspect".into(),
+                title: "Inspect".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        progress: pending_plan_progress("inspect", "Inspect"),
+        updated_at: 3,
+        ..Default::default()
+    });
+    database.save_session(&session).await.unwrap();
+
+    let plan = session.pending_plan.as_mut().unwrap();
+    plan.revision = 2;
+    plan.assistant_plan_message_index = 4;
+    plan.artifact.title = "Current revision".into();
+    plan.updated_at = 4;
+    database.save_session(&session).await.unwrap();
+
+    session.messages.remove(3);
+    session
+        .pending_plan
+        .as_mut()
+        .unwrap()
+        .assistant_plan_message_index = 3;
+    database.save_session(&session).await.unwrap();
+
+    let history = database.load_plan_history(&session.id).await.unwrap();
+    let removed = history
+        .iter()
+        .find(|plan| plan["revision"] == 1)
+        .expect("removed revision should remain in history");
+    let current = history
+        .iter()
+        .find(|plan| plan["revision"] == 2)
+        .expect("current revision should remain in history");
+    assert_eq!(removed["message_index"], 0);
+    assert_eq!(current["message_index"], 3);
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[test]
+fn runtime_instance_lock_is_exclusive_and_reusable() {
+    let home = temp_home("runtime-lock");
+    let database_path = home.join("lingclaw.db");
+    let first = crate::storage::RuntimeInstanceLock::acquire(&database_path).unwrap();
+    let error = crate::storage::RuntimeInstanceLock::acquire(&database_path)
+        .err()
+        .expect("a second process lock must be rejected");
+    assert!(error.to_string().contains("another LingClaw process"));
+    drop(first);
+    let second = crate::storage::RuntimeInstanceLock::acquire(&database_path)
+        .expect("the lock should be reusable after release");
+    drop(second);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn database_recovers_process_bound_plan_states_after_restart() {
+    let (home, database) = open_temp_database("recover-interrupted-plans").await;
+    let artifact = crate::plan::PlanArtifact {
+        title: "Restart-safe plan".into(),
+        goal: "Recover the plan lifecycle".into(),
+        steps: vec![crate::plan::PlanStep {
+            id: "recover".into(),
+            title: "Recover after restart".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut planning = basic_session("planning-on-restart", "Planning on restart");
+    planning.pending_plan = Some(crate::PendingPlan::new(
+        "planning-plan".into(),
+        0,
+        0,
+        10,
+        1,
+        crate::plan::PlanStatus::Planning,
+        artifact.clone(),
+        Vec::new(),
+        false,
+    ));
+    planning.pending_plan.as_mut().unwrap().pending_feedback =
+        Some("Keep the recovered question answer".into());
+    database.save_session(&planning).await.unwrap();
+
+    let mut executing = basic_session("executing-on-restart", "Executing on restart");
+    let mut executing_plan = crate::PendingPlan::new(
+        "executing-plan".into(),
+        0,
+        0,
+        10,
+        2,
+        crate::plan::PlanStatus::Executing,
+        artifact,
+        Vec::new(),
+        false,
+    );
+    executing_plan.approved_at = Some(20);
+    executing_plan.execution_attempt = 1;
+    executing.pending_plan = Some(executing_plan);
+    database.save_session(&executing).await.unwrap();
+
+    assert_eq!(database.recover_interrupted_plans().await.unwrap(), (1, 1));
+
+    let planning = database
+        .load_session(&planning.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .pending_plan
+        .unwrap();
+    assert_eq!(planning.status, crate::plan::PlanStatus::Stopped);
+    assert_eq!(planning.approved_at, None);
+    assert_eq!(planning.execution_attempt, 0);
+    assert_eq!(
+        planning.pending_feedback.as_deref(),
+        Some("Keep the recovered question answer")
+    );
+    assert!(planning.finished_at.is_some());
+
+    let executing = database
+        .load_session(&executing.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .pending_plan
+        .unwrap();
+    assert_eq!(executing.status, crate::plan::PlanStatus::Stopped);
+    assert_eq!(executing.approved_at, Some(20));
+    assert_eq!(executing.execution_attempt, 1);
+    assert!(executing.finished_at.is_some());
+
+    assert_eq!(database.recover_interrupted_plans().await.unwrap(), (0, 0));
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn clearing_an_active_plan_persists_a_discarded_terminal_state() {
+    let (home, database) = open_temp_database("clear-active-plan").await;
+    let mut session = basic_session("clear-active-plan", "Clear active plan");
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-to-clear".into(),
+        status: crate::plan::PlanStatus::Ready,
+        created_at: 2,
+        updated_at: 3,
+        ..Default::default()
+    });
+    database.save_session(&session).await.unwrap();
+
+    session.pending_plan = None;
+    session.updated_at = 4;
+    database.save_session(&session).await.unwrap();
+
+    let loaded = database.load_session(&session.id).await.unwrap().unwrap();
+    let plan = loaded
+        .pending_plan
+        .expect("cleared plan history should remain available");
+    assert_eq!(plan.id, "plan-to-clear");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Discarded);
+    assert_eq!(plan.finished_at, Some(4));
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn resetting_session_context_removes_all_plan_history() {
+    let (home, database) = open_temp_database("reset-plan-history").await;
+    let mut session = basic_session("reset-plan-history", "Reset plan history");
+    session.messages.extend([
+        chat_message("user", "Plan this change", 2),
+        chat_message("assistant", "The plan", 3),
+    ]);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan-to-reset".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        status: crate::plan::PlanStatus::Completed,
+        created_at: 2,
+        updated_at: 3,
+        finished_at: Some(3),
+        ..Default::default()
+    });
+    database.save_session(&session).await.unwrap();
+
+    session.messages.truncate(1);
+    session.pending_plan = None;
+    session.updated_at = 4;
+    database.reset_session_context(&session).await.unwrap();
+
+    assert!(
+        database
+            .load_plan_history(&session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let loaded = database.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(loaded.messages.len(), 1);
+    assert!(loaded.pending_plan.is_none());
 
     drop(database);
     remove_home(&home);
@@ -2142,6 +3370,46 @@ async fn invalid_message_json_enters_sticky_protected_mode_during_rebuild() {
             .expect_err("sticky protection must reject later writes")
             .to_string()
             .contains(&reason)
+    );
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn invalid_plan_artifact_enters_sticky_protected_mode_during_rebuild() {
+    let (home, database) = open_temp_database("protected-plan-artifact").await;
+    let session = populated_session();
+    let session_id = session.id.clone();
+    database.save_session(&session).await.unwrap();
+    let corrupt_session_id = session_id.clone();
+    database
+        .call(move |connection| {
+            connection.execute(
+                r#"UPDATE session_plan_revisions
+                   SET artifact_json='{"schema_version":1,"title":"","goal":"Invalid","steps":[{"id":"inspect","title":"Inspect"}]}'
+                   WHERE session_id=?1"#,
+                [&corrupt_session_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let error = match database.load_session(&session_id).await {
+        Err(error) => error,
+        Ok(_) => panic!("semantically invalid plan data must fail the read"),
+    };
+    assert!(error.to_string().contains("Invalid persisted plan"));
+    assert!(error.to_string().contains("title must contain"));
+    assert_eq!(database.status().mode, StorageMode::Protected);
+    assert!(
+        database
+            .save_session(&basic_session("blocked-plan-write", "Blocked"))
+            .await
+            .expect_err("sticky protection must reject later writes")
+            .to_string()
+            .contains("Invalid persisted plan")
     );
 
     drop(database);

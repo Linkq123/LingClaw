@@ -83,13 +83,43 @@ export function updateAttachButton() {
 }
 
 export function syncPlanModeToggle() {
-  if (!dom.planModeToggle) return;
-  dom.planModeToggle.setAttribute('aria-checked', state.planModeEnabled ? 'true' : 'false');
-  dom.planModeToggle.classList.toggle('is-on', state.planModeEnabled);
+  const groupDisabled = Boolean(state.activeGroupId);
+  const executeDisabled = Boolean(
+    !groupDisabled &&
+    state.activePlan &&
+    ['planning', 'needs_input', 'ready'].includes(state.activePlan.status),
+  );
+  if (groupDisabled) state.planModeEnabled = false;
+  if (dom.planModeToggle) {
+    dom.planModeToggle.setAttribute('aria-pressed', state.planModeEnabled ? 'true' : 'false');
+    dom.planModeToggle.classList.toggle('is-active', state.planModeEnabled);
+    dom.planModeToggle.disabled = groupDisabled;
+    dom.planModeToggle.title = groupDisabled ? tr('composer.groupPlanUnsupported') : '';
+  }
+  if (dom.executeModeToggle) {
+    dom.executeModeToggle.setAttribute('aria-pressed', state.planModeEnabled ? 'false' : 'true');
+    dom.executeModeToggle.classList.toggle('is-active', !state.planModeEnabled);
+    dom.executeModeToggle.disabled = executeDisabled;
+    dom.executeModeToggle.title = executeDisabled ? tr('plan.composer.resolveActive') : '';
+  }
+}
+
+export function setPlanMode(enabled: boolean) {
+  if (enabled && state.activeGroupId) return;
+  state.planModeEnabled = enabled;
+  const sessionId = state.activeSessionId || 'main';
+  state.planModesBySession.set(sessionId, enabled);
+  syncPlanModeToggle();
 }
 
 export function togglePlanMode() {
-  state.planModeEnabled = !state.planModeEnabled;
+  setPlanMode(!state.planModeEnabled);
+}
+
+export function restorePlanModeForSession(sessionId: string): void {
+  state.planModeEnabled = state.activeGroupId
+    ? false
+    : (state.planModesBySession.get(sessionId || 'main') ?? false);
   syncPlanModeToggle();
 }
 
@@ -431,7 +461,12 @@ export function initImageListeners() {
   if (dom.planModeToggle)
     dom.planModeToggle.addEventListener('click', (e) => {
       e.stopPropagation();
-      togglePlanMode();
+      setPlanMode(true);
+    });
+  if (dom.executeModeToggle)
+    dom.executeModeToggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setPlanMode(false);
     });
   if (dom.imageUrlAddBtn)
     dom.imageUrlAddBtn.addEventListener('click', () => {

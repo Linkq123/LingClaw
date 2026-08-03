@@ -710,102 +710,54 @@ fn built_in_read_only_agents_allow_conditional_view_image() {
 use crate::subagents::{McpPolicy, is_mcp_tool_read_only};
 use crate::tools::mcp::McpToolDescriptor;
 
-fn make_mcp_descriptor(raw_name: &str, description: &str) -> McpToolDescriptor {
+fn make_mcp_descriptor(
+    raw_name: &str,
+    read_only_hint: Option<bool>,
+    destructive_hint: Option<bool>,
+) -> McpToolDescriptor {
     McpToolDescriptor {
         server_name: "test-server".into(),
         raw_name: raw_name.into(),
         exposed_name: format!("mcp__test_server__{raw_name}"),
-        description: description.into(),
+        description: "Tool description must not affect authorization".into(),
         input_schema: serde_json::json!({}),
+        annotations: crate::tools::mcp::McpToolAnnotations {
+            read_only_hint,
+            destructive_hint,
+        },
     }
 }
 
 #[test]
-fn test_mcp_tool_classification_read_only() {
-    // Tools with read-only names should be classified as read-only.
+fn test_mcp_tool_classification_requires_explicit_read_only_annotation() {
     assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
-        "get_file_contents",
-        "Retrieve the contents of a file"
+        "delete_everything_despite_the_name",
+        Some(true),
+        Some(false),
     )));
-    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
-        "list_repos",
-        "List available repositories"
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "read_file",
+        None,
+        None,
     )));
-    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
         "search_code",
-        "Search for code patterns"
-    )));
-    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
-        "describe_table",
-        "Show table schema information"
+        Some(false),
+        Some(false),
     )));
 }
 
 #[test]
-fn test_mcp_tool_classification_mutating() {
-    // Tools with mutation keywords in name should NOT be classified as read-only.
+fn test_mcp_tool_classification_destructive_annotation_wins() {
     assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "create_issue",
-        "Create a new GitHub issue"
-    )));
-    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "delete_branch",
-        "Delete a git branch"
-    )));
-    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "update_pull_request",
-        "Update a pull request"
-    )));
-    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "execute_query",
-        "Execute a SQL query"
-    )));
-    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "send_message",
-        "Send a chat message"
-    )));
-}
-
-#[test]
-fn test_mcp_tool_classification_description_only_mutation() {
-    // Tool with innocent name but mutation keyword in description.
-    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "query",
-        "Execute and modify database records"
-    )));
-    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "manage_workflow",
-        "Start or stop CI workflows"
-    )));
-}
-
-#[test]
-fn test_mcp_tool_classification_no_false_positives_from_substrings() {
-    // Words like "offset", "settings", "address" contain short keywords
-    // but should NOT trigger a mutation classification.
-    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
-        "get_offset",
-        "Retrieve the current offset"
+        "get_records",
+        Some(true),
+        Some(true),
     )));
     assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
-        "read_settings",
-        "Load settings from configuration"
-    )));
-    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
-        "lookup_address",
-        "Look up an address record"
-    )));
-}
-
-#[test]
-fn test_mcp_tool_classification_defaults_unknown_tools_to_mutating() {
-    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "clone_repo",
-        "Repository operation"
-    )));
-    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
-        "operation_42",
-        "Tool exposed by MCP server"
+        "get_records",
+        Some(true),
+        None,
     )));
 }
 

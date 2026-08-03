@@ -142,6 +142,14 @@ function cancelAssistantFlush() {
   cancelFlushIfIdle();
 }
 
+export function discardAssistantStream() {
+  cancelAssistantFlush();
+  const message = state.currentMsg;
+  if (!message) return;
+  message.closest('.msg-row')?.remove();
+  state.currentMsg = null;
+}
+
 function cancelReasoningFlush() {
   state.pendingReasoningText = '';
   cancelFlushIfIdle();

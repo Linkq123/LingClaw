@@ -111,6 +111,7 @@ import {
   renderImagePreviews,
   syncRestoredSessionCapabilities,
   updateS3ConfigIdentity,
+  restorePlanModeForSession,
 } from './images.js';
 import {
   activateGroupMentionTargetMode,
@@ -222,11 +223,25 @@ import {
   supersedeTaskPlanPanel,
 } from './renderers/task-plan.js';
 import {
+  clearPlanStateForSessionTransition,
   clearPendingPlanAction,
-  confirmPendingPlanExecution,
+  copyPlan,
+  discardPlan,
   executePendingPlan,
+  executeStalePlan,
+  handlePlanRevisionConflict,
+  handlePlanStale,
+  jumpToPlan,
+  refreshPlan,
+  refreshPlanLanguage,
+  refreshPlanMounts,
+  renderPlanHistory,
+  renderPlanState,
   renderPendingPlanAction,
+  resumePlan,
   restorePendingPlanAction,
+  submitPlanFeedback,
+  togglePlanFeedback,
 } from './renderers/pending-plan.js';
 import {
   disposeSessionDrawer,
@@ -352,6 +367,7 @@ function refreshLocalizedUi() {
   renderReactStatus();
   refreshExecutionStacks();
   refreshActionDialog();
+  refreshPlanLanguage();
   if (state.activeToolPanel) {
     syncToolDrawer(state.activeToolPanel);
   }
@@ -1959,6 +1975,7 @@ function loadEarlierMessages() {
   completeExecutionStack({ immediate: true, durationMs: null });
   for (const el of existing) dom.chat.appendChild(el);
   restoreExecutionStackState(liveExecutionStack);
+  refreshPlanMounts();
   invalidateChatScrollCache();
   requestAnimationFrame(() => {
     state.bulkRenderingChat = false;
@@ -2129,6 +2146,32 @@ function recoverFromInvalidActiveGroup(): void {
   reconnectToActiveSession(handleMessage);
 }
 
+function localizedRuntimeError(data: { code?: unknown; content?: unknown }): string {
+  const keyByCode: Record<string, string> = {
+    stale_plan_revision: 'plan.error.staleRevision',
+    plan_not_ready: 'plan.error.notReady',
+    plan_already_active: 'plan.error.alreadyActive',
+    group_plan_mode_unsupported: 'plan.error.groupUnsupported',
+    invalid_plan_action: 'plan.error.invalidAction',
+    invalid_plan_feedback: 'plan.error.invalidFeedback',
+    plan_evidence_verification_failed: 'plan.error.verificationFailed',
+    agent_model_unconfigured: 'composer.agentModelUnconfigured',
+    invalid_plan_request: 'plan.error.invalidRequest',
+    session_not_found: 'plan.error.sessionNotFound',
+    storage_error: 'plan.error.storage',
+  };
+  const key = keyByCode[String(data.code || '')];
+  return key ? tr(key) : String(data.content || 'Error');
+}
+
+function localizedRuntimeProgress(data: { code?: unknown; content?: unknown }): string {
+  const keyByCode: Record<string, string> = {
+    plan_tool_calling_fallback: 'plan.progress.toolCallingFallback',
+  };
+  const key = keyByCode[String(data.code || '')];
+  return key ? tr(key) : String(data.content || '');
+}
+
 function applyStorageStatus(data: unknown): void {
   const payload = data as { storage?: { mode?: unknown } } | null;
   const mode = payload?.storage?.mode;
@@ -2190,9 +2233,19 @@ function applyStorageStatus(data: unknown): void {
   renderTodosPanel();
   renderGroupTargetControls();
   renderGroupMemberDrawer();
+  refreshPlanMounts();
 }
 
 // ── handleMessage ──
+
+let historyRenderGeneration = 0;
+
+function invalidatePendingHistoryRender(): number {
+  historyRenderGeneration += 1;
+  state.bulkRenderingChat = false;
+  dom.chat.classList.remove('no-animate');
+  return historyRenderGeneration;
+}
 
 function handleMessage(data) {
   switch (data.type) {
@@ -2209,10 +2262,12 @@ function handleMessage(data) {
       {
         const nextGroupId = String(data.id || '').trim();
         if (!nextGroupId) break;
+        invalidatePendingHistoryRender();
         state.composerSessionIdentityPending = false;
         clearCompressionOutcome();
         const groupChanged = state.activeGroupId !== '' && state.activeGroupId !== nextGroupId;
         state.activeGroupId = nextGroupId;
+        restorePlanModeForSession(state.activeSessionId || 'main');
         if (groupChanged) {
           clearGroupRunState();
         }
@@ -2230,6 +2285,7 @@ function handleMessage(data) {
       break;
 
     case 'group_history':
+      invalidatePendingHistoryRender();
       if (Array.isArray(data.members)) {
         applyGroupModelConfiguration(data, true);
       }
@@ -2301,6 +2357,8 @@ function handleMessage(data) {
 
     case 'session':
       if (!sessionModelPayloadTargetsActiveSession(data, true)) break;
+      clearPlanStateForSessionTransition(String(data.id || 'main'));
+      invalidatePendingHistoryRender();
       state.composerSessionIdentityPending = false;
       applySessionModelFields(data, false);
       completeComposerSessionTransition();
@@ -2311,6 +2369,7 @@ function handleMessage(data) {
       clearGroupRunState();
       resetGroupTargetControls();
       state.activeSessionId = data.id;
+      restorePlanModeForSession(state.activeSessionId || 'main');
       persistActiveSessionId(state.activeSessionId || 'main');
       state.sessionSwitchInFlight = false;
       syncComposerAvailability();
@@ -2334,6 +2393,7 @@ function handleMessage(data) {
       break;
 
     case 'history': {
+      const historyRenderToken = invalidatePendingHistoryRender();
       resetToolImageCompatibilityWarning();
       clearCompressionOutcome();
       closeToolDrawer();
@@ -2388,9 +2448,12 @@ function handleMessage(data) {
         }
         completeExecutionStack({ immediate: true, durationMs: null });
         requestAnimationFrame(() => {
+          if (historyRenderToken !== historyRenderGeneration) return;
           state.bulkRenderingChat = false;
           dom.chat.classList.remove('no-animate');
-          if (data.pending_plan) renderPendingPlanAction(data.pending_plan);
+          const plans = Array.isArray(data.plans) ? data.plans : [];
+          if (plans.length > 0) renderPlanHistory(plans);
+          else if (data.pending_plan) renderPendingPlanAction(data.pending_plan);
           scrollDown(true);
         });
       }
@@ -2405,8 +2468,6 @@ function handleMessage(data) {
       if (data.subagent) break;
       clearCompressionOutcomeForNewRound(data.cycle);
       clearActiveAutoTrace();
-      if (data.run_mode === 'execute') confirmPendingPlanExecution();
-      clearPendingPlanAction();
       supersedeTaskPlanPanel(data.round, data.cycle);
       const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
       setBusy(true);
@@ -2434,6 +2495,15 @@ function handleMessage(data) {
 
     case 'plan_ready':
       renderPendingPlanAction(data);
+      break;
+
+    case 'plan_state':
+      invalidatePendingHistoryRender();
+      if (data.plan) renderPlanState(data.plan);
+      break;
+
+    case 'plan_stale':
+      handlePlanStale(data);
       break;
 
     case 'context_compressed':
@@ -2731,7 +2801,7 @@ function handleMessage(data) {
       break;
 
     case 'progress':
-      addSystem(data.content);
+      addSystem(localizedRuntimeProgress(data));
       break;
 
     case 'success':
@@ -2762,7 +2832,10 @@ function handleMessage(data) {
       finishTaskPlanPanel();
       clearReactStatus();
       completeExecutionStack({ failed: true });
-      addError(data.content, { dismissible: data.dismissible === true });
+      if (data.code === 'stale_plan_revision' && data.plan) {
+        handlePlanRevisionConflict(data.plan);
+      }
+      addError(localizedRuntimeError(data), { dismissible: data.dismissible === true });
       state.reasoningPanel = null;
       resetRoundTimers();
       restorePendingPlanAction();
@@ -2825,6 +2898,14 @@ const actionHandlers = {
   },
   'load-earlier': () => loadEarlierMessages(),
   'execute-plan': (el) => executePendingPlan(el),
+  'plan-execute-stale': () => executeStalePlan(),
+  'plan-discard': () => discardPlan(),
+  'plan-refresh': () => refreshPlan(),
+  'plan-resume': () => resumePlan(),
+  'plan-toggle-feedback': (el) => togglePlanFeedback(el),
+  'plan-submit-feedback': (el) => submitPlanFeedback(el),
+  'plan-copy': () => void copyPlan(),
+  'plan-jump': () => jumpToPlan(),
   'retry-composer-config': () => void refreshComposerAvailability(),
   'open-group-members': (el) => {
     if (!state.activeGroupId) return;

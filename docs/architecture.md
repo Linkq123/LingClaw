@@ -44,7 +44,17 @@ flowchart TB
 - HTTP 级 LLM 重试只处理瞬态连接、超时、429 和 5xx；Agent cycle 是更高一层的决策循环。
 - `/stop` 和服务关闭会取消当前 run，并向正在执行的工具和 Sub-agent 传播；各层 hard cap 与超时在各自边界终止工作。浏览器断开只解除连接，不会停止仍在运行的 active run。
 - Busy 时收到的普通用户文本作为 delayed intervention 排队，在下一次 Analyze 前注入，不强行截断当前 tool transaction。
-- Plan Mode 使用独立 `PlanOnly` 边界，只暴露只读能力；批准后用持久化 plan ID 开始正常 run。
+- Plan Mode 使用独立 `PlanOnly` 边界，只暴露显式只读能力；Group 在协议边界拒绝 `plan_only`。批准后用持久化 `plan_id + revision` 开始正常 run，批准动作不写入虚假 user message。
+
+### Plan Mode 生命周期
+
+`src/plan.rs` 是结构化计划、校验、证据指纹和进度更新的领域边界。Plan-only loop 只能通过内部 `submit_plan` 终结：`needs_input` 必须包含阻塞问题，`ready` 必须包含稳定步骤 ID。模型不支持 Tool Calling 时退化为一个保留原始 Markdown 的 legacy 步骤。
+
+SQLite v5 把生命周期拆为 `session_plans`、不可变 `session_plan_revisions` 和 `session_plan_progress`，并在活动计划上暂存尚未形成新 revision 的反馈，同时持久化初次提交标记和过期证据覆盖确认时间。同一 Session 只允许一个活动计划；revision 使用乐观并发，History 最多恢复最近 50 个只读 revision，并始终包含当前 revision。规划时通过本地工具读取的文件/目录以及受限 `git_inspect` 查询最多记录 256 项证据：文件系统项保存相对路径与 SHA-256，Git 查询保存受限参数与结果指纹，并在批准前重新验证。过期覆盖令牌同时绑定 plan revision 与本次验证得到的实际证据快照，避免警告与执行之间的再次变化被静默放行；即使证据采集不完整但没有具体变化路径，用户的明确覆盖决定也会持久化。MCP/HTTP 观察不参与此可验证证据集合。
+
+执行阶段的每个 cycle 都注入完整 `ApprovedPlanContext`。内部 `update_plan` 只能更新步骤状态，或在提供偏离原因时追加步骤；不能删除原步骤，也不能修改已批准的目标与验收标准。`enableTaskPlan` 只为没有批准计划的普通 Execute run 生成兼容性软指导。
+
+`planning` 与 `executing` 都依赖仅驻留内存的 Agent run reservation。进程启动时，存储层会在加载 Session 前把遗留的这两种状态事务性恢复为 `stopped`：只有保留了批准时间且执行次数大于零的计划可 Resume，规划阶段的中断计划只能修订或丢弃。`feedback` 的模型控制提示会随活动计划暂存，`refresh` 提示仅驻留对应 Plan-only run；两者都不作为用户消息写入会话历史。
 
 ### Execution Stack
 
@@ -65,6 +75,7 @@ flowchart TB
 | `context.rs` | Token 估算、请求预算、裁剪 |
 | `hooks.rs` | LLM/Tool/Command 生命周期与自动上下文压缩 |
 | `prompts.rs` | Workspace 提示、Bootstrap、Skills 发现与注入 |
+| `plan.rs` | Plan artifact、revision、证据指纹、执行进度与内部工具 schema |
 | `storage/` | SQLite schema、Session/Group repository、旧 JSON 迁移、状态检查和在线备份 |
 | `session_store.rs` | Session 运行时适配、规范化和 Workspace 兼容逻辑 |
 | `session_group.rs` | Group 模型、成员、管理员、投票和 replay payload |
@@ -72,7 +83,7 @@ flowchart TB
 | `todos.rs` | Todo 校验、revision 冲突和广播 |
 | `memory.rs` | Structured Memory、Daily Reflection 和队列 |
 | `image_uploads.rs` | PNG/JPEG 校验、S3 上传、签名和配置身份 |
-| `tools/` | ToolSpec、执行分派、文件/shell/网络/MCP/view_image |
+| `tools/` | ToolSpec、执行分派、文件/shell/网络/MCP/view_image，以及受限只读 `git_inspect` |
 | `subagents/` | 发现、隔离执行和 DAG Orchestration |
 
 `src/main.rs` 负责协议边界，不承载所有业务实现。模块测试位于 `src/tests/`，从对应源文件的测试模块引入。

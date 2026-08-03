@@ -1567,6 +1567,16 @@ async fn append_target_session_message(
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| format!("Session '{}' not found", session_id))?;
+        if let Some(plan) = session
+            .pending_plan
+            .as_ref()
+            .filter(|plan| plan.status.is_active())
+        {
+            return Err(format!(
+                "Session '{}' has active plan '{}' revision {}; execute or discard it before dispatching new work",
+                session_id, plan.id, plan.revision
+            ));
+        }
         let message_index = session.messages.len();
         session.messages.push(ChatMessage {
             role: "user".to_string(),
@@ -1578,7 +1588,14 @@ async fn append_target_session_message(
             tool_call_id: None,
             timestamp: Some(now_epoch()),
         });
-        session.pending_plan = None;
+        if !session.pending_plan.as_ref().is_some_and(|plan| {
+            matches!(
+                plan.status,
+                crate::plan::PlanStatus::Failed | crate::plan::PlanStatus::Stopped
+            )
+        }) {
+            session.pending_plan = None;
+        }
         session.updated_at = now_epoch();
         message_index
     };
@@ -2826,6 +2843,10 @@ pub(crate) async fn handle_group_socket_message(
     if text.is_empty() {
         return Err("Group message cannot be empty.".to_string());
     }
+    let run_mode = parse_run_mode(&payload.run_mode)?;
+    if run_mode == AgentRunMode::PlanOnly {
+        return Err("group_plan_mode_unsupported".to_string());
+    }
     validate_message_len(&text)?;
     let group = session_group::load_group_from_storage_result(group_id)?
         .ok_or_else(|| format!("Group '{}' not found", group_id))?;
@@ -2889,7 +2910,6 @@ pub(crate) async fn handle_group_socket_message(
         }
         None
     };
-    let run_mode = parse_run_mode(&payload.run_mode)?;
     let turn_id = next_id("turn");
     if let Some(targets) = dispatch_targets {
         dispatch_to_sessions(
@@ -4604,6 +4624,14 @@ async fn dispatch_from_tool(state: &Arc<AppState>, args: &Value) -> Result<Strin
     validate_tool_array_len(args, "targets", SESSION_CONTROL_TARGETS_MAX_ITEMS)?;
     let group_id = tool_args_string(args, "group_id");
     let message = tool_args_bounded_string(args, "message", SESSION_CONTROL_MESSAGE_MAX_CHARS)?;
+    let run_mode = parse_run_mode(
+        args.get("run_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("execute"),
+    )?;
+    if run_mode == AgentRunMode::PlanOnly {
+        return Err("group_plan_mode_unsupported".to_string());
+    }
     let raw_targets = tool_args_array(args, "targets");
     let max_targets = if group_id.is_some() && raw_targets.is_empty() {
         SESSION_CONTROL_MEMBERS_MAX_ITEMS
@@ -4613,11 +4641,6 @@ async fn dispatch_from_tool(state: &Arc<AppState>, args: &Value) -> Result<Strin
     let targets =
         prepare_dispatch_targets(state, group_id.as_deref(), raw_targets, max_targets).await?;
     ensure_explicit_target_models(state, &targets).await?;
-    let run_mode = parse_run_mode(
-        args.get("run_mode")
-            .and_then(Value::as_str)
-            .unwrap_or("execute"),
-    )?;
     let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
     let summary_budget = args
         .get("summary_budget")

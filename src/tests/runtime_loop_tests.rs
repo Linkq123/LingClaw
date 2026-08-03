@@ -621,6 +621,125 @@ async fn handle_idle_socket_input_defaults_structured_payload_to_execute_mode() 
 }
 
 #[tokio::test]
+async fn handle_idle_socket_input_keeps_a_resumable_terminal_plan_during_a_normal_run() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "normal-run-keeps-stopped-plan-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Stopped Plan", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_resume_later".into(),
+        revision: 2,
+        status: crate::plan::PlanStatus::Stopped,
+        approved_at: Some(20),
+        execution_attempt: 1,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut current_session_id = session_id.clone();
+
+    let action = handle_idle_socket_input(
+        "Answer an unrelated question first.".into(),
+        &mut current_session_id,
+        &Arc::new(Mutex::new(session_id.clone())),
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &CancellationToken::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    let reservation = match action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::Execute,
+            reservation,
+            ..
+        } => reservation,
+        _ => panic!("a normal run should still start"),
+    };
+    let sessions = state.sessions.lock().await;
+    let plan = sessions[&session_id]
+        .pending_plan
+        .as_ref()
+        .expect("the stopped plan should remain resumable");
+    assert_eq!(plan.id, "plan_resume_later");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Stopped);
+    assert_eq!(
+        sessions[&session_id]
+            .messages
+            .last()
+            .and_then(|message| message.content.as_deref()),
+        Some("Answer an unrelated question first.")
+    );
+    drop(sessions);
+    release_agent_run_reservation(&state, &session_id, &reservation).await;
+
+    let _ = std::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    );
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_rejects_an_active_plan_before_image_validation() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "active-plan-before-images-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Active Plan", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_active_before_images".into(),
+        revision: 3,
+        status: crate::plan::PlanStatus::Ready,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut current_session_id = session_id.clone();
+    let images = (0..11)
+        .map(|index| serde_json::json!({"url": format!("https://example.com/{index}.png")}))
+        .collect::<Vec<_>>();
+
+    let action = handle_idle_socket_input(
+        serde_json::json!({"text":"inspect these images","images":images}).to_string(),
+        &mut current_session_id,
+        &Arc::new(Mutex::new(session_id.clone())),
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &CancellationToken::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["code"], "plan_already_active");
+    assert_eq!(event["plan_id"], "plan_active_before_images");
+    assert_eq!(state.sessions.lock().await[&session_id].messages.len(), 1);
+    assert!(state.active_runs.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn handle_idle_socket_input_executes_matching_pending_plan() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
@@ -657,6 +776,7 @@ async fn handle_idle_socket_input_executes_matching_pending_plan() {
         original_user_message_index: 1,
         assistant_plan_message_index: 2,
         created_at: 10,
+        ..Default::default()
     });
     {
         let mut sessions = state.sessions.lock().await;
@@ -685,17 +805,911 @@ async fn handle_idle_socket_input_executes_matching_pending_plan() {
     ));
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_id).expect("session should exist");
-    assert!(session.pending_plan.is_none());
+    let active_plan = session
+        .pending_plan
+        .as_ref()
+        .expect("plan should remain tracked");
+    assert_eq!(active_plan.status, crate::plan::PlanStatus::Executing);
+    assert_eq!(active_plan.execution_attempt, 1);
     assert_eq!(
-        session
-            .messages
-            .last()
-            .and_then(|message| message.content.as_deref()),
-        Some("Proceed with the approved plan.")
+        session.messages.len(),
+        3,
+        "approval must not create a fake user message"
     );
     let _ = std::fs::remove_file(
         crate::session_store::sessions_dir().join(format!("{session_id}.json")),
     );
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_rejects_a_stale_plan_revision() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_revision".into(),
+        revision: 3,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"execute","plan_id":"plan_revision","revision":2}}"#.into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["code"], "stale_plan_revision");
+    assert_eq!(event["plan"]["plan_id"], "plan_revision");
+    assert_eq!(event["plan"]["revision"], 3);
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| (plan.revision, plan.status)),
+        Some((3, crate::plan::PlanStatus::Ready))
+    );
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_does_not_let_legacy_approval_skip_revisions() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_revised".into(),
+        revision: 2,
+        status: crate::plan::PlanStatus::Ready,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let action = handle_idle_socket_input(
+        r#"{"execute_plan_id":"plan_revised"}"#.into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["code"], "stale_plan_revision");
+    assert_eq!(event["plan"]["revision"], 2);
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| (plan.revision, plan.status, plan.execution_attempt)),
+        Some((2, crate::plan::PlanStatus::Ready, 0))
+    );
+    assert!(state.active_runs.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_does_not_resume_an_unapproved_stopped_plan() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "stopped-planning-plan-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Stopped Planning Plan", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_stopped_while_planning".into(),
+        revision: 1,
+        status: crate::plan::PlanStatus::Stopped,
+        approved_at: None,
+        execution_attempt: 0,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut current_session_id = session_id.clone();
+
+    let action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"resume","plan_id":"plan_stopped_while_planning","revision":1}}"#.into(),
+        &mut current_session_id,
+        &Arc::new(Mutex::new(session_id.clone())),
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &CancellationToken::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["code"], "plan_not_ready");
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Stopped)
+    );
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_resumes_a_stopped_approved_execution() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "stopped-approved-plan-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Stopped Approved Plan", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_stopped_after_approval".into(),
+        revision: 2,
+        status: crate::plan::PlanStatus::Stopped,
+        approved_at: Some(20),
+        execution_attempt: 1,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut current_session_id = session_id.clone();
+
+    let action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"resume","plan_id":"plan_stopped_after_approval","revision":2}}"#.into(),
+        &mut current_session_id,
+        &Arc::new(Mutex::new(session_id.clone())),
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &CancellationToken::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    let reservation = match action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::Execute,
+            reservation,
+            ..
+        } => reservation,
+        _ => panic!("an approved stopped execution should resume"),
+    };
+    let sessions = state.sessions.lock().await;
+    let plan = sessions[&session_id]
+        .pending_plan
+        .as_ref()
+        .expect("plan should remain available");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Executing);
+    assert_eq!(plan.execution_attempt, 2);
+    assert_eq!(plan.approved_at, Some(20));
+    drop(sessions);
+    release_agent_run_reservation(&state, &session_id, &reservation).await;
+
+    let _ = std::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    );
+}
+
+#[tokio::test]
+async fn plan_feedback_is_durable_without_becoming_a_transcript_message() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-feedback-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Plan Feedback", None);
+    session.version = crate::SESSION_VERSION;
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_feedback".into(),
+        revision: 3,
+        status: crate::plan::PlanStatus::NeedsInput,
+        artifact: crate::plan::PlanArtifact {
+            title: "Choose storage".into(),
+            goal: "Choose a storage engine".into(),
+            questions: vec![crate::plan::PlanQuestion {
+                id: "storage".into(),
+                prompt: "Which storage engine?".into(),
+                options: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        created_at: 10,
+        ..Default::default()
+    });
+    let original_message_count = session.messages.len();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut current_session_id = session_id.clone();
+
+    let action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"feedback","plan_id":"plan_feedback","revision":3,"answers":{"storage":"SQLite"}}}"#.into(),
+        &mut current_session_id,
+        &Arc::new(Mutex::new(session_id.clone())),
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &CancellationToken::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    let reservation = match action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::PlanOnly,
+            reservation,
+            ..
+        } => reservation,
+        _ => panic!("valid feedback should start a PlanOnly run"),
+    };
+    assert_eq!(
+        reservation.plan_action_prompt.as_deref(),
+        Some("Answers to the blocking plan questions:\n- Which storage engine?: SQLite")
+    );
+    let sessions = state.sessions.lock().await;
+    assert_eq!(sessions[&session_id].messages.len(), original_message_count);
+    assert_eq!(
+        sessions[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Planning)
+    );
+    assert_eq!(
+        sessions[&session_id]
+            .pending_plan
+            .as_ref()
+            .and_then(|plan| plan.pending_feedback.as_deref()),
+        Some("Answers to the blocking plan questions:\n- Which storage engine?: SQLite")
+    );
+    drop(sessions);
+    let saved = crate::session_store::load_session_from_disk(&session_id)
+        .expect("feedback should be recoverable from durable Session state");
+    assert_eq!(
+        saved
+            .pending_plan
+            .as_ref()
+            .and_then(|plan| plan.pending_feedback.as_deref()),
+        Some("Answers to the blocking plan questions:\n- Which storage engine?: SQLite")
+    );
+    release_agent_run_reservation(&state, &session_id, &reservation).await;
+
+    let _ = std::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    );
+}
+
+#[test]
+fn plan_action_context_is_an_ephemeral_user_message() {
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: Some("System policy".to_string()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    append_plan_action_user_context(&mut messages, Some("Use SQLite"));
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[0].content.as_deref(), Some("System policy"));
+    assert_eq!(messages[1].role, "user");
+    assert_eq!(
+        messages[1].content.as_deref(),
+        Some("Plan revision request from the user:\n\nUse SQLite")
+    );
+    assert!(messages[1].timestamp.is_none());
+}
+
+#[tokio::test]
+async fn handle_plan_action_rechecks_status_after_reserving_the_run() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-status-race-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Plan Status Race", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_status_race".into(),
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let persist_gate = crate::session_store::session_persist_gate(&session_id);
+    let persist_guard = persist_gate.lock().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let task_state = Arc::clone(&state);
+    let task_session_id = session_id.clone();
+    let task = tokio::spawn(async move {
+        let mut current_session_id = task_session_id.clone();
+        handle_idle_socket_input(
+            r#"{"plan_action":{"action":"execute","plan_id":"plan_status_race","revision":1}}"#
+                .into(),
+            &mut current_session_id,
+            &Arc::new(Mutex::new(task_session_id)),
+            7,
+            &task_state,
+            &tx,
+            &live_tx,
+            &CancellationToken::new(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if state.active_runs.lock().await.contains_key(&session_id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("action should reserve the run before waiting for persistence");
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions
+            .get_mut(&session_id)
+            .and_then(|session| session.pending_plan.as_mut())
+            .expect("plan should exist")
+            .status = crate::plan::PlanStatus::Completed;
+    }
+    drop(persist_guard);
+
+    let action = task.await.expect("plan action should finish");
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["code"], "plan_not_ready");
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Completed)
+    );
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+}
+
+#[tokio::test]
+async fn terminal_plans_reject_refresh_and_discard_actions() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-terminal-actions-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Plan Terminal Actions", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_terminal_actions".into(),
+        revision: 1,
+        status: crate::plan::PlanStatus::Completed,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+
+    for status in [
+        crate::plan::PlanStatus::Completed,
+        crate::plan::PlanStatus::Discarded,
+    ] {
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions
+                .get_mut(&session_id)
+                .and_then(|session| session.pending_plan.as_mut())
+                .expect("plan should exist")
+                .status = status;
+        }
+        for action in [
+            socket_input::PlanActionKind::Refresh,
+            socket_input::PlanActionKind::Discard,
+        ] {
+            let result = socket_input::handle_plan_action(
+                socket_input::PlanActionPayload {
+                    action,
+                    plan_id: "plan_terminal_actions".into(),
+                    revision: 1,
+                    text: None,
+                    answers: Default::default(),
+                    allow_stale: false,
+                    stale_confirmation_token: None,
+                },
+                &session_id,
+                7,
+                &state,
+                &tx,
+                &CancellationToken::new(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+
+            assert!(matches!(result, IdleSocketInputAction::Continue));
+            let event = recv_json_with_timeout(&mut rx).await;
+            assert_eq!(event["code"], "plan_not_ready");
+            assert_eq!(
+                state.sessions.lock().await[&session_id]
+                    .pending_plan
+                    .as_ref()
+                    .map(|plan| plan.status),
+                Some(status)
+            );
+            assert!(!state.active_runs.lock().await.contains_key(&session_id));
+        }
+    }
+}
+
+#[tokio::test]
+async fn discard_plan_cannot_race_an_active_agent_run() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-discard-race-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Plan Discard Race", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_discard_race".into(),
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let active_cancel = CancellationToken::new();
+    let active_stop = Arc::new(AtomicBool::new(false));
+    let active_reservation =
+        try_reserve_agent_run(&state, &session_id, 99, &active_cancel, &active_stop)
+            .await
+            .expect("fixture run should reserve");
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let action = socket_input::handle_plan_action(
+        socket_input::PlanActionPayload {
+            action: socket_input::PlanActionKind::Discard,
+            plan_id: "plan_discard_race".into(),
+            revision: 1,
+            text: None,
+            answers: Default::default(),
+            allow_stale: false,
+            stale_confirmation_token: None,
+        },
+        &session_id,
+        7,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["code"], "plan_already_active");
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Ready)
+    );
+    release_agent_run_reservation(&state, &session_id, &active_reservation).await;
+}
+
+#[tokio::test]
+async fn refresh_plan_preserves_current_revision_evidence_until_replacement() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-refresh-evidence-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("refresh-evidence");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    std::fs::write(workspace.join("evidence.txt"), "current").expect("fixture should be written");
+    let evidence = crate::plan::capture_tool_evidence(
+        crate::tools::TOOL_NAME_READ_FILE,
+        r#"{"path":"evidence.txt"}"#,
+        &workspace,
+    );
+    let mut session = test_session(&session_id, "Plan Refresh Evidence", None);
+    session.workspace = workspace.clone();
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_refresh_evidence".into(),
+        revision: 2,
+        status: crate::plan::PlanStatus::Ready,
+        evidence: evidence.clone(),
+        evidence_truncated: true,
+        created_at: 10,
+        ..Default::default()
+    });
+    let original_message_count = session.messages.len();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut current_session_id = session_id.clone();
+
+    let action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"refresh","plan_id":"plan_refresh_evidence","revision":2}}"#
+            .into(),
+        &mut current_session_id,
+        &Arc::new(Mutex::new(session_id.clone())),
+        7,
+        &state,
+        &tx,
+        &live_tx,
+        &CancellationToken::new(),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    let reservation = match action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::PlanOnly,
+            reservation,
+            ..
+        } => reservation,
+        _ => panic!("refresh should start a PlanOnly run"),
+    };
+    assert!(reservation.reset_plan_evidence);
+    assert_eq!(
+        reservation.plan_action_prompt.as_deref(),
+        Some("Refresh this plan against the current workspace state and submit a new revision.")
+    );
+    let sessions = state.sessions.lock().await;
+    let plan = sessions[&session_id]
+        .pending_plan
+        .as_ref()
+        .expect("plan should remain available");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Planning);
+    assert_eq!(plan.evidence, evidence);
+    assert!(plan.evidence_truncated);
+    assert_eq!(
+        sessions[&session_id].messages.len(),
+        original_message_count,
+        "refresh controls must not create a user transcript message"
+    );
+    drop(sessions);
+    release_agent_run_reservation(&state, &session_id, &reservation).await;
+
+    let _ = std::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    );
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_reports_changed_plan_evidence_before_execution() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-stale-confirmation-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let workspace = temp_workspace("plan-stale-evidence");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    std::fs::write(workspace.join("evidence.txt"), "before")
+        .expect("evidence file should be written");
+
+    let evidence = crate::plan::capture_tool_evidence(
+        crate::tools::TOOL_NAME_READ_FILE,
+        r#"{"path":"evidence.txt"}"#,
+        &workspace,
+    );
+    assert_eq!(evidence.len(), 1);
+    std::fs::write(workspace.join("evidence.txt"), "after")
+        .expect("evidence file should be changed");
+
+    let mut session = test_session(&session_id, "Plan Stale Confirmation", None);
+    session.workspace = workspace.clone();
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_evidence".into(),
+        revision: 2,
+        evidence,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"execute","plan_id":"plan_evidence","revision":2,"allow_stale":true}}"#.into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "plan_stale");
+    assert_eq!(event["code"], "plan_stale");
+    assert_eq!(event["plan_id"], "plan_evidence");
+    assert_eq!(event["revision"], 2);
+    assert_eq!(event["paths"], serde_json::json!(["evidence.txt"]));
+    let first_confirmation_token = event["confirmation_token"]
+        .as_str()
+        .expect("stale evidence should include a confirmation token")
+        .to_string();
+    assert!(!first_confirmation_token.is_empty());
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Ready)
+    );
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+
+    std::fs::write(workspace.join("evidence.txt"), "changed again")
+        .expect("evidence file should change again");
+    let action = handle_idle_socket_input(
+        serde_json::json!({
+            "plan_action": {
+                "action": "execute",
+                "plan_id": "plan_evidence",
+                "revision": 2,
+                "allow_stale": true,
+                "stale_confirmation_token": first_confirmation_token,
+            }
+        })
+        .to_string(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "plan_stale");
+    let second_confirmation_token = event["confirmation_token"]
+        .as_str()
+        .expect("changed evidence should replace the confirmation token")
+        .to_string();
+    assert_ne!(second_confirmation_token, first_confirmation_token);
+
+    let action = handle_idle_socket_input(
+        serde_json::json!({
+            "plan_action": {
+                "action": "execute",
+                "plan_id": "plan_evidence",
+                "revision": 2,
+                "allow_stale": true,
+                "stale_confirmation_token": second_confirmation_token,
+            }
+        })
+        .to_string(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    let reservation = match action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::Execute,
+            reservation,
+            ..
+        } => reservation,
+        _ => panic!("the current evidence confirmation should start execution"),
+    };
+    let plan = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("plan should remain available");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Executing);
+    assert_eq!(plan.stale_override_paths, vec!["evidence.txt"]);
+    release_agent_run_reservation(&state, &session_id, &reservation).await;
+
+    let _ = std::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    );
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_requires_confirmation_for_incomplete_plan_evidence() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-incomplete-evidence-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("plan-incomplete-evidence");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let mut session = test_session(&session_id, "Incomplete Plan Evidence", None);
+    session.workspace = workspace.clone();
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_incomplete_evidence".into(),
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        evidence_truncated: true,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    let action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"execute","plan_id":"plan_incomplete_evidence","revision":1}}"#
+            .into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "plan_stale");
+    assert_eq!(event["paths"], serde_json::json!([]));
+    assert_eq!(event["evidence_incomplete"], true);
+    let confirmation_token = event["confirmation_token"]
+        .as_str()
+        .expect("incomplete evidence should require a confirmation token")
+        .to_string();
+
+    let action = handle_idle_socket_input(
+        serde_json::json!({
+            "plan_action": {
+                "action": "execute",
+                "plan_id": "plan_incomplete_evidence",
+                "revision": 1,
+                "allow_stale": true,
+                "stale_confirmation_token": confirmation_token,
+            }
+        })
+        .to_string(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    let reservation = match action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::Execute,
+            reservation,
+            ..
+        } => reservation,
+        _ => panic!("explicitly confirmed incomplete evidence should start execution"),
+    };
+    let plan = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("plan should remain available");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Executing);
+    assert!(plan.stale_override_paths.is_empty());
+    assert!(plan.stale_override_confirmed_at.is_some());
+    release_agent_run_reservation(&state, &session_id, &reservation).await;
+
+    let _ = std::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    );
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[tokio::test]
@@ -717,6 +1731,7 @@ async fn handle_idle_socket_input_restores_the_pending_plan_when_approval_cannot
         original_user_message_index: 0,
         assistant_plan_message_index: 0,
         created_at: 10,
+        ..Default::default()
     });
     let original_updated_at = session.updated_at;
     let original_message_count = session.messages.len();
@@ -777,6 +1792,7 @@ async fn handle_idle_socket_input_keeps_a_pending_plan_when_the_final_model_is_d
         original_user_message_index: 0,
         assistant_plan_message_index: 0,
         created_at: 10,
+        ..Default::default()
     });
     {
         let mut sessions = state.sessions.lock().await;
@@ -864,7 +1880,8 @@ async fn handle_idle_socket_input_rejects_execute_plan_conflicts() {
     assert!(matches!(action, IdleSocketInputAction::Continue));
     let payload = rx.recv().await.expect("error payload should be sent");
     let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
-    assert_eq!(parsed["type"].as_str(), Some("system"));
+    assert_eq!(parsed["type"].as_str(), Some("error"));
+    assert_eq!(parsed["code"].as_str(), Some("invalid_plan_action"));
     assert!(
         parsed["content"]
             .as_str()
@@ -890,6 +1907,7 @@ async fn handle_idle_socket_input_rejects_malformed_structured_json_without_clea
         original_user_message_index: 1,
         assistant_plan_message_index: 2,
         created_at: 10,
+        ..Default::default()
     });
     {
         let mut sessions = state.sessions.lock().await;
@@ -2456,6 +3474,13 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     apply_run_cancel_outcome(&ctx, &mut phase_state).await;
@@ -2620,6 +3645,13 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     }
 }
 
@@ -3159,7 +4191,7 @@ async fn build_plan_only_tools_includes_only_read_only_builtins() {
     let workspace = temp_workspace("plan-only-tools");
     std::fs::create_dir_all(&workspace).expect("workspace should be created");
 
-    let tools = build_plan_only_tools(&config, Provider::OpenAI, &workspace);
+    let tools = build_plan_only_tools(&config, Provider::OpenAI, &workspace).await;
     let names = tools
         .iter()
         .filter_map(tool_definition_name)
@@ -3224,6 +4256,7 @@ async fn session_control_tool_is_only_exposed_for_main_execute_tools() {
         .filter_map(|tool| tool_definition_name(&tool).map(str::to_string))
         .collect::<Vec<_>>();
     let plan_tools = build_plan_only_tools(&config, Provider::OpenAI, &workspace)
+        .await
         .into_iter()
         .filter_map(|tool| tool_definition_name(&tool).map(str::to_string))
         .collect::<Vec<_>>();
@@ -3331,13 +4364,75 @@ async fn execute_tool_call_rejects_session_control_in_plan_only_mode() {
 
     let image_budget =
         tools::mcp::ToolImageBudget::new(crate::image_uploads::MAX_IMAGE_UPLOAD_FILES);
-    let (outcome, effective_args) = execute_tool_call(&ctx, &mut phase_state, &tc, &image_budget)
-        .await
-        .expect("plan-only session_control rejection should be recorded");
+    let (outcome, effective_args, _evidence_before) =
+        execute_tool_call(&ctx, &mut phase_state, &tc, &image_budget)
+            .await
+            .expect("plan-only session_control rejection should be recorded");
 
     assert!(outcome.is_error);
     assert!(outcome.output.contains("rejected by plan mode"));
     assert!(effective_args.is_none());
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn plan_evidence_capture_honors_run_cancellation() {
+    let workspace = temp_workspace("plan-evidence-cancel");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    std::fs::write(workspace.join("notes.txt"), "evidence")
+        .expect("evidence fixture should be written");
+    let run_cancel = CancellationToken::new();
+    run_cancel.cancel();
+
+    let capture = tokio::time::timeout(
+        Duration::from_millis(100),
+        capture_plan_tool_evidence(
+            AgentRunMode::PlanOnly,
+            crate::tools::TOOL_NAME_READ_FILE,
+            r#"{"path":"notes.txt"}"#,
+            &workspace,
+            Duration::from_secs(30),
+            None,
+            &run_cancel,
+        ),
+    )
+    .await
+    .expect("a cancelled run must not wait for evidence collection");
+
+    assert!(capture.failed);
+    assert!(capture.evidence.is_empty());
+    assert!(capture.deadline.is_some());
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn plan_evidence_capture_honors_the_shared_tool_deadline() {
+    let workspace = temp_workspace("plan-evidence-deadline");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    std::fs::write(workspace.join("notes.txt"), "evidence")
+        .expect("evidence fixture should be written");
+    let run_cancel = CancellationToken::new();
+    let expired_deadline = std::time::Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("the test deadline should be representable");
+
+    let capture = capture_plan_tool_evidence(
+        AgentRunMode::PlanOnly,
+        crate::tools::TOOL_NAME_READ_FILE,
+        r#"{"path":"notes.txt"}"#,
+        &workspace,
+        Duration::from_secs(30),
+        Some(expired_deadline),
+        &run_cancel,
+    )
+    .await;
+
+    assert!(capture.failed);
+    assert!(capture.evidence.is_empty());
+    assert_eq!(
+        capture.remaining_timeout(Some(Duration::from_secs(30))),
+        Some(Duration::ZERO)
+    );
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
@@ -3481,6 +4576,10 @@ fn cached_read_only_mcp_descriptor(exposed_name: &str) -> crate::tools::mcp::Mcp
         exposed_name: exposed_name.to_string(),
         description: "Search repository metadata".to_string(),
         input_schema: json!({"type": "object", "properties": {}}),
+        annotations: crate::tools::mcp::McpToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+        },
     }
 }
 
@@ -3602,8 +4701,9 @@ async fn prepare_analyze_snapshot_keeps_plan_only_prompt_read_only() {
             .and_then(|message| message.content.clone())
             .expect("system prompt should be present")
     };
-    assert!(prompt.contains("## Plan Mode"));
-    assert!(prompt.contains("Do not modify files"));
+    assert!(prompt.contains("plan-only mode"));
+    assert!(prompt.contains("Do not write files"));
+    assert!(prompt.contains("`submit_plan`"));
     assert!(prompt.contains("**think**"));
     assert!(prompt.contains("**read_file**"));
     assert!(prompt.contains("**list_dir**"));
@@ -3656,9 +4756,10 @@ async fn execute_tool_call_rejects_mutating_tools_in_plan_only_mode() {
 
     let image_budget =
         tools::mcp::ToolImageBudget::new(crate::image_uploads::MAX_IMAGE_UPLOAD_FILES);
-    let (outcome, effective_args) = execute_tool_call(&ctx, &mut phase_state, &tc, &image_budget)
-        .await
-        .expect("plan-only rejection should be recorded as a tool outcome");
+    let (outcome, effective_args, _evidence_before) =
+        execute_tool_call(&ctx, &mut phase_state, &tc, &image_budget)
+            .await
+            .expect("plan-only rejection should be recorded as a tool outcome");
 
     assert!(outcome.is_error);
     assert!(outcome.output.contains("rejected by plan mode"));
@@ -3678,7 +4779,278 @@ async fn execute_tool_call_rejects_mutating_tools_in_plan_only_mode() {
 }
 
 #[tokio::test]
-async fn run_finish_phase_plan_only_registers_plan_without_memory_enqueue() {
+async fn refreshed_revision_replaces_evidence_only_when_submission_succeeds() {
+    let state = Arc::new(test_app_state());
+    let session_id = "plan-refresh-replacement".to_string();
+    let workspace = temp_workspace("plan-refresh-replacement");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    std::fs::write(workspace.join("old.txt"), "old").expect("old fixture should write");
+    std::fs::write(workspace.join("new.txt"), "new").expect("new fixture should write");
+    let old_evidence = crate::plan::capture_tool_evidence(
+        crate::tools::TOOL_NAME_READ_FILE,
+        r#"{"path":"old.txt"}"#,
+        &workspace,
+    );
+    let new_evidence = crate::plan::capture_tool_evidence(
+        crate::tools::TOOL_NAME_READ_FILE,
+        r#"{"path":"new.txt"}"#,
+        &workspace,
+    );
+    let mut session = test_session(&session_id, "Plan Refresh Replacement", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Refresh the plan".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_refresh_replacement".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        revision: 2,
+        status: crate::plan::PlanStatus::Planning,
+        evidence: old_evidence,
+        evidence_truncated: true,
+        created_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::PlanOnly;
+    phase_state.replace_plan_evidence = true;
+    phase_state.plan_evidence = new_evidence.clone();
+    phase_state.plan_submission = Some(
+        crate::plan::validate_submission_json(
+            r#"{
+                "state":"ready",
+                "title":"Refreshed plan",
+                "goal":"Use current evidence",
+                "steps":[{"id":"verify","title":"Verify current state"}]
+            }"#,
+        )
+        .expect("submission should validate"),
+    );
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let events = register_pending_plan(&ctx, &mut phase_state).await;
+
+    assert!(!events.is_empty());
+    let sessions = state.sessions.lock().await;
+    let plan = sessions[&session_id]
+        .pending_plan
+        .as_ref()
+        .expect("refreshed plan should be registered");
+    assert_eq!(plan.revision, 3);
+    assert_eq!(plan.evidence, new_evidence);
+    assert!(!plan.evidence_truncated);
+    drop(sessions);
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn pruned_plan_message_anchors_do_not_reuse_an_existing_revision() {
+    let state = Arc::new(test_app_state());
+    let session_id = "plan-pruned-revision".to_string();
+    let workspace = temp_workspace("plan-pruned-revision");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let mut session = test_session(&session_id, "Pruned Plan Revision", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Revise the pruned plan".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_pruned_revision".into(),
+        original_user_message_index: 0,
+        assistant_plan_message_index: 0,
+        revision: 2,
+        status: crate::plan::PlanStatus::Planning,
+        artifact: crate::plan::PlanArtifact {
+            schema_version: 1,
+            title: "Existing revision".into(),
+            goal: "Preserve optimistic concurrency".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "inspect".into(),
+                title: "Inspect the state".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        initial_submission_pending: false,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::PlanOnly;
+    phase_state.plan_submission = Some(
+        crate::plan::validate_submission_json(
+            r#"{
+                "state":"ready",
+                "title":"Revised plan",
+                "goal":"Preserve optimistic concurrency",
+                "steps":[{"id":"implement","title":"Implement safely"}]
+            }"#,
+        )
+        .expect("submission should validate"),
+    );
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let events = register_pending_plan(&ctx, &mut phase_state).await;
+
+    assert!(!events.is_empty());
+    let sessions = state.sessions.lock().await;
+    let plan = sessions[&session_id]
+        .pending_plan
+        .as_ref()
+        .expect("revised plan should be registered");
+    assert_eq!(plan.revision, 3);
+    assert!(!plan.initial_submission_pending);
+    drop(sessions);
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn plan_tool_calling_fallback_removes_tools_and_adds_text_plan_contract() {
+    let mut messages = vec![ChatMessage {
+        role: "system".into(),
+        content: Some("Base system prompt".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let mut tools = vec![serde_json::json!({"type":"function","name":"submit_plan"})];
+
+    assert!(apply_plan_tool_calling_fallback(&mut messages, &mut tools));
+    assert!(tools.is_empty());
+    assert!(
+        messages[0]
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("exactly one concrete implementation plan"))
+    );
+    assert!(!apply_plan_tool_calling_fallback(&mut messages, &mut tools));
+    let event = plan_tool_calling_fallback_event();
+    assert_eq!(event["type"], "progress");
+    assert_eq!(event["code"], "plan_tool_calling_fallback");
+}
+
+#[test]
+fn plan_only_plain_response_activates_legacy_fallback_once() {
+    let plain_response = ChatMessage {
+        role: "assistant".into(),
+        content: Some("A concrete Markdown plan".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::PlanOnly;
+
+    assert!(activate_plan_text_fallback_for_plain_response(
+        &mut phase_state,
+        &plain_response
+    ));
+    assert!(phase_state.plan_text_fallback_used);
+    assert!(!activate_plan_text_fallback_for_plain_response(
+        &mut phase_state,
+        &plain_response
+    ));
+
+    let mut execute_state = phase_state_for_analyze_test();
+    assert!(!activate_plan_text_fallback_for_plain_response(
+        &mut execute_state,
+        &plain_response
+    ));
+
+    let mut tool_response = plain_response;
+    tool_response.tool_calls = Some(vec![crate::ToolCall {
+        id: "submit-plan".into(),
+        call_type: "function".into(),
+        gemini_thought_signature: None,
+        function: crate::FunctionCall {
+            name: crate::plan::TOOL_NAME_SUBMIT_PLAN.into(),
+            arguments: "{}".into(),
+        },
+    }]);
+    let mut tool_state = phase_state_for_analyze_test();
+    tool_state.run_mode = AgentRunMode::PlanOnly;
+    assert!(!activate_plan_text_fallback_for_plain_response(
+        &mut tool_state,
+        &tool_response
+    ));
+
+    let mut proven_tool_state = phase_state_for_analyze_test();
+    proven_tool_state.run_mode = AgentRunMode::PlanOnly;
+    proven_tool_state.react_ctx.tool_calls = 1;
+    assert!(!activate_plan_text_fallback_for_plain_response(
+        &mut proven_tool_state,
+        &ChatMessage {
+            tool_calls: None,
+            ..tool_response
+        }
+    ));
+    assert!(!proven_tool_state.plan_text_fallback_used);
+}
+
+#[tokio::test]
+async fn run_finish_phase_plan_only_compatibility_fallback_registers_legacy_plan() {
     let mut config = test_config();
     config.structured_memory = true;
     let state = Arc::new(test_app_state_with_config(config.clone()));
@@ -3733,6 +5105,7 @@ async fn run_finish_phase_plan_only_registers_plan_without_memory_enqueue() {
     };
     let mut phase_state = phase_state_for_analyze_test();
     phase_state.run_mode = AgentRunMode::PlanOnly;
+    phase_state.plan_text_fallback_used = true;
     phase_state
         .react_ctx
         .transition_to_finish(agent::FinishReason::Complete);
@@ -3773,6 +5146,214 @@ async fn run_finish_phase_plan_only_registers_plan_without_memory_enqueue() {
         crate::session_store::sessions_dir().join(format!("{session_id}.json")),
     );
     let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_finish_phase_plan_only_plain_response_registers_legacy_plan() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-only-unsubmitted-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("plan-only-unsubmitted");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let mut session = test_session(&session_id, "Unsubmitted Plan", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("plan the next change".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    let plain_response = ChatMessage {
+        role: "assistant".into(),
+        content: Some("Goal: inspect and propose the implementation steps.".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    session.messages.push(plain_response.clone());
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_unsubmitted".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 1,
+        revision: 1,
+        status: crate::plan::PlanStatus::Planning,
+        artifact: crate::plan::initial_placeholder_artifact("plan the next change", false)
+            .expect("placeholder should validate"),
+        created_at: 10,
+        updated_at: 10,
+        initial_submission_pending: true,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::PlanOnly;
+    assert!(activate_plan_text_fallback_for_plain_response(
+        &mut phase_state,
+        &plain_response
+    ));
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let control = run_finish_phase(&ctx, &mut phase_state).await;
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(!phase_state.run_failed);
+    let sessions = state.sessions.lock().await;
+    let plan = sessions[&session_id]
+        .pending_plan
+        .as_ref()
+        .expect("the plain response should become a legacy plan");
+    assert_eq!(plan.id, "plan_unsubmitted");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Ready);
+    assert_eq!(
+        plan.artifact.legacy_markdown.as_deref(),
+        plain_response.content.as_deref()
+    );
+    drop(sessions);
+    assert!(
+        std::iter::from_fn(|| live_rx.try_recv().ok()).any(|event| event["type"] == "plan_ready")
+    );
+
+    crate::session_store::delete_session_from_storage(&session_id)
+        .await
+        .expect("test session should be removed");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn structured_plan_reuses_the_submit_plan_assistant_message() {
+    let state = Arc::new(test_app_state());
+    let session_id = "structured-plan-message-anchor".to_string();
+    let workspace = temp_workspace("structured-plan-message-anchor");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let mut session = test_session(&session_id, "Structured Plan Anchor", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Plan the change".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some("I prepared a plan.".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "submit-plan-call".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: crate::plan::TOOL_NAME_SUBMIT_PLAN.into(),
+                arguments: "{}".into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
+        role: "tool".into(),
+        content: Some("Plan accepted.".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: Some("submit-plan-call".into()),
+        timestamp: None,
+    });
+    let original_message_count = session.messages.len();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::PlanOnly;
+    phase_state.plan_submission = Some(
+        crate::plan::validate_submission_json(
+            r#"{
+                "state":"ready",
+                "title":"Canonical plan",
+                "goal":"Keep one visible plan representation",
+                "steps":[{"id":"implement","title":"Implement the change"}]
+            }"#,
+        )
+        .expect("submission should validate"),
+    );
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let events = register_pending_plan(&ctx, &mut phase_state).await;
+
+    assert!(!events.is_empty());
+    let sessions = state.sessions.lock().await;
+    let session = &sessions[&session_id];
+    let plan = session
+        .pending_plan
+        .as_ref()
+        .expect("plan should be registered");
+    assert_eq!(session.messages.len(), original_message_count);
+    assert_eq!(plan.assistant_plan_message_index, 2);
+    assert!(
+        session.messages[2]
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("# Canonical plan"))
+    );
+    assert_eq!(
+        session.messages[2].tool_calls.as_ref().map(Vec::len),
+        Some(1)
+    );
+    drop(sessions);
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[tokio::test]
@@ -3887,6 +5468,17 @@ async fn run_finish_phase_does_not_report_completion_when_persistence_fails() {
         tool_call_id: None,
         timestamp: None,
     });
+    let executing_plan = crate::PendingPlan {
+        id: "plan_finish_persist_failure".into(),
+        revision: 2,
+        status: crate::plan::PlanStatus::Executing,
+        approved_at: Some(20),
+        execution_attempt: 1,
+        created_at: 10,
+        updated_at: 20,
+        ..Default::default()
+    };
+    session.pending_plan = Some(executing_plan.clone());
     state
         .sessions
         .lock()
@@ -3910,6 +5502,7 @@ async fn run_finish_phase_does_not_report_completion_when_persistence_fails() {
         run_cancel: &run_cancel,
     };
     let mut phase_state = phase_state_for_analyze_test();
+    phase_state.approved_plan = Some(executing_plan);
     phase_state
         .react_ctx
         .transition_to_finish(agent::FinishReason::Complete);
@@ -3919,6 +5512,14 @@ async fn run_finish_phase_does_not_report_completion_when_persistence_fails() {
     std::fs::remove_dir_all(&failure_path).expect("failure sentinel should be removed");
     assert!(matches!(control, AgentPhaseControl::Break));
     assert!(phase_state.run_failed);
+    let sessions = state.sessions.lock().await;
+    let plan = sessions[&session_id]
+        .pending_plan
+        .as_ref()
+        .expect("the approved plan should remain available after rollback");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Executing);
+    assert!(plan.finished_at.is_none());
+    drop(sessions);
     let error = live_rx
         .try_recv()
         .expect("persistence failure should be reported");
@@ -3931,6 +5532,121 @@ async fn run_finish_phase_does_not_report_completion_when_persistence_fails() {
     assert!(
         live_rx.try_recv().is_err(),
         "a failed final save must not emit done or finish hooks"
+    );
+}
+
+#[tokio::test]
+async fn run_finish_phase_rolls_back_plan_registration_when_persistence_fails() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-finish-persist-failure-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Plan Finish Persist Failure", None);
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Plan the persistence change".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some("Draft plan response".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "submit-plan-persist-failure".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: crate::plan::TOOL_NAME_SUBMIT_PLAN.into(),
+                arguments: "{}".into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    });
+    let planning_plan = crate::PendingPlan {
+        id: "plan_finish_persist_failure".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        revision: 1,
+        status: crate::plan::PlanStatus::Planning,
+        created_at: 10,
+        updated_at: 10,
+        initial_submission_pending: true,
+        ..Default::default()
+    };
+    session.pending_plan = Some(planning_plan.clone());
+    let original_messages = session.messages.clone();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let failure_path = crate::session_store::sessions_dir().join(format!("{session_id}.json.tmp"));
+    std::fs::create_dir_all(&failure_path).expect("failure sentinel directory should be created");
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::PlanOnly;
+    phase_state.plan_submission = Some(
+        crate::plan::validate_submission_json(
+            r#"{
+                "state":"ready",
+                "title":"Persist the plan safely",
+                "goal":"Keep memory and durable state consistent",
+                "steps":[{"id":"save","title":"Save the accepted revision"}]
+            }"#,
+        )
+        .expect("submission should validate"),
+    );
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let control = run_finish_phase(&ctx, &mut phase_state).await;
+
+    std::fs::remove_dir_all(&failure_path).expect("failure sentinel should be removed");
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(phase_state.run_failed);
+    let sessions = state.sessions.lock().await;
+    let session = &sessions[&session_id];
+    let plan = session
+        .pending_plan
+        .as_ref()
+        .expect("the planning plan should be restored for terminal handling");
+    assert_eq!(plan.id, planning_plan.id);
+    assert_eq!(plan.revision, planning_plan.revision);
+    assert_eq!(plan.status, crate::plan::PlanStatus::Planning);
+    assert_eq!(session.messages.len(), original_messages.len());
+    assert_eq!(session.messages[2].content, original_messages[2].content);
+    drop(sessions);
+    let error = live_rx
+        .try_recv()
+        .expect("persistence failure should be reported");
+    assert_eq!(error["type"].as_str(), Some("error"));
+    assert!(
+        live_rx.try_recv().is_err(),
+        "an unsaved plan revision must not be announced"
     );
 }
 
@@ -4305,6 +6021,13 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     phase_state.working_state.seed_from_query(Some(
@@ -4443,6 +6166,13 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     prepare_analyze_snapshot(&ctx, &mut phase_state)
@@ -4572,6 +6302,13 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
     phase_state
         .working_state
@@ -4705,6 +6442,13 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     update_working_state(&ctx, &mut phase_state, &[]).await;
@@ -4816,6 +6560,13 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     prepare_analyze_snapshot(&ctx, &mut phase_state)
@@ -4984,6 +6735,13 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     update_working_state(&ctx, &mut phase_state, &[]).await;
@@ -5076,6 +6834,13 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     phase_state
@@ -5239,6 +7004,13 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     prepare_analyze_snapshot(&ctx, &mut phase_state)
@@ -5353,6 +7125,13 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     phase_state.working_state.seed_from_query(Some(
@@ -5505,6 +7284,13 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         usage_snap_output: 0,
         tool_images_disabled: false,
         tool_images_attached_in_batch: 0,
+        plan_submission: None,
+        plan_text_fallback_used: false,
+        plan_evidence: Vec::new(),
+        plan_evidence_truncated: false,
+        replace_plan_evidence: false,
+        approved_plan: None,
+        plan_action_prompt: None,
     };
 
     let response = providers::LlmResponse {
@@ -5666,7 +7452,15 @@ async fn canceled_tool_image_upload_records_text_result_before_breaking() {
         }],
     };
 
-    let control = record_tool_result(&ctx, &mut phase_state, &tool_call, result, None).await;
+    let control = record_tool_result(
+        &ctx,
+        &mut phase_state,
+        &tool_call,
+        result,
+        None,
+        PlanEvidenceCapture::default(),
+    )
+    .await;
 
     assert!(matches!(control, AgentPhaseControl::Break));
     assert!(phase_state.run_detached);
@@ -6063,7 +7857,9 @@ fn persist_pending_interventions_appends_user_messages() {
         original_user_message_index: 1,
         assistant_plan_message_index: 2,
         created_at: 10,
+        ..Default::default()
     });
+    session.version = SESSION_VERSION;
 
     rt.block_on(async {
         state
@@ -6099,12 +7895,18 @@ fn persist_pending_interventions_appends_user_messages() {
         persisted.messages[2].content.as_deref(),
         Some("second note")
     );
-    assert!(persisted.pending_plan.is_none());
+    assert_eq!(
+        persisted.pending_plan.as_ref().map(|plan| plan.id.as_str()),
+        Some("plan_stale")
+    );
     assert!(persisted.updated_at >= 1);
 
     let saved = crate::session_store::load_session_from_disk("session-a")
         .expect("session should be saved to disk");
-    assert!(saved.pending_plan.is_none());
+    assert_eq!(
+        saved.pending_plan.as_ref().map(|plan| plan.id.as_str()),
+        Some("plan_stale")
+    );
     assert_eq!(saved.messages.len(), 3);
     let _ = std::fs::remove_file(crate::session_store::sessions_dir().join("session-a.json"));
 }

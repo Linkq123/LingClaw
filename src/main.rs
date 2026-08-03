@@ -35,6 +35,7 @@ mod context;
 mod hooks;
 mod image_uploads;
 mod memory;
+mod plan;
 mod prompts;
 mod providers;
 mod runtime_loop;
@@ -312,14 +313,7 @@ fn now_epoch() -> u64 {
 }
 
 const SESSION_VERSION: u32 = 7;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PendingPlan {
-    id: String,
-    original_user_message_index: usize,
-    assistant_plan_message_index: usize,
-    created_at: u64,
-}
+pub(crate) use plan::PendingPlan;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -443,6 +437,9 @@ fn migrate_session(session: &mut Session) {
     }
     if session.version < 7 {
         session.pending_plan = None;
+    }
+    if let Some(plan) = session.pending_plan.as_mut() {
+        plan.normalize_legacy(&session.messages);
     }
     todos::normalize_snapshot(&mut session.todos, session.updated_at);
     session.version = SESSION_VERSION;
@@ -3217,11 +3214,17 @@ async fn handle_group_socket(
         .await
         {
             if state.storage_is_writable() {
-                ws_send(
-                    &tx,
-                    &json!({"type":"error","content":error,"dismissible":true}),
-                )
-                .await;
+                let event = if error == "group_plan_mode_unsupported" {
+                    json!({
+                        "type":"error",
+                        "code":"group_plan_mode_unsupported",
+                        "content":"Plan Mode is not available in Group chats. Open a Session to create and approve a plan.",
+                        "dismissible":true,
+                    })
+                } else {
+                    json!({"type":"error","content":error,"dismissible":true})
+                };
+                ws_send(&tx, &event).await;
             } else {
                 eprintln!("ERROR: group message entered storage protection: {error}");
                 send_storage_status(&tx, &state).await;
@@ -5585,6 +5588,21 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let _runtime_instance_lock = match storage::RuntimeInstanceLock::acquire(&database_path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("ERROR: Failed to acquire LingClaw runtime ownership: {error}");
+            std::process::exit(1);
+        }
+    };
+    let addr = format!("127.0.0.1:{port}");
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("Failed to bind {addr}: {error}");
+            return;
+        }
+    };
     if let Err(error) = storage::preflight_legacy_storage_path_conflicts(&database_path) {
         eprintln!("ERROR: Legacy storage preflight failed: {error}");
         std::process::exit(1);
@@ -5606,6 +5624,21 @@ async fn main() {
         Ok(None) => eprintln!("  Storage:       {}", database.path().display()),
         Err(error) => {
             eprintln!("ERROR: Legacy storage migration failed: {error}");
+            std::process::exit(1);
+        }
+    }
+    match database.recover_interrupted_plans().await {
+        Ok((planning, executing)) if planning + executing > 0 => {
+            eprintln!(
+                "  Storage:       recovered {} interrupted plan(s) ({} planning, {} executing)",
+                planning + executing,
+                planning,
+                executing
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("ERROR: Failed to recover interrupted plans: {error}");
             std::process::exit(1);
         }
     }
@@ -5746,19 +5779,10 @@ async fn main() {
         .layer(middleware::from_fn(enforce_local_request))
         .with_state(state.clone());
 
-    let addr = format!("127.0.0.1:{port}");
     println!("🦀 LingClaw v2 listening on http://{addr}");
     println!(
         "   Tools: think, todos, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch"
     );
-
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("Failed to bind {addr}: {error}");
-            return;
-        }
-    };
 
     match session_group::recover_stale_group_runs_on_startup().await {
         Ok(recovered) if recovered > 0 => {

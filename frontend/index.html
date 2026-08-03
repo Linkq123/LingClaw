@@ -491,6 +491,27 @@
 
           <div id="input-area">
             <div id="group-target-bar" class="group-target-bar" hidden></div>
+            <div class="composer-mode-row">
+              <div class="composer-mode-switch" role="group" aria-label="Agent mode">
+                <button
+                  id="execute-mode-toggle"
+                  type="button"
+                  aria-pressed="true"
+                  data-i18n="composer.executeMode"
+                >
+                  Execute
+                </button>
+                <button
+                  id="plan-mode-toggle"
+                  type="button"
+                  aria-pressed="false"
+                  data-i18n="composer.planMode"
+                >
+                  Plan
+                </button>
+              </div>
+              <div id="plan-progress" class="plan-progress" hidden></div>
+            </div>
             <div id="image-preview-bar" class="image-preview-bar" style="display: none"></div>
             <div
               id="slash-command-menu"
@@ -519,16 +540,6 @@
                           <use href="#icon-paperclip"></use></svg
                       ></span>
                       <span data-i18n="composer.addImage">Add image</span>
-                    </button>
-                    <button
-                      class="attach-menu-item attach-menu-toggle"
-                      id="plan-mode-toggle"
-                      type="button"
-                      role="switch"
-                      aria-checked="false"
-                    >
-                      <span data-i18n="composer.planMode">Plan mode</span>
-                      <span class="toggle-switch" aria-hidden="true"><span></span></span>
                     </button>
                   </div>
                   <div id="attach-upload-status" class="attach-upload-status" style="display: none">

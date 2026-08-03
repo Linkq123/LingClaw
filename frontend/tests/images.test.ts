@@ -7,6 +7,8 @@ import {
   removeImage,
   renderImagePreviews,
   syncPlanModeToggle,
+  restorePlanModeForSession,
+  setPlanMode,
   togglePlanMode,
   updateAttachButton,
   updateS3ConfigIdentity,
@@ -43,7 +45,7 @@ describe('ensureUploadTokenInternal', () => {
         <div id="attach-popup" style="display: none">
           <div id="attach-menu">
             <button id="attach-local-btn"></button>
-            <button id="plan-mode-toggle" class="attach-menu-toggle" aria-checked="false"></button>
+            <button id="plan-mode-toggle" class="attach-menu-toggle" aria-pressed="false"></button>
           </div>
           <div id="attach-upload-status" style="display: none"></div>
         </div>
@@ -107,7 +109,7 @@ describe('attachment menu', () => {
         <div id="attach-popup" style="display: none">
           <div id="attach-menu">
             <button id="attach-local-btn"></button>
-            <button id="plan-mode-toggle" class="attach-menu-toggle" aria-checked="false"></button>
+            <button id="plan-mode-toggle" class="attach-menu-toggle" aria-pressed="false"></button>
           </div>
           <div id="attach-upload-status" style="display: none"></div>
         </div>
@@ -153,14 +155,33 @@ describe('attachment menu', () => {
 
   it('syncs plan mode switch state', () => {
     syncPlanModeToggle();
-    expect(dom.planModeToggle?.getAttribute('aria-checked')).toBe('false');
-    expect(dom.planModeToggle?.classList.contains('is-on')).toBe(false);
+    expect(dom.planModeToggle?.getAttribute('aria-pressed')).toBe('false');
+    expect(dom.planModeToggle?.classList.contains('is-active')).toBe(false);
 
     togglePlanMode();
 
     expect(state.planModeEnabled).toBe(true);
-    expect(dom.planModeToggle?.getAttribute('aria-checked')).toBe('true');
-    expect(dom.planModeToggle?.classList.contains('is-on')).toBe(true);
+    expect(dom.planModeToggle?.getAttribute('aria-pressed')).toBe('true');
+    expect(dom.planModeToggle?.classList.contains('is-active')).toBe(true);
+  });
+
+  it('keeps the Plan Mode choice isolated per Session and disables it for Groups', () => {
+    state.activeSessionId = 'alpha';
+    state.activeGroupId = '';
+    setPlanMode(true);
+
+    state.activeSessionId = 'beta';
+    restorePlanModeForSession('beta');
+    expect(state.planModeEnabled).toBe(false);
+
+    state.activeSessionId = 'alpha';
+    restorePlanModeForSession('alpha');
+    expect(state.planModeEnabled).toBe(true);
+
+    state.activeGroupId = 'group-a';
+    restorePlanModeForSession('alpha');
+    expect(state.planModeEnabled).toBe(false);
+    expect(dom.planModeToggle?.disabled).toBe(true);
   });
 
   it('uses the shared close icon for pending image removal', () => {

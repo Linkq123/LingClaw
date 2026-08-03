@@ -237,6 +237,13 @@ pub(crate) struct McpToolDescriptor {
     pub(crate) exposed_name: String,
     pub(crate) description: String,
     pub(crate) input_schema: Value,
+    pub(crate) annotations: McpToolAnnotations,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct McpToolAnnotations {
+    pub(crate) read_only_hint: Option<bool>,
+    pub(crate) destructive_hint: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -385,94 +392,11 @@ pub(crate) fn is_mcp_tool_name(name: &str) -> bool {
     name.starts_with(MCP_NAME_PREFIX)
 }
 
-/// Conservative read-only classification for MCP tools.
-/// Unknown tools default to mutating. A tool is considered read-only only when
-/// it avoids mutation keywords and explicitly matches a read-only keyword.
+/// Trust the MCP server's explicit impact declaration for read-only execution.
+/// Missing declarations and contradictory destructive declarations fail closed.
 pub(crate) fn is_read_only_tool_descriptor(descriptor: &McpToolDescriptor) -> bool {
-    const MUTATION_WORDS: &[&str] = &[
-        "write",
-        "clone",
-        "create",
-        "update",
-        "delete",
-        "remove",
-        "modify",
-        "set",
-        "put",
-        "post",
-        "patch",
-        "insert",
-        "add",
-        "edit",
-        "append",
-        "replace",
-        "rename",
-        "move",
-        "copy",
-        "checkout",
-        "switch",
-        "execute",
-        "run",
-        "exec",
-        "deploy",
-        "install",
-        "uninstall",
-        "send",
-        "publish",
-        "push",
-        "commit",
-        "approve",
-        "merge",
-        "close",
-        "reopen",
-        "assign",
-        "drop",
-        "truncate",
-        "grant",
-        "revoke",
-        "enable",
-        "disable",
-        "start",
-        "stop",
-        "restart",
-        "kill",
-        "terminate",
-        "upload",
-        "submit",
-        "apply",
-        "reset",
-        "purge",
-        "destroy",
-        "dismiss",
-        "invite",
-        "ban",
-        "block",
-        "archive",
-    ];
-    const READ_ONLY_WORDS: &[&str] = &[
-        "get", "read", "list", "search", "find", "fetch", "lookup", "describe", "show", "inspect",
-        "retrieve", "view", "stat", "status", "count",
-    ];
-
-    let name = descriptor.raw_name.to_lowercase();
-    let desc = descriptor.description.to_lowercase();
-    let name_words = name.split(|c: char| !c.is_alphanumeric());
-    let desc_words = desc.split(|c: char| !c.is_alphanumeric());
-    let mut saw_read_only_keyword = false;
-
-    for word in name_words.chain(desc_words) {
-        if word.is_empty() {
-            continue;
-        }
-        if MUTATION_WORDS.contains(&word) {
-            return false;
-        }
-        if READ_ONLY_WORDS.contains(&word) {
-            saw_read_only_keyword = true;
-        }
-    }
-
-    saw_read_only_keyword
+    descriptor.annotations.read_only_hint == Some(true)
+        && descriptor.annotations.destructive_hint != Some(true)
 }
 
 /// Cached-only lookup for MCP parallel classification.
@@ -3160,12 +3084,21 @@ fn parse_tool_descriptors(
             .or_else(|| tool.get("input_schema"))
             .cloned()
             .unwrap_or_else(|| json!({"type":"object","properties":{},"required":[]}));
+        let annotations = tool.get("annotations");
         descriptors.push(McpToolDescriptor {
             server_name: server_name.to_string(),
             raw_name: raw_name.to_string(),
             exposed_name,
             description,
             input_schema,
+            annotations: McpToolAnnotations {
+                read_only_hint: annotations
+                    .and_then(|value| value.get("readOnlyHint"))
+                    .and_then(Value::as_bool),
+                destructive_hint: annotations
+                    .and_then(|value| value.get("destructiveHint"))
+                    .and_then(Value::as_bool),
+            },
         });
     }
 

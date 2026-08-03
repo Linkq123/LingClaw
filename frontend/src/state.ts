@@ -9,6 +9,7 @@ import type {
   SessionSummary,
   SessionGroupSummary,
   TodosStateEvent,
+  PlanStatePayload,
 } from './types.js';
 import type { ComposerModelAvailability } from './composerAvailability.js';
 
@@ -63,6 +64,8 @@ export interface DomRefs {
   imageUrlField: HTMLInputElement | null;
   imageUrlAddBtn: HTMLButtonElement | null;
   planModeToggle: HTMLButtonElement | null;
+  executeModeToggle: HTMLButtonElement | null;
+  planProgress: HTMLElement | null;
   groupTargetBar: HTMLElement | null;
   attachUploadStatus: HTMLElement | null;
   imageFileInput: HTMLInputElement | null;
@@ -151,6 +154,11 @@ export interface AppState {
   s3Capable: boolean;
   s3ConfigId: string;
   planModeEnabled: boolean;
+  planModesBySession: Map<string, boolean>;
+  activePlan: PlanStatePayload | null;
+  planHistory: PlanStatePayload[];
+  planStalePaths: string[];
+  planStaleConfirmationToken: string;
   pendingPlanId: string;
   pendingPlanMessageIndex: number | null;
   pendingPlanExecutionId: string;
@@ -277,6 +285,11 @@ export const state: AppState = {
   s3Capable: false,
   s3ConfigId: '',
   planModeEnabled: false,
+  planModesBySession: new Map(),
+  activePlan: null,
+  planHistory: [],
+  planStalePaths: [],
+  planStaleConfirmationToken: '',
   pendingPlanId: '',
   pendingPlanMessageIndex: null,
   pendingPlanExecutionId: '',
@@ -367,6 +380,10 @@ export function initDomRefs() {
   dom.imageUrlField = document.getElementById('image-url-field') as HTMLInputElement | null;
   dom.imageUrlAddBtn = document.getElementById('image-url-add') as HTMLButtonElement | null;
   dom.planModeToggle = document.getElementById('plan-mode-toggle') as HTMLButtonElement | null;
+  dom.executeModeToggle = document.getElementById(
+    'execute-mode-toggle',
+  ) as HTMLButtonElement | null;
+  dom.planProgress = document.getElementById('plan-progress');
   dom.groupTargetBar = document.getElementById('group-target-bar');
   dom.attachUploadStatus = document.getElementById('attach-upload-status');
   dom.imageFileInput = document.getElementById('image-file-input') as HTMLInputElement | null;

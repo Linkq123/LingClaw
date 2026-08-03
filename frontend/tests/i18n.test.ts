@@ -76,6 +76,20 @@ describe('i18n', () => {
     expect(helpCommand.description()).toBe('显示命令帮助。');
   });
 
+  it('localizes plan request failures in both languages', () => {
+    expect(tr('plan.error.invalidRequest')).toBe(
+      'The plan request is invalid. Review it and try again.',
+    );
+    expect(tr('plan.error.sessionNotFound')).toContain('Session');
+    expect(tr('plan.error.storage')).toContain('saved');
+
+    setLanguage('zh-CN');
+    expect(tr('composer.agentModelUnconfigured')).toContain('Agent 模型未配置');
+    expect(tr('plan.error.invalidRequest')).toBe('计划请求无效，请检查后重试。');
+    expect(tr('plan.error.sessionNotFound')).toContain('Session');
+    expect(tr('plan.error.storage')).toContain('计划保存失败');
+  });
+
   it('updates a dynamically recreated welcome state after switching languages', async () => {
     document.body.innerHTML = '<main id="chat"></main>';
     const { initDomRefs } = await import('../src/state.js');

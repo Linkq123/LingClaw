@@ -108,6 +108,8 @@ Session、Group、消息、Todos、Usage 和 Sub-agent 快照存放在 `~/.lingc
 
 LingClaw 使用 `Analyze → Act → Observe → Finish` 的 ReAct 状态机组织每轮工作。推理、工具调用、计划、Sub-agent 和 Orchestration 会聚合为可展开的执行栈；你可以查看过程、检查工具结果、在运行中追加指令或立即停止。
 
+输入区可按 Session 切换“执行 / 规划”。规划模式只做只读分析和必要提问，并生成带版本、步骤、风险与验收标准的结构化计划；批准后，Runtime 会在每个执行 cycle 注入精确 revision，并持续回写步骤进度与偏离原因。工作区证据变化时必须刷新计划或明确选择继续，批准动作不会伪造用户消息。Group 当前不开放规划模式。
+
 ### 连接不同模型与协议
 
 同一套 Session 和工具体系支持：

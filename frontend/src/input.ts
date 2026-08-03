@@ -3,7 +3,7 @@ import { INPUT_HISTORY_MAX } from './constants.js';
 import { canSendWhileBusy } from './utils.js';
 import { syncToolDrawerBounds, scrollDown } from './scroll.js';
 import { addMsg, addSystem, setBusy, renderUserImageThumbnails } from './renderers/chat.js';
-import { renderImagePreviews, uploadLocalImages } from './images.js';
+import { renderImagePreviews, setPlanMode, uploadLocalImages } from './images.js';
 import {
   buildSlashCommandInput,
   getSlashCommandMenuState,
@@ -486,7 +486,7 @@ export function send() {
         targets,
         target_mode: targetMode,
         start_runs: true,
-        run_mode: state.planModeEnabled ? 'plan_only' : 'execute',
+        run_mode: 'execute',
       }),
     );
     if (!state.busy) {
@@ -526,6 +526,13 @@ export function send() {
         renderSessionDrawer();
       }
     }
+    if (commandName === '/clear' || commandName === '/new') {
+      // These commands replace the current transcript and remove its active
+      // plan. Switch optimistically so the following plan-less history stays
+      // in Execute mode; an error event re-renders the still-active plan and
+      // restores Plan mode when the reset did not commit.
+      setPlanMode(false);
+    }
     sendCmd(commandText);
     pushInputHistory(commandText);
     dom.input.value = '';
@@ -533,6 +540,14 @@ export function send() {
     closeSlashCommandMenu();
     syncComposerAvailability();
     syncToolDrawerBounds();
+    return;
+  }
+
+  if (state.activePlan && ['planning', 'needs_input', 'ready'].includes(state.activePlan.status)) {
+    addSystem(tr('plan.composer.resolveActive'));
+    document
+      .querySelector<HTMLElement>('.plan-artifact-card:not([data-historical="true"])')
+      ?.focus();
     return;
   }
 

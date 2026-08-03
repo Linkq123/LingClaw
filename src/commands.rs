@@ -17,8 +17,9 @@ use crate::{
     session_admin::gather_global_today_usage,
     session_store::{
         SessionSummary, build_session_status, build_usage_report,
-        list_saved_session_summaries_result, replace_session_messages, save_session_to_disk_locked,
-        session_persist_gate, sessions_dir,
+        list_saved_session_summaries_result, replace_session_messages,
+        reset_session_context_on_disk_locked, save_session_to_disk_locked, session_persist_gate,
+        sessions_dir,
     },
     tools, truncate, ws_send,
 };
@@ -588,21 +589,15 @@ async fn reset_session_context_and_persist(
     current_session_id: &str,
 ) -> Result<(), String> {
     let config = state.config();
-    persist_session_update(
-        state,
-        current_session_id,
-        |session| {
-            (
-                session.messages.clone(),
-                session.subagent_snapshots.clone(),
-                session.failed_tool_results.clone(),
-                session.tool_calls_count,
-                session.todos.clone(),
-                session.pending_plan.clone(),
-                session.updated_at,
-            )
-        },
-        |session| {
+    let persist_gate = session_persist_gate(current_session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let (previous, session_to_save) = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(current_session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        let previous = session.clone();
+        {
             let model = session.effective_model(&config.model).to_string();
             let sys = build_system_prompt(
                 &config,
@@ -615,27 +610,19 @@ async fn reset_session_context_and_persist(
             session.todos =
                 crate::todos::TodoSnapshot::cleared_by_user_from(&session.todos, now_epoch());
             session.pending_plan = None;
-        },
-        |session,
-         (
-            messages,
-            subagent_snapshots,
-            failed_tool_results,
-            tool_calls_count,
-            todos,
-            pending_plan,
-            updated_at,
-        )| {
-            session.messages = messages;
-            session.subagent_snapshots = subagent_snapshots;
-            session.failed_tool_results = failed_tool_results;
-            session.tool_calls_count = tool_calls_count;
-            session.todos = todos;
-            session.pending_plan = pending_plan;
-            session.updated_at = updated_at;
-        },
-    )
-    .await
+            session.updated_at = now_epoch();
+        }
+        (previous, session.clone())
+    };
+
+    if let Err(error) = reset_session_context_on_disk_locked(&session_to_save).await {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(current_session_id) {
+            *session = previous;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn handle_new_command(

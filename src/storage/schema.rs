@@ -1,5 +1,5 @@
 pub(crate) const APPLICATION_ID: i64 = 0x4C_43_4C_57;
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 pub(crate) const INITIAL_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -82,12 +82,56 @@ CREATE TABLE IF NOT EXISTS session_todos (
     UNIQUE (session_id, todo_id)
 );
 
-CREATE TABLE IF NOT EXISTS session_pending_plans (
-    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS session_plans (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     plan_id TEXT NOT NULL,
     original_user_message_index INTEGER NOT NULL,
+    current_revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    approved_at INTEGER,
+    finished_at INTEGER,
+    execution_attempt INTEGER NOT NULL,
+    evidence_truncated INTEGER NOT NULL,
+    stale_override_json TEXT,
+    pending_feedback TEXT,
+    initial_submission_pending INTEGER NOT NULL DEFAULT 0,
+    stale_override_confirmed_at INTEGER,
+    PRIMARY KEY (session_id, plan_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_plans_one_active
+    ON session_plans(session_id)
+    WHERE status IN ('planning', 'needs_input', 'ready', 'executing');
+CREATE INDEX IF NOT EXISTS idx_session_plans_latest
+    ON session_plans(session_id, updated_at DESC, plan_id DESC);
+
+CREATE TABLE IF NOT EXISTS session_plan_revisions (
+    session_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
     assistant_plan_message_index INTEGER NOT NULL,
-    created_at INTEGER NOT NULL
+    artifact_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, plan_id, revision),
+    FOREIGN KEY (session_id, plan_id)
+        REFERENCES session_plans(session_id, plan_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_plan_progress (
+    session_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    step_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    note TEXT NOT NULL,
+    deviation_reason TEXT,
+    PRIMARY KEY (session_id, plan_id, position),
+    UNIQUE (session_id, plan_id, step_id),
+    FOREIGN KEY (session_id, plan_id)
+        REFERENCES session_plans(session_id, plan_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS session_usage (
@@ -188,4 +232,65 @@ CREATE TABLE IF NOT EXISTS group_runs (
     PRIMARY KEY (group_id, run_id),
     UNIQUE (group_id, position)
 );
+"#;
+
+pub(crate) const PLAN_LIFECYCLE_SCHEMA: &str = r#"
+CREATE TABLE session_plans (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    plan_id TEXT NOT NULL,
+    original_user_message_index INTEGER NOT NULL,
+    current_revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    approved_at INTEGER,
+    finished_at INTEGER,
+    execution_attempt INTEGER NOT NULL,
+    evidence_truncated INTEGER NOT NULL,
+    stale_override_json TEXT,
+    PRIMARY KEY (session_id, plan_id)
+);
+CREATE UNIQUE INDEX idx_session_plans_one_active
+    ON session_plans(session_id)
+    WHERE status IN ('planning', 'needs_input', 'ready', 'executing');
+CREATE INDEX idx_session_plans_latest
+    ON session_plans(session_id, updated_at DESC, plan_id DESC);
+CREATE TABLE session_plan_revisions (
+    session_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    assistant_plan_message_index INTEGER NOT NULL,
+    artifact_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, plan_id, revision),
+    FOREIGN KEY (session_id, plan_id)
+        REFERENCES session_plans(session_id, plan_id) ON DELETE CASCADE
+);
+CREATE TABLE session_plan_progress (
+    session_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    step_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    note TEXT NOT NULL,
+    deviation_reason TEXT,
+    PRIMARY KEY (session_id, plan_id, position),
+    UNIQUE (session_id, plan_id, step_id),
+    FOREIGN KEY (session_id, plan_id)
+        REFERENCES session_plans(session_id, plan_id) ON DELETE CASCADE
+);
+"#;
+
+pub(crate) const PLAN_FEEDBACK_SCHEMA: &str = r#"
+ALTER TABLE session_plans ADD COLUMN pending_feedback TEXT;
+"#;
+
+pub(crate) const PLAN_INITIAL_SUBMISSION_SCHEMA: &str = r#"
+ALTER TABLE session_plans ADD COLUMN initial_submission_pending INTEGER NOT NULL DEFAULT 0;
+"#;
+
+pub(crate) const PLAN_STALE_OVERRIDE_AUDIT_SCHEMA: &str = r#"
+ALTER TABLE session_plans ADD COLUMN stale_override_confirmed_at INTEGER;
 "#;

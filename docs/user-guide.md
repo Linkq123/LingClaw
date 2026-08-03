@@ -82,7 +82,8 @@ Runtime 检测到 SQLite I/O、完整性或约束故障后，会进入本次进�
 - `Enter` 发送，`Shift+Enter` 换行。
 - 输入首字符 `/` 打开命令菜单；方向键切换，`Tab` 补全。
 - Group 中输入 `@` 打开成员补全；写入协议的是 Session ID。
-- `+` 菜单包含图片附件和 Plan Mode；能力不可用时对应入口隐藏或禁用。
+- 输入区直接提供“执行 / 规划”切换；选择按 Session 保存在内存中，切换 Session 不会串状态。Group 中规划入口禁用。
+- `+` 菜单用于图片附件；能力不可用时对应入口隐藏或禁用。
 - Agent 运行中发送普通文本会排队，在下一个 Analyze 阶段前注入；停止按钮和 `/stop` 会立即请求取消。
 - 模型不可用时，输入框显示原因并禁用普通发送；状态、帮助和设置类命令仍可使用。
 
@@ -148,7 +149,7 @@ Group socket 不执行普通 Session slash command。请先切回 Session 再运
 | `orchestrate` | 按 DAG 编排多个 Sub-agent |
 | `session_control` | 仅 Main 正常模式可用的 Session/Group 调度与治理 |
 
-`view_image` 只在当前消费模型声明 `input: ["image"]` 且 S3 可用时暴露。Plan Mode 只提供只读工具、满足策略的只读 MCP 工具，以及条件化 `view_image`。
+`view_image` 只在当前消费模型声明 `input: ["image"]` 且 S3 可用时暴露。Plan Mode 可使用 `think`、只读文件/目录搜索、`http_fetch`、受限 `git_inspect`、条件化 `view_image`，以及当前 Session 已启用且显式声明 `readOnlyHint=true`、未声明 `destructiveHint=true` 的 MCP 工具。缺少 MCP annotations 时默认不在规划模式暴露；第三方 annotations 是 LingClaw 信任的服务器声明。
 
 ## Skills
 
@@ -197,10 +198,14 @@ Sub-agent 有独立消息历史、工具集和 ReAct loop。为防止递归与�
 
 `orchestrate` 按依赖层并发执行任务；依赖失败时后续任务会失败或跳过。主界面显示完成数、失败数和任务图，详情中保留每个任务的阶段、工具链与结果。
 
-## Plan Mode、Task Plan 与思考
+## Plan Mode、自动执行提纲与思考
 
-- **Plan Mode**：本轮只做理解、只读探索和计划输出。计划写入历史后，用户点击“开始执行”进入普通模式。
-- **Task Plan**：Settings 中的可选运行期软指导，在每轮 Analyze 前根据目标、证据和工具生成，不代表已经执行。
+- **Plan Mode**：在当前 Session 内运行 `planning → needs_input → ready → executing → completed/failed/stopped/discarded` 状态机。计划卡展示目标、摘要、revision、步骤、假设、风险、验收标准与验证方式。
+- **提问与修订**：只有会实质改变方案的阻塞决策才进入 `needs_input`。回答问题或提交修订会在同一个 `plan_id` 下生成新 revision；旧 revision 在历史中折叠为只读内容，过期页面不能修改或批准新版本。
+- **批准与证据**：规划时读取的本地文件和目录会保存相对路径与 SHA-256 指纹；受限 `git_inspect` 查询会保存查询参数和结果指纹，因此工作树、索引或提交变化也能按实际查询触发过期提示。批准前若证据变化，必须选择“刷新计划”或“仍然执行”；确认操作与当时实际读取到的证据快照绑定，警告后内容再次变化会要求重新确认，成功覆盖时会记录对应路径。MCP/HTTP 外部数据不会伪装成可重新验证证据。
+- **执行进度**：批准不生成额外用户气泡。完整 revision 会注入每个 Agent cycle；Agent 通过内部 `update_plan` 更新既有步骤或带偏离原因追加适应性步骤。运行结束后仍未报告的步骤保持可见，不会被自动伪造为完成。
+- **恢复与边界**：只有已批准且已经开始执行的 `failed`/`stopped` 计划才能继续剩余步骤；规划阶段被停止或因进程重启而中断时，只能修订或丢弃，不能绕过批准直接执行。模型尚未生成新 revision 时，已提交的回答或修订会恢复到计划卡中，供用户检查并重新提交。LingClaw 启动时会把遗留的 `planning`/`executing` 进程态恢复为 `stopped`。计划待审批时，普通执行消息必须先执行或丢弃当前计划。Group 当前不支持 Plan Mode。
+- **自动执行提纲**：配置键仍为 `enableTaskPlan`，仅为没有批准计划的普通 Execute run 生成运行期软指导；Plan-only 和已批准计划执行期间会抑制它，避免形成第二套计划。
 - **Think level**：控制支持推理模型的 effort。`auto` 根据任务信号选择级别，Auto Debug 只在本地展示最近一条决策轨迹。
 - **Reasoning visibility**：只控制界面是否展示，不改变 Provider 返回或 Agent 行为。
 

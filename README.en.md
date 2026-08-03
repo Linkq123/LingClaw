@@ -108,6 +108,8 @@ See the [deployment guide](docs/deploy.en.md) for installation details, systemd,
 
 LingClaw organizes every run as an `Analyze → Act → Observe → Finish` ReAct state machine. Reasoning, tool calls, plans, sub-agents, and orchestration appear in an expandable execution stack. You can inspect the process, review tool output, add delayed guidance, or stop a run immediately.
 
+The composer exposes per-session Execute and Plan modes. Plan Mode performs read-only analysis, asks only blocking questions, and produces a versioned artifact with steps, risks, and acceptance criteria. Once approved, the runtime injects that exact revision into every execution cycle and records step progress and deviations. Changed workspace evidence requires a refresh or explicit override, and approval never fabricates a user message. Plan Mode is currently unavailable in groups.
+
 ### Route work across models and protocols
 
 The same session and tool system supports:

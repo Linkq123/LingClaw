@@ -1,11 +1,12 @@
 use super::*;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::prompts::build_system_prompt;
 use crate::socket_sync::broadcast_session_list_payload;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 /// Structured user message payload from frontend (when images are attached).
 #[derive(Deserialize)]
@@ -31,12 +32,46 @@ struct UserMessagePayload {
     plan_mode: Option<bool>,
     #[serde(default)]
     execute_plan_id: Option<String>,
+    #[serde(default)]
+    plan_action: Option<PlanActionPayload>,
 }
 
-const APPROVED_PLAN_EXECUTION_PREFIX: &str = "Proceed with the approved plan.";
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PlanActionKind {
+    Feedback,
+    Execute,
+    Refresh,
+    Discard,
+    Resume,
+}
 
-fn approved_plan_execution_message() -> String {
-    APPROVED_PLAN_EXECUTION_PREFIX.to_string()
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PlanActionPayload {
+    pub(super) action: PlanActionKind,
+    pub(super) plan_id: String,
+    pub(super) revision: u32,
+    #[serde(default)]
+    pub(super) text: Option<String>,
+    #[serde(default)]
+    pub(super) answers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(super) allow_stale: bool,
+    #[serde(default)]
+    pub(super) stale_confirmation_token: Option<String>,
+}
+
+const PLAN_EVIDENCE_VERIFICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn stale_confirmation_token(plan_id: &str, revision: u32, snapshot_fingerprint: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"lingclaw-plan-stale-confirmation-v1");
+    digest.update((plan_id.len() as u64).to_le_bytes());
+    digest.update(plan_id.as_bytes());
+    digest.update(revision.to_le_bytes());
+    digest.update(snapshot_fingerprint.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 fn looks_like_structured_user_payload(trimmed: &str) -> bool {
@@ -49,6 +84,7 @@ fn looks_like_structured_user_payload(trimmed: &str) -> bool {
         "\"images\"",
         "\"plan_mode\"",
         "\"execute_plan_id\"",
+        "\"plan_action\"",
     ]
     .iter()
     .any(|field| rest.starts_with(field))
@@ -303,6 +339,629 @@ pub(crate) async fn resolve_session_target_for_delete(
     target: &str,
 ) -> Result<String, String> {
     resolve_session_target_for_command(state, target).await
+}
+
+fn plan_error(code: &str, content: impl Into<String>) -> serde_json::Value {
+    json!({
+        "type": "error",
+        "code": code,
+        "content": content.into(),
+        "dismissible": true,
+    })
+}
+
+async fn reject_message_for_active_plan(
+    state: &Arc<AppState>,
+    session_id: &str,
+    tx: &WsTx,
+) -> bool {
+    let active_plan = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .and_then(|session| session.pending_plan.as_ref())
+            .filter(|plan| plan.status.is_active())
+            .map(|plan| (plan.id.clone(), plan.revision, plan.status.label()))
+    };
+    let Some((plan_id, revision, status)) = active_plan else {
+        return false;
+    };
+    ws_send(
+        tx,
+        &json!({
+            "type": "error",
+            "code": "plan_already_active",
+            "content": "Execute, revise, or discard the active plan before sending another message.",
+            "dismissible": true,
+            "plan_id": plan_id,
+            "revision": revision,
+            "status": status,
+        }),
+    )
+    .await;
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanActionMutationError {
+    StaleRevision,
+    InvalidStatus(crate::plan::PlanStatus),
+}
+
+fn plan_action_status_allowed(action: PlanActionKind, plan: &crate::PendingPlan) -> bool {
+    match action {
+        PlanActionKind::Feedback => plan.status.can_receive_feedback(),
+        PlanActionKind::Execute => plan.status == crate::plan::PlanStatus::Ready,
+        PlanActionKind::Refresh | PlanActionKind::Discard => matches!(
+            plan.status,
+            crate::plan::PlanStatus::Planning
+                | crate::plan::PlanStatus::NeedsInput
+                | crate::plan::PlanStatus::Ready
+                | crate::plan::PlanStatus::Failed
+                | crate::plan::PlanStatus::Stopped
+        ),
+        PlanActionKind::Resume => {
+            matches!(
+                plan.status,
+                crate::plan::PlanStatus::Failed | crate::plan::PlanStatus::Stopped
+            ) && plan.approved_at.is_some()
+                && plan.execution_attempt > 0
+        }
+    }
+}
+
+fn plan_action_mutation_error(
+    action: PlanActionKind,
+    error: PlanActionMutationError,
+    current_plan: Option<&crate::PendingPlan>,
+) -> serde_json::Value {
+    let mut event = match error {
+        PlanActionMutationError::StaleRevision => {
+            plan_error("stale_plan_revision", "The plan changed.")
+        }
+        PlanActionMutationError::InvalidStatus(crate::plan::PlanStatus::Executing)
+            if matches!(action, PlanActionKind::Discard) =>
+        {
+            plan_error(
+                "plan_already_active",
+                "Stop the executing plan before discarding it.",
+            )
+        }
+        PlanActionMutationError::InvalidStatus(_) => {
+            plan_error("plan_not_ready", "The plan is not ready for this action.")
+        }
+    };
+    if matches!(error, PlanActionMutationError::StaleRevision)
+        && let Some(plan) = current_plan
+    {
+        event["plan"] = plan.to_live_value();
+    }
+    event
+}
+
+async fn plan_action_model_snapshot(
+    state: &Arc<AppState>,
+    session_id: &str,
+    tx: &WsTx,
+) -> Option<crate::SessionModelSnapshot> {
+    let snapshot = crate::session_model_snapshot(state, session_id).await;
+    let Some(snapshot) = snapshot else {
+        ws_send(
+            tx,
+            &plan_error("session_not_found", "Current session not found."),
+        )
+        .await;
+        return None;
+    };
+    if !snapshot.explicit {
+        ws_send(
+            tx,
+            &plan_error(
+                "agent_model_unconfigured",
+                "Configure an explicit model before starting an Agent run.",
+            ),
+        )
+        .await;
+        return None;
+    }
+    Some(snapshot)
+}
+
+fn build_plan_feedback_text(
+    plan: &crate::PendingPlan,
+    text: Option<&str>,
+    answers: &BTreeMap<String, String>,
+) -> Result<String, serde_json::Value> {
+    let mut sections = Vec::new();
+    if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+        if text.chars().count() > 16_000 {
+            return Err(plan_error(
+                "invalid_plan_feedback",
+                "Plan feedback is too long.",
+            ));
+        }
+        sections.push(text.to_string());
+    }
+    if !answers.is_empty() {
+        let questions = plan
+            .artifact
+            .questions
+            .iter()
+            .map(|question| (question.id.as_str(), question))
+            .collect::<BTreeMap<_, _>>();
+        let mut lines = vec!["Answers to the blocking plan questions:".to_string()];
+        for (question_id, answer) in answers {
+            let Some(question) = questions.get(question_id.as_str()) else {
+                return Err(plan_error(
+                    "invalid_plan_feedback",
+                    format!("Unknown plan question '{question_id}'."),
+                ));
+            };
+            let answer = answer.trim();
+            if answer.is_empty() || answer.chars().count() > 4_000 {
+                return Err(plan_error(
+                    "invalid_plan_feedback",
+                    format!("Answer for question '{question_id}' is empty or too long."),
+                ));
+            }
+            lines.push(format!("- {}: {}", question.prompt, answer));
+        }
+        sections.push(lines.join("\n"));
+    }
+    if sections.is_empty() {
+        return Err(plan_error(
+            "invalid_plan_feedback",
+            "Provide feedback or answer at least one plan question.",
+        ));
+    }
+    Ok(sections.join("\n\n"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_plan_action(
+    action: PlanActionPayload,
+    current_session_id: &str,
+    connection_id: u64,
+    state: &Arc<AppState>,
+    tx: &WsTx,
+    cancel: &CancellationToken,
+    stop_requested: &Arc<AtomicBool>,
+) -> IdleSocketInputAction {
+    let snapshot = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(current_session_id).and_then(|session| {
+            session
+                .pending_plan
+                .as_ref()
+                .map(|plan| (plan.clone(), session.workspace.clone()))
+        })
+    };
+    let Some((plan_snapshot, workspace)) = snapshot else {
+        ws_send(
+            tx,
+            &plan_error("plan_not_ready", "No plan is available for this Session."),
+        )
+        .await;
+        return IdleSocketInputAction::Continue;
+    };
+    if plan_snapshot.id != action.plan_id || plan_snapshot.revision != action.revision {
+        let mut event = plan_error(
+            "stale_plan_revision",
+            format!(
+                "This plan changed. Reload revision {} before continuing.",
+                plan_snapshot.revision
+            ),
+        );
+        event["plan"] = plan_snapshot.to_live_value();
+        ws_send(tx, &event).await;
+        return IdleSocketInputAction::Continue;
+    }
+
+    if matches!(action.action, PlanActionKind::Discard) {
+        if plan_snapshot.status == crate::plan::PlanStatus::Executing {
+            ws_send(
+                tx,
+                &plan_error(
+                    "plan_already_active",
+                    "Stop the executing plan before discarding it.",
+                ),
+            )
+            .await;
+            return IdleSocketInputAction::Continue;
+        }
+        if !plan_action_status_allowed(action.action, &plan_snapshot) {
+            ws_send(
+                tx,
+                &plan_error(
+                    "plan_not_ready",
+                    "This plan cannot be discarded in its current state.",
+                ),
+            )
+            .await;
+            return IdleSocketInputAction::Continue;
+        }
+        let Some(reservation) = super::try_reserve_agent_run(
+            state,
+            current_session_id,
+            connection_id,
+            cancel,
+            stop_requested,
+        )
+        .await
+        else {
+            ws_send(
+                tx,
+                &plan_error("plan_already_active", "Session already has an active run."),
+            )
+            .await;
+            return IdleSocketInputAction::Continue;
+        };
+        let persist_gate = crate::session_store::session_persist_gate(current_session_id);
+        let _persist_guard = persist_gate.lock().await;
+        let mutation = {
+            let mut sessions = state.sessions.lock().await;
+            (|| {
+                let session = sessions
+                    .get_mut(current_session_id)
+                    .ok_or(PlanActionMutationError::StaleRevision)?;
+                let previous = session.clone();
+                let discarded = {
+                    let plan = session
+                        .pending_plan
+                        .as_mut()
+                        .ok_or(PlanActionMutationError::StaleRevision)?;
+                    if plan.id != action.plan_id || plan.revision != action.revision {
+                        return Err(PlanActionMutationError::StaleRevision);
+                    }
+                    if !plan_action_status_allowed(action.action, plan) {
+                        return Err(PlanActionMutationError::InvalidStatus(plan.status));
+                    }
+                    let now = now_epoch();
+                    plan.status = crate::plan::PlanStatus::Discarded;
+                    plan.updated_at = now;
+                    plan.finished_at = Some(now);
+                    plan.pending_feedback = None;
+                    plan.clone()
+                };
+                let now = discarded.updated_at;
+                session.updated_at = now;
+                Ok((previous, session.clone(), discarded))
+            })()
+        };
+        let (previous, session_to_save, discarded) = match mutation {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+                let current_plan = {
+                    let sessions = state.sessions.lock().await;
+                    sessions
+                        .get(current_session_id)
+                        .and_then(|session| session.pending_plan.clone())
+                };
+                ws_send(
+                    tx,
+                    &plan_action_mutation_error(action.action, error, current_plan.as_ref()),
+                )
+                .await;
+                return IdleSocketInputAction::Continue;
+            }
+        };
+        if let Err(error) =
+            crate::session_store::save_session_to_disk_locked(&session_to_save).await
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(current_session_id) {
+                *session = previous;
+            }
+            drop(sessions);
+            super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+            eprintln!("ERROR: could not discard plan: {error}");
+            crate::send_storage_status(tx, state).await;
+            if state.storage_is_writable() {
+                ws_send(
+                    tx,
+                    &plan_error(
+                        "storage_error",
+                        "The plan could not be discarded because it was not saved.",
+                    ),
+                )
+                .await;
+            }
+            return IdleSocketInputAction::Continue;
+        }
+        super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+        ws_send(
+            tx,
+            &json!({"type":"plan_state", "plan": discarded.to_live_value()}),
+        )
+        .await;
+        return IdleSocketInputAction::Continue;
+    }
+
+    let (run_mode, clear_evidence, plan_action_prompt, pending_feedback) = match action.action {
+        PlanActionKind::Feedback => {
+            if !plan_snapshot.status.can_receive_feedback() {
+                ws_send(
+                    tx,
+                    &plan_error(
+                        "plan_not_ready",
+                        "This plan cannot be revised in its current state.",
+                    ),
+                )
+                .await;
+                return IdleSocketInputAction::Continue;
+            }
+            let feedback = match build_plan_feedback_text(
+                &plan_snapshot,
+                action.text.as_deref(),
+                &action.answers,
+            ) {
+                Ok(feedback) => feedback,
+                Err(event) => {
+                    ws_send(tx, &event).await;
+                    return IdleSocketInputAction::Continue;
+                }
+            };
+            (
+                AgentRunMode::PlanOnly,
+                false,
+                Some(feedback.clone()),
+                Some(feedback),
+            )
+        }
+        PlanActionKind::Refresh => {
+            if !plan_action_status_allowed(action.action, &plan_snapshot) {
+                ws_send(
+                    tx,
+                    &plan_error(
+                        "plan_not_ready",
+                        "This plan cannot be refreshed in its current state.",
+                    ),
+                )
+                .await;
+                return IdleSocketInputAction::Continue;
+            }
+            (
+                AgentRunMode::PlanOnly,
+                true,
+                Some("Refresh this plan against the current workspace state and submit a new revision.".to_string()),
+                None,
+            )
+        }
+        PlanActionKind::Execute | PlanActionKind::Resume => {
+            let allowed = plan_action_status_allowed(action.action, &plan_snapshot);
+            if !allowed {
+                ws_send(
+                    tx,
+                    &plan_error("plan_not_ready", "The plan is not ready for this action."),
+                )
+                .await;
+                return IdleSocketInputAction::Continue;
+            }
+            (AgentRunMode::Execute, false, None, None)
+        }
+        PlanActionKind::Discard => unreachable!(),
+    };
+
+    let Some(model_snapshot) = plan_action_model_snapshot(state, current_session_id, tx).await
+    else {
+        return IdleSocketInputAction::Continue;
+    };
+    let Some(mut reservation) = super::try_reserve_agent_run(
+        state,
+        current_session_id,
+        connection_id,
+        cancel,
+        stop_requested,
+    )
+    .await
+    else {
+        ws_send(
+            tx,
+            &plan_error("plan_already_active", "Session already has an active run."),
+        )
+        .await;
+        return IdleSocketInputAction::Continue;
+    };
+    reservation.reset_plan_evidence = clear_evidence;
+    reservation.plan_action_prompt = plan_action_prompt;
+
+    let evidence_snapshot = if run_mode == AgentRunMode::Execute {
+        let evidence = plan_snapshot.evidence.clone();
+        let workspace_for_check = workspace.clone();
+        let verification_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stop = std::sync::Arc::clone(&verification_stop);
+        let verification_cancel = reservation.run_cancel.clone();
+        let deadline = std::time::Instant::now() + PLAN_EVIDENCE_VERIFICATION_TIMEOUT;
+        let verification = tokio::task::spawn_blocking(move || {
+            crate::plan::verify_evidence_snapshot_until(
+                &workspace_for_check,
+                &evidence,
+                deadline,
+                worker_stop.as_ref(),
+            )
+        });
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                verification_stop.store(true, Ordering::Relaxed);
+                super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+                return IdleSocketInputAction::Break;
+            }
+            _ = verification_cancel.cancelled() => {
+                verification_stop.store(true, Ordering::Relaxed);
+                super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+                return IdleSocketInputAction::Continue;
+            }
+            result = tokio::time::timeout(
+                PLAN_EVIDENCE_VERIFICATION_TIMEOUT + std::time::Duration::from_millis(250),
+                verification,
+            ) => result,
+        };
+        match result {
+            Ok(Ok(Ok(paths))) => paths,
+            Ok(Ok(Err(crate::plan::EvidenceVerificationError::Cancelled))) => {
+                super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+                return IdleSocketInputAction::Break;
+            }
+            Ok(Ok(Err(crate::plan::EvidenceVerificationError::TimedOut))) | Err(_) => {
+                verification_stop.store(true, Ordering::Relaxed);
+                super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+                ws_send(
+                    tx,
+                    &plan_error(
+                        "plan_evidence_verification_failed",
+                        "Plan evidence verification timed out. Refresh the plan and try again.",
+                    ),
+                )
+                .await;
+                return IdleSocketInputAction::Continue;
+            }
+            Ok(Err(error)) => {
+                eprintln!("ERROR: plan evidence verification worker failed: {error}");
+                super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+                ws_send(
+                    tx,
+                    &plan_error(
+                        "plan_evidence_verification_failed",
+                        "Plan evidence could not be verified. Refresh the plan and try again.",
+                    ),
+                )
+                .await;
+                return IdleSocketInputAction::Continue;
+            }
+        }
+    } else {
+        crate::plan::EvidenceVerificationSnapshot {
+            stale_paths: Vec::new(),
+            fingerprint: String::new(),
+        }
+    };
+    let crate::plan::EvidenceVerificationSnapshot {
+        stale_paths,
+        fingerprint,
+    } = evidence_snapshot;
+    let evidence_incomplete = run_mode == AgentRunMode::Execute && plan_snapshot.evidence_truncated;
+    let requires_confirmation = evidence_incomplete || !stale_paths.is_empty();
+    let confirmation_token = requires_confirmation
+        .then(|| stale_confirmation_token(&plan_snapshot.id, plan_snapshot.revision, &fingerprint));
+    let stale_override_confirmed = confirmation_token.as_deref().is_some_and(|expected| {
+        action.allow_stale && action.stale_confirmation_token.as_deref() == Some(expected)
+    });
+    if requires_confirmation && !stale_override_confirmed {
+        super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+        ws_send(
+            tx,
+            &json!({
+                "type": "plan_stale",
+                "code": "plan_stale",
+                "plan_id": plan_snapshot.id,
+                "revision": plan_snapshot.revision,
+                "paths": stale_paths,
+                "evidence_incomplete": evidence_incomplete,
+                "confirmation_token": confirmation_token,
+            }),
+        )
+        .await;
+        return IdleSocketInputAction::Continue;
+    }
+
+    let persist_gate = crate::session_store::session_persist_gate(current_session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let mutation = {
+        let mut sessions = state.sessions.lock().await;
+        (|| {
+            let session = sessions
+                .get_mut(current_session_id)
+                .ok_or(PlanActionMutationError::StaleRevision)?;
+            let previous = session.clone();
+            let active_plan = {
+                let plan = session
+                    .pending_plan
+                    .as_mut()
+                    .ok_or(PlanActionMutationError::StaleRevision)?;
+                if plan.id != action.plan_id || plan.revision != action.revision {
+                    return Err(PlanActionMutationError::StaleRevision);
+                }
+                if !plan_action_status_allowed(action.action, plan) {
+                    return Err(PlanActionMutationError::InvalidStatus(plan.status));
+                }
+                let now = now_epoch();
+                match run_mode {
+                    AgentRunMode::PlanOnly => {
+                        plan.status = crate::plan::PlanStatus::Planning;
+                        plan.updated_at = now;
+                        plan.approved_at = None;
+                        plan.finished_at = None;
+                        plan.pending_feedback = pending_feedback.clone();
+                    }
+                    AgentRunMode::Execute => {
+                        plan.status = crate::plan::PlanStatus::Executing;
+                        plan.updated_at = now;
+                        plan.approved_at.get_or_insert(now);
+                        plan.finished_at = None;
+                        plan.execution_attempt = plan.execution_attempt.saturating_add(1);
+                        if stale_override_confirmed {
+                            plan.stale_override_paths = stale_paths.clone();
+                            plan.stale_override_confirmed_at = Some(now);
+                        }
+                        plan.pending_feedback = None;
+                    }
+                }
+                plan.clone()
+            };
+            session.updated_at = active_plan.updated_at;
+            Ok((previous, session.clone(), active_plan))
+        })()
+    };
+    let (previous, session_to_save, active_plan) = match mutation {
+        Ok(mutation) => mutation,
+        Err(error) => {
+            super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+            let current_plan = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get(current_session_id)
+                    .and_then(|session| session.pending_plan.clone())
+            };
+            ws_send(
+                tx,
+                &plan_action_mutation_error(action.action, error, current_plan.as_ref()),
+            )
+            .await;
+            return IdleSocketInputAction::Continue;
+        }
+    };
+    if let Err(error) = crate::session_store::save_session_to_disk_locked(&session_to_save).await {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(current_session_id) {
+            *session = previous;
+        }
+        super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+        eprintln!("ERROR: could not save plan action: {error}");
+        crate::send_storage_status(tx, state).await;
+        if state.storage_is_writable() {
+            ws_send(
+                tx,
+                &plan_error(
+                    "storage_error",
+                    "The approved plan could not be saved, so the Agent run was not started.",
+                ),
+            )
+            .await;
+        }
+        return IdleSocketInputAction::Continue;
+    }
+    ws_send(
+        tx,
+        &json!({"type":"plan_state", "plan": active_plan.to_live_value()}),
+    )
+    .await;
+    IdleSocketInputAction::StartAgent {
+        run_mode,
+        reservation,
+        model_snapshot,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -580,6 +1239,33 @@ pub(crate) async fn handle_idle_socket_input(
     let (msg_text, msg_images, run_mode, image_validation_snapshot) = if trimmed.starts_with('{') {
         match serde_json::from_str::<UserMessagePayload>(trimmed) {
             Ok(payload) => {
+                if let Some(action) = payload.plan_action {
+                    let has_conflicting_fields = payload.text.is_some()
+                        || !payload.images.is_empty()
+                        || payload.plan_mode.is_some()
+                        || payload.execute_plan_id.is_some();
+                    if has_conflicting_fields {
+                        ws_send(
+                            tx,
+                            &plan_error(
+                                "invalid_plan_action",
+                                "plan_action cannot be combined with text, images, plan_mode, or execute_plan_id.",
+                            ),
+                        )
+                        .await;
+                        return IdleSocketInputAction::Continue;
+                    }
+                    return handle_plan_action(
+                        action,
+                        current_session_id,
+                        connection_id,
+                        state,
+                        tx,
+                        cancel,
+                        stop_requested,
+                    )
+                    .await;
+                }
                 if let Some(plan_id) = payload.execute_plan_id.as_deref() {
                     let has_conflicting_fields = payload.text.is_some()
                         || !payload.images.is_empty()
@@ -587,194 +1273,61 @@ pub(crate) async fn handle_idle_socket_input(
                     if has_conflicting_fields {
                         ws_send(
                             tx,
-                            &json!({
-                                "type":"system",
-                                "content":"execute_plan_id cannot be combined with text, images, or plan_mode.",
-                                "dismissible": true,
-                            }),
+                            &plan_error(
+                                "invalid_plan_action",
+                                "execute_plan_id cannot be combined with text, images, or plan_mode.",
+                            ),
                         )
                         .await;
                         return IdleSocketInputAction::Continue;
                     }
-
-                    let execute_plan_error = {
+                    let plan = {
                         let sessions = state.sessions.lock().await;
-                        match sessions.get(current_session_id) {
-                            None => Some(json!({
-                                "type":"error",
-                                "content":"Current session not found.",
-                            })),
-                            Some(session) => match session.pending_plan.as_ref().cloned() {
-                                None => Some(json!({
-                                    "type":"system",
-                                    "content":"No pending plan is available to execute.",
-                                    "dismissible": true,
-                                })),
-                                Some(pending_plan) if pending_plan.id != plan_id => Some(json!({
-                                    "type":"system",
-                                    "content":"The requested plan is no longer pending for this session.",
-                                    "dismissible": true,
-                                })),
-                                Some(_) => None,
-                            },
-                        }
+                        sessions
+                            .get(current_session_id)
+                            .and_then(|session| session.pending_plan.as_ref())
+                            .filter(|plan| plan.id == plan_id)
+                            .cloned()
                     };
-                    if let Some(event) = execute_plan_error {
+                    let Some(plan) = plan else {
+                        ws_send(
+                            tx,
+                            &plan_error(
+                                "plan_not_ready",
+                                "The requested plan is no longer available for this Session.",
+                            ),
+                        )
+                        .await;
+                        return IdleSocketInputAction::Continue;
+                    };
+                    if plan.revision != 1 {
+                        let mut event = plan_error(
+                            "stale_plan_revision",
+                            "This plan has been revised. Reload it before approving execution.",
+                        );
+                        event["plan"] = plan.to_live_value();
                         ws_send(tx, &event).await;
                         return IdleSocketInputAction::Continue;
                     }
-                    let Some(reservation) = super::try_reserve_agent_run(
-                        state,
+                    return handle_plan_action(
+                        PlanActionPayload {
+                            action: PlanActionKind::Execute,
+                            plan_id: plan_id.to_string(),
+                            revision: plan.revision,
+                            text: None,
+                            answers: BTreeMap::new(),
+                            allow_stale: false,
+                            stale_confirmation_token: None,
+                        },
                         current_session_id,
                         connection_id,
+                        state,
+                        tx,
                         cancel,
                         stop_requested,
                     )
-                    .await
-                    else {
-                        ws_send(
-                            tx,
-                            &json!({
-                                "type":"system",
-                                "content":"Session already has an active run.",
-                                "dismissible": true,
-                            }),
-                        )
-                        .await;
-                        return IdleSocketInputAction::Continue;
-                    };
-                    let Some(model_snapshot) =
-                        crate::session_model_snapshot(state, current_session_id).await
-                    else {
-                        super::release_agent_run_reservation(
-                            state,
-                            current_session_id,
-                            &reservation,
-                        )
-                        .await;
-                        ws_send(
-                            tx,
-                            &json!({
-                                "type":"error",
-                                "content":"Current session not found.",
-                            }),
-                        )
-                        .await;
-                        return IdleSocketInputAction::Continue;
-                    };
-                    if !model_snapshot.explicit {
-                        super::release_agent_run_reservation(
-                            state,
-                            current_session_id,
-                            &reservation,
-                        )
-                        .await;
-                        ws_send(
-                            tx,
-                            &json!({
-                                "type":"error",
-                                "content":"Configure an explicit model before starting an Agent run.",
-                                "dismissible":true,
-                            }),
-                        )
-                        .await;
-                        return IdleSocketInputAction::Continue;
-                    }
-                    let persist_gate =
-                        crate::session_store::session_persist_gate(current_session_id);
-                    let _persist_guard = persist_gate.lock().await;
-                    let execute_plan_mutation = {
-                        let mut sessions = state.sessions.lock().await;
-                        match sessions.get_mut(current_session_id) {
-                            None => Err(json!({
-                                "type":"error",
-                                "content":"Current session not found.",
-                            })),
-                            Some(session) => match session.pending_plan.as_ref().cloned() {
-                                None => Err(json!({
-                                    "type":"system",
-                                    "content":"No pending plan is available to execute.",
-                                    "dismissible": true,
-                                })),
-                                Some(pending_plan) if pending_plan.id != plan_id => Err(json!({
-                                    "type":"system",
-                                    "content":"The requested plan is no longer pending for this session.",
-                                    "dismissible": true,
-                                })),
-                                Some(_) => {
-                                    let previous_session = session.clone();
-                                    let execution_message = approved_plan_execution_message();
-                                    session.pending_plan = None;
-                                    session.messages.push(ChatMessage {
-                                        role: "user".into(),
-                                        content: Some(execution_message),
-                                        images: None,
-                                        thinking: None,
-                                        anthropic_thinking_blocks: None,
-                                        tool_calls: None,
-                                        tool_call_id: None,
-                                        timestamp: Some(now_epoch()),
-                                    });
-                                    session.updated_at = now_epoch();
-                                    Ok((previous_session, session.clone()))
-                                }
-                            },
-                        }
-                    };
-                    let (previous_session, session_to_save) = match execute_plan_mutation {
-                        Ok(mutation) => mutation,
-                        Err(event) => {
-                            drop(_persist_guard);
-                            super::release_agent_run_reservation(
-                                state,
-                                current_session_id,
-                                &reservation,
-                            )
-                            .await;
-                            ws_send(tx, &event).await;
-                            return IdleSocketInputAction::Continue;
-                        }
-                    };
-                    if let Err(error) =
-                        crate::session_store::save_session_to_disk_locked(&session_to_save).await
-                    {
-                        {
-                            let mut sessions = state.sessions.lock().await;
-                            if let Some(session) = sessions.get_mut(current_session_id) {
-                                *session = previous_session;
-                            }
-                        }
-                        drop(_persist_guard);
-                        super::release_agent_run_reservation(
-                            state,
-                            current_session_id,
-                            &reservation,
-                        )
-                        .await;
-                        eprintln!(
-                            "ERROR: failed to persist session before executing an approved plan: {error}"
-                        );
-                        crate::send_storage_status(tx, state).await;
-                        if state.storage_is_writable() {
-                            ws_send(
-                                tx,
-                                &json!({
-                                    "type":"error",
-                                    "content":"The approved plan could not be saved, so the Agent run was not started.",
-                                    "dismissible":true,
-                                }),
-                            )
-                            .await;
-                        }
-                        return IdleSocketInputAction::Continue;
-                    }
-                    return IdleSocketInputAction::StartAgent {
-                        run_mode: AgentRunMode::Execute,
-                        reservation,
-                        model_snapshot,
-                    };
+                    .await;
                 }
-
                 let Some(text) = payload.text else {
                     ws_send(
                         tx,
@@ -792,6 +1345,9 @@ pub(crate) async fn handle_idle_socket_input(
                 } else {
                     AgentRunMode::Execute
                 };
+                if reject_message_for_active_plan(state, current_session_id, tx).await {
+                    return IdleSocketInputAction::Continue;
+                }
                 // Limit images per message to prevent abuse.
                 const MAX_IMAGES_PER_MESSAGE: usize = 10;
                 if payload.images.len() > MAX_IMAGES_PER_MESSAGE {
@@ -975,6 +1531,10 @@ pub(crate) async fn handle_idle_socket_input(
         (text, None, AgentRunMode::Execute, None)
     };
 
+    if reject_message_for_active_plan(state, current_session_id, tx).await {
+        return IdleSocketInputAction::Continue;
+    }
+
     let Some(reservation) = super::try_reserve_agent_run(
         state,
         current_session_id,
@@ -1055,12 +1615,27 @@ pub(crate) async fn handle_idle_socket_input(
         return IdleSocketInputAction::Continue;
     }
 
+    let initial_plan_artifact = if run_mode.is_plan_only() {
+        let has_images = msg_images.as_ref().is_some_and(|images| !images.is_empty());
+        match crate::plan::initial_placeholder_artifact(&msg_text, has_images) {
+            Ok(artifact) => Some(artifact),
+            Err(error) => {
+                super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+                ws_send(tx, &plan_error("invalid_plan_request", error)).await;
+                return IdleSocketInputAction::Continue;
+            }
+        }
+    } else {
+        None
+    };
+
     let persist_gate = crate::session_store::session_persist_gate(current_session_id);
     let _persist_guard = persist_gate.lock().await;
     let mutation = {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
             let previous_session = session.clone();
+            let now = now_epoch();
             session.messages.push(ChatMessage {
                 role: "user".into(),
                 content: Some(msg_text),
@@ -1069,10 +1644,33 @@ pub(crate) async fn handle_idle_socket_input(
                 anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
-                timestamp: Some(now_epoch()),
+                timestamp: Some(now),
             });
-            session.pending_plan = None;
-            session.updated_at = now_epoch();
+            if let Some(artifact) = initial_plan_artifact.clone() {
+                let user_message_index = session.messages.len() - 1;
+                let plan_id = format!("plan_{now}_{user_message_index}_pending");
+                let mut pending_plan = crate::PendingPlan::new(
+                    plan_id,
+                    user_message_index,
+                    user_message_index,
+                    now,
+                    1,
+                    crate::plan::PlanStatus::Planning,
+                    artifact,
+                    Vec::new(),
+                    false,
+                );
+                pending_plan.initial_submission_pending = true;
+                session.pending_plan = Some(pending_plan);
+            } else if !session.pending_plan.as_ref().is_some_and(|plan| {
+                matches!(
+                    plan.status,
+                    crate::plan::PlanStatus::Failed | crate::plan::PlanStatus::Stopped
+                )
+            }) {
+                session.pending_plan = None;
+            }
+            session.updated_at = now;
             Some((previous_session, session.clone()))
         } else {
             None
@@ -1117,6 +1715,19 @@ pub(crate) async fn handle_idle_socket_input(
         }
         return IdleSocketInputAction::Continue;
     }
+    let planning_plan = run_mode
+        .is_plan_only()
+        .then_some(session_to_save.pending_plan.as_ref())
+        .flatten()
+        .cloned();
+    drop(_persist_guard);
+    if let Some(plan) = planning_plan {
+        ws_send(
+            tx,
+            &json!({"type":"plan_state", "plan": plan.to_live_value()}),
+        )
+        .await;
+    }
 
     IdleSocketInputAction::StartAgent {
         run_mode,
@@ -1160,7 +1771,6 @@ pub(super) async fn persist_pending_interventions(
                     timestamp: Some(now_epoch()),
                 });
             }
-            session.pending_plan = None;
             session.updated_at = now_epoch();
             Some((previous, session.clone()))
         } else {

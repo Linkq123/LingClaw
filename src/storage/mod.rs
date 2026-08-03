@@ -180,6 +180,90 @@ impl From<std::io::Error> for StorageError {
     }
 }
 
+pub(crate) struct RuntimeInstanceLock {
+    file: std::fs::File,
+}
+
+impl RuntimeInstanceLock {
+    pub(crate) fn acquire(database_path: &Path) -> Result<Self, StorageError> {
+        use std::io::Write as _;
+
+        let path = database_path.with_file_name("lingclaw.runtime.lock");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        lock_runtime_file(&file).map_err(|error| {
+            StorageError::new(format!(
+                "another LingClaw process is already using {}: {error}",
+                database_path.display()
+            ))
+        })?;
+        file.set_len(0)?;
+        writeln!(file, "{}", std::process::id())?;
+        file.sync_data()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for RuntimeInstanceLock {
+    fn drop(&mut self) {
+        unlock_runtime_file(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn lock_runtime_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: flock only borrows the valid file descriptor for this call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unlock_runtime_file(file: &std::fs::File) {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: flock only borrows the valid file descriptor for this call.
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[cfg(windows)]
+fn lock_runtime_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    // SAFETY: LockFile only borrows the valid file handle for this call.
+    if unsafe {
+        windows_sys::Win32::Storage::FileSystem::LockFile(file.as_raw_handle() as _, 0, 0, 1, 0)
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn unlock_runtime_file(file: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle as _;
+
+    // SAFETY: UnlockFile only borrows the valid file handle for this call.
+    let _ = unsafe {
+        windows_sys::Win32::Storage::FileSystem::UnlockFile(file.as_raw_handle() as _, 0, 0, 1, 0)
+    };
+}
+
 fn normalized_schema_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -274,11 +358,41 @@ fn validate_current_schema(connection: &rusqlite::Connection) -> Result<(), Stor
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let expected_migrations = vec![(schema::SCHEMA_VERSION, "initial_core_storage".to_string())];
+    let expected_migrations = vec![
+        (1, "initial_core_storage".to_string()),
+        (2, "plan_lifecycle".to_string()),
+        (3, "durable_plan_feedback".to_string()),
+        (4, "plan_initial_submission_marker".to_string()),
+        (5, "plan_stale_override_audit".to_string()),
+    ];
     if migrations != expected_migrations {
         return Err(StorageError::new(format!(
             "LingClaw SQLite migration ledger does not match schema {}",
             schema::SCHEMA_VERSION
+        )));
+    }
+    Ok(())
+}
+
+fn validate_database_integrity(connection: &rusqlite::Connection) -> Result<(), StorageError> {
+    let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if check != "ok" {
+        return Err(StorageError::new(format!(
+            "SQLite quick check failed: {check}"
+        )));
+    }
+    let foreign_key_violation = connection
+        .query_row("PRAGMA foreign_key_check", [], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?;
+    if let Some((table, row_id, parent)) = foreign_key_violation {
+        return Err(StorageError::new(format!(
+            "SQLite foreign key check failed in table '{table}' row {row_id} referencing '{parent}'"
         )));
     }
     Ok(())
@@ -352,10 +466,10 @@ impl Database {
                 .map_err(|error| {
                     StorageError::new(format!("Failed to create schema backup: {error}"))
                 })??;
-            return Err(StorageError::new(format!(
-                "No SQLite schema migration is registered from version {user_version} to {}",
-                schema::SCHEMA_VERSION
-            )));
+            connection
+                .call(move |connection| migrate_schema(connection, user_version))
+                .await
+                .map_err(|error| StorageError::new(error.to_string()))?;
         }
         let create_schema = user_version == 0;
         let initial_status = StorageStatus::default();
@@ -440,36 +554,33 @@ impl Database {
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                     transaction.pragma_update(None, "application_id", schema::APPLICATION_ID)?;
                     transaction.execute_batch(schema::INITIAL_SCHEMA)?;
+                    let applied_at = crate::now_epoch() as i64;
                     transaction.execute(
-                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, 'initial_core_storage', ?2)",
-                        rusqlite::params![schema::SCHEMA_VERSION, crate::now_epoch() as i64],
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (1, 'initial_core_storage', ?1)",
+                        [applied_at],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (2, 'plan_lifecycle', ?1)",
+                        [applied_at],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (3, 'durable_plan_feedback', ?1)",
+                        [applied_at],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (4, 'plan_initial_submission_marker', ?1)",
+                        [applied_at],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (5, 'plan_stale_override_audit', ?1)",
+                        [applied_at],
                     )?;
                     transaction.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
                     transaction.commit()?;
                 } else {
                     validate_current_schema(connection)?;
                 }
-                let check: String =
-                    connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-                if check != "ok" {
-                    return Err(StorageError::new(format!(
-                        "SQLite quick check failed: {check}"
-                    )));
-                }
-                let foreign_key_violation = connection
-                    .query_row("PRAGMA foreign_key_check", [], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })
-                    .optional()?;
-                if let Some((table, row_id, parent)) = foreign_key_violation {
-                    return Err(StorageError::new(format!(
-                        "SQLite foreign key check failed in table '{table}' row {row_id} referencing '{parent}'"
-                    )));
-                }
+                validate_database_integrity(connection)?;
                 Ok(())
             })
             .await
@@ -528,6 +639,34 @@ impl Database {
                 u64::try_from(sessions).unwrap_or_default(),
                 u64::try_from(groups).unwrap_or_default(),
             ))
+        })
+        .await
+    }
+
+    /// Process-bound plan states cannot survive a restart because their Agent
+    /// run reservations live only in memory. Convert them to an explicit
+    /// stopped state before Sessions are loaded so the UI always offers a
+    /// valid recovery path.
+    pub(crate) async fn recover_interrupted_plans(&self) -> Result<(usize, usize), StorageError> {
+        let recovered_at = crate::now_epoch() as i64;
+        self.call(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let planning = transaction.execute(
+                r#"UPDATE session_plans
+                   SET status='stopped', updated_at=MAX(updated_at, ?1),
+                       finished_at=?1, approved_at=NULL
+                   WHERE status='planning'"#,
+                [recovered_at],
+            )?;
+            let executing = transaction.execute(
+                r#"UPDATE session_plans
+                   SET status='stopped', updated_at=MAX(updated_at, ?1), finished_at=?1
+                   WHERE status='executing'"#,
+                [recovered_at],
+            )?;
+            transaction.commit()?;
+            Ok((planning, executing))
         })
         .await
     }
@@ -594,6 +733,124 @@ impl Database {
     {
         block_on_connection(self.read(operation))
     }
+}
+
+fn migrate_schema(
+    connection: &mut rusqlite::Connection,
+    from_version: i64,
+) -> Result<(), StorageError> {
+    if !matches!(from_version, 1..=4) {
+        return Err(StorageError::new(format!(
+            "No SQLite schema migration is registered from version {from_version} to {}",
+            schema::SCHEMA_VERSION
+        )));
+    }
+
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if from_version == 1 {
+        let legacy_plans = {
+            let mut statement = transaction.prepare(
+                r#"SELECT p.session_id, p.plan_id, p.original_user_message_index,
+                          p.assistant_plan_message_index, p.created_at, m.content
+                   FROM session_pending_plans p
+                   LEFT JOIN session_messages m
+                     ON m.session_id = p.session_id
+                    AND m.position = p.assistant_plan_message_index
+                   ORDER BY p.session_id"#,
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        transaction.execute_batch(schema::PLAN_LIFECYCLE_SCHEMA)?;
+        for (session_id, plan_id, user_index, assistant_index, created_at, content) in legacy_plans
+        {
+            let markdown = content.ok_or_else(|| {
+                StorageError::new(format!(
+                    "Legacy plan '{plan_id}' references a missing assistant message"
+                ))
+            })?;
+            let artifact = crate::plan::legacy_artifact(&markdown);
+            crate::plan::validate_persisted_legacy_artifact(&artifact).map_err(|error| {
+                StorageError::new(format!("Invalid legacy plan '{plan_id}': {error}"))
+            })?;
+            let artifact_json = serde_json::to_string(&artifact)
+                .map_err(|error| StorageError::new(error.to_string()))?;
+            transaction.execute(
+                r#"INSERT INTO session_plans(
+                    session_id, plan_id, original_user_message_index, current_revision,
+                    status, created_at, updated_at, approved_at, finished_at,
+                    execution_attempt, evidence_truncated, stale_override_json
+                ) VALUES (?1, ?2, ?3, 1, 'ready', ?4, ?4, NULL, NULL, 0, 0, NULL)"#,
+                rusqlite::params![session_id, plan_id, user_index, created_at],
+            )?;
+            transaction.execute(
+                r#"INSERT INTO session_plan_revisions(
+                    session_id, plan_id, revision, assistant_plan_message_index,
+                    artifact_json, evidence_json, created_at
+                ) VALUES (?1, ?2, 1, ?3, ?4, '[]', ?5)"#,
+                rusqlite::params![
+                    session_id,
+                    plan_id,
+                    assistant_index,
+                    artifact_json,
+                    created_at
+                ],
+            )?;
+            transaction.execute(
+                r#"INSERT INTO session_plan_progress(
+                    session_id, plan_id, position, step_id, title, status, note, deviation_reason
+                ) VALUES (?1, ?2, 0, 'legacy-plan', 'Execute the approved plan', 'pending', '', NULL)"#,
+                rusqlite::params![session_id, plan_id],
+            )?;
+        }
+        transaction.execute("DROP TABLE session_pending_plans", [])?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (2, 'plan_lifecycle', ?1)",
+            [crate::now_epoch() as i64],
+        )?;
+    }
+
+    if from_version <= 2 {
+        transaction.execute_batch(schema::PLAN_FEEDBACK_SCHEMA)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (3, 'durable_plan_feedback', ?1)",
+            [crate::now_epoch() as i64],
+        )?;
+    }
+    if from_version <= 3 {
+        transaction.execute_batch(schema::PLAN_INITIAL_SUBMISSION_SCHEMA)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (4, 'plan_initial_submission_marker', ?1)",
+            [crate::now_epoch() as i64],
+        )?;
+    }
+    transaction.execute_batch(schema::PLAN_STALE_OVERRIDE_AUDIT_SCHEMA)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (5, 'plan_stale_override_audit', ?1)",
+        [crate::now_epoch() as i64],
+    )?;
+    transaction.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
+    // Validate the exact schema, migration ledger, and integrity while the
+    // migration is still rollback-capable. A post-commit validation failure
+    // must never leave the user's primary database permanently half-upgraded.
+    validate_current_schema(&transaction)?;
+    validate_database_integrity(&transaction)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn protect_shared_status(

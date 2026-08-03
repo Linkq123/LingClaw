@@ -1,5 +1,6 @@
 pub(crate) mod exec;
 pub(crate) mod fs;
+pub(crate) mod git;
 pub(crate) mod image_view;
 pub(crate) mod mcp;
 pub(crate) mod net;
@@ -134,6 +135,7 @@ pub(crate) const TOOL_NAME_PATCH_FILE: &str = "patch_file";
 pub(crate) const TOOL_NAME_LIST_DIR: &str = "list_dir";
 pub(crate) const TOOL_NAME_SEARCH_FILES: &str = "search_files";
 pub(crate) const TOOL_NAME_HTTP_FETCH: &str = "http_fetch";
+pub(crate) const TOOL_NAME_GIT_INSPECT: &str = "git_inspect";
 pub(crate) const TOOL_NAME_DELETE_FILE: &str = "delete_file";
 pub(crate) const TOOL_NAME_TASK: &str = "task";
 pub(crate) const TOOL_NAME_ORCHESTRATE: &str = "orchestrate";
@@ -492,6 +494,41 @@ fn tool_parameters_http_fetch() -> serde_json::Value {
     })
 }
 
+fn tool_parameters_git_inspect() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["status", "diff", "log", "show"],
+                "description": "Read-only Git operation"
+            },
+            "path": {
+                "type": "string",
+                "maxLength": 4096,
+                "description": "Optional workspace-relative path filter"
+            },
+            "ref": {
+                "type": "string",
+                "maxLength": 512,
+                "description": "Single commit-ish revision for show (default HEAD); object paths, trees, and revision sets are rejected"
+            },
+            "staged": {
+                "type": "boolean",
+                "description": "Show staged diff when operation is diff"
+            },
+            "max_entries": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum log entries"
+            }
+        },
+        "required": ["operation"],
+        "additionalProperties": false
+    })
+}
+
 fn tool_parameters_delete_file() -> serde_json::Value {
     json!({
         "type": "object",
@@ -551,6 +588,10 @@ fn tool_prompt_line_search_files(_: &Config) -> String {
 
 fn tool_prompt_line_http_fetch(_: &Config) -> String {
     "**http_fetch** — Fetch content from a URL via HTTP GET.".to_string()
+}
+
+fn tool_prompt_line_git_inspect(_: &Config) -> String {
+    "**git_inspect** — Inspect workspace Git status, diff, log, or a revision without running arbitrary shell commands.".to_string()
 }
 
 fn tool_prompt_line_delete_file(_: &Config) -> String {
@@ -712,6 +753,19 @@ fn tool_handler_http_fetch<'a>(
     Box::pin(
         async move { ToolHandlerOutput::inferred(net::tool_http_fetch(args, http, config).await) },
     )
+}
+
+fn tool_handler_git_inspect<'a>(
+    args: &'a serde_json::Value,
+    config: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+    _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
+) -> ToolFuture<'a> {
+    Box::pin(async move {
+        ToolHandlerOutput::inferred(git::tool_git_inspect(args, config, workspace).await)
+    })
 }
 
 fn tool_handler_delete_file<'a>(
@@ -984,6 +1038,15 @@ pub(crate) fn tool_specs() -> &'static [ToolSpec] {
             parameters: tool_parameters_http_fetch,
             handler: tool_handler_http_fetch,
             trace_builder: trace_builder_http_fetch,
+        },
+        ToolSpec {
+            name: TOOL_NAME_GIT_INSPECT,
+            description: "Inspect Git status, diff, log, or a revision without executing arbitrary shell commands or modifying the repository.",
+            relevance_hint: "git status diff changes history commit inspect repository",
+            prompt_line: tool_prompt_line_git_inspect,
+            parameters: tool_parameters_git_inspect,
+            handler: tool_handler_git_inspect,
+            trace_builder: trace_builder_none,
         },
         ToolSpec {
             name: TOOL_NAME_DELETE_FILE,
@@ -1698,6 +1761,7 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
             | TOOL_NAME_LIST_DIR
             | TOOL_NAME_SEARCH_FILES
             | TOOL_NAME_HTTP_FETCH
+            | TOOL_NAME_GIT_INSPECT
     )
 }
 
@@ -1720,8 +1784,9 @@ pub(crate) fn is_parallelizable_tool(name: &str) -> bool {
 
 /// Returns true if the named tool call can safely run in a parallel batch.
 /// This includes built-in read-only tools plus cached MCP tools whose
-/// descriptors are conservatively classified as read-only from their
-/// name/description. Cache misses fall back to sequential execution.
+/// descriptors explicitly declare `readOnlyHint=true` without
+/// `destructiveHint=true`. Cache misses and missing annotations fall back to
+/// sequential execution.
 pub(crate) fn is_parallelizable_tool_call(
     name: &str,
     config: &Config,
@@ -1927,8 +1992,8 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
             },
             "run_mode": {
                 "type": "string",
-                "enum": ["execute", "plan_only"],
-                "description": "Whether dispatched sessions should execute directly or only produce a plan."
+                "enum": ["execute"],
+                "description": "Delegated sessions execute directly; Plan Mode is not supported for dispatch."
             },
             "wait": {
                 "type": "boolean",

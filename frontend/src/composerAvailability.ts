@@ -422,20 +422,43 @@ export function syncComposerAvailability(): void {
     .forEach((button) => {
       button.disabled = attachmentChangesBlocked;
     });
-  document.querySelectorAll<HTMLButtonElement>('.plan-execute-btn').forEach((button) => {
+  const planIdentityChangeBlocked = Boolean(
+    state.activeGroupId ||
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending,
+  );
+  const activeSessionId = state.activeSessionId || 'main';
+  document.querySelectorAll<HTMLButtonElement>('.plan-write-btn').forEach((button) => {
+    const targetsActiveSession =
+      !state.activeGroupId && button.dataset.planSessionId === activeSessionId;
+    const requiresModel = button.dataset.planRequiresModel === 'true';
+    const modelRunAvailable = !requiresModel || (ready && !state.imageUploadInFlight);
     const executing = state.pendingPlanExecutionId === button.dataset.planId;
-    const canExecute =
+    const actionPending =
+      button.closest('.plan-artifact-card')?.getAttribute('aria-busy') === 'true';
+    const canUseAction =
       !storageProtected &&
-      ready &&
-      !state.imageUploadInFlight &&
-      !state.sessionSwitchInFlight &&
-      !state.sessionIdentityMutationInFlight &&
-      !state.composerSessionTransitionPending &&
-      !state.composerSessionIdentityPending;
-    button.disabled = !canExecute || executing;
-    button.title = canExecute ? '' : tr(key);
-    if (canExecute) button.removeAttribute('aria-describedby');
-    else button.setAttribute('aria-describedby', 'composer-availability-detail');
+      !planIdentityChangeBlocked &&
+      targetsActiveSession &&
+      modelRunAvailable &&
+      !executing &&
+      !actionPending;
+    button.disabled = !canUseAction;
+    if (canUseAction) {
+      button.title = '';
+      button.removeAttribute('aria-describedby');
+      return;
+    }
+
+    const identityMismatch = planIdentityChangeBlocked || !targetsActiveSession;
+    button.title = identityMismatch ? tr('composer.sessionChangeInProgress') : tr(key, vars);
+    if (!identityMismatch && requiresModel) {
+      button.setAttribute('aria-describedby', 'composer-availability-detail');
+    } else {
+      button.removeAttribute('aria-describedby');
+    }
   });
 }
 

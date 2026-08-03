@@ -82,7 +82,8 @@ Selecting a tool step opens the Tool Inspector. It docks on wide desktops, float
 - Press `Enter` to send and `Shift+Enter` for a new line.
 - Type `/` as the first character to open commands; use arrows to move and `Tab` to complete.
 - Type `@` in a group to open member completion; the stored protocol value is the session ID.
-- The `+` menu contains image attachments and Plan Mode. Unavailable capabilities are hidden or disabled.
+- The composer directly exposes Execute and Plan modes. The choice stays in memory per session, so switching sessions cannot leak the mode. Plan Mode is disabled in groups.
+- The `+` menu is used for image attachments. Unavailable capabilities are hidden or disabled.
 - Normal text sent during an active run is queued and injected before the next Analyze phase. The stop button and `/stop` request immediate cancellation.
 - When no model is available, the composer explains why and blocks regular messages. Status, help, and configuration commands remain usable.
 
@@ -148,7 +149,7 @@ A group socket does not execute normal session slash commands. Switch back to a 
 | `orchestrate` | Execute a sub-agent DAG |
 | `session_control` | Main-only session/group dispatch and governance in normal mode |
 
-`view_image` is exposed only when the consuming model declares `input: ["image"]` and S3 is available. Plan Mode exposes read-only built-ins, policy-approved read-only MCP tools, and conditional `view_image`.
+`view_image` is exposed only when the consuming model declares `input: ["image"]` and S3 is available. Plan Mode can use `think`, read-only file/directory search, `http_fetch`, constrained `git_inspect`, conditional `view_image`, and MCP tools enabled for the current session that explicitly declare `readOnlyHint=true` without `destructiveHint=true`. Missing MCP annotations fail closed; third-party annotations are trusted server declarations.
 
 ## Skills
 
@@ -197,10 +198,14 @@ A sub-agent has isolated messages, tools, and a ReAct loop. To prevent recursion
 
 `orchestrate` runs dependency layers concurrently. Tasks after a failed dependency fail or skip according to the plan. The main stack summarizes completed and failed tasks, while details retain stages, tool chains, and results.
 
-## Plan Mode, Task Plan, and reasoning
+## Plan Mode, automatic execution outline, and reasoning
 
-- **Plan Mode** — Limits the run to understanding, read-only exploration, and a proposed plan. The plan enters history, then the user selects Start execution to enter normal mode.
-- **Task Plan** — Optional runtime guidance generated before Analyze from goals, evidence, and tools. It does not imply that a step has already run.
+- **Plan Mode** — Runs a per-session `planning → needs_input → ready → executing → completed/failed/stopped/discarded` state machine. The plan card presents the goal, summary, revision, steps, assumptions, risks, acceptance criteria, and verification.
+- **Questions and revisions** — Only blocking decisions that materially change the solution enter `needs_input`. Answers or revision feedback create a new revision under the same `plan_id`. Superseded revisions remain folded and read-only in history, and stale pages cannot mutate or approve a newer revision.
+- **Approval and evidence** — Local files and directories read while planning are recorded as workspace-relative SHA-256 evidence. Constrained `git_inspect` calls record their selector and result fingerprint, so worktree, index, or commit changes invalidate the plan when they affect the original inspection. If evidence changes before approval, the user must refresh the plan or explicitly continue. Confirmation is bound to the evidence snapshot actually observed at that warning, so another change requires confirmation again; successful overrides record the affected paths. MCP and HTTP observations are not presented as re-verifiable local evidence.
+- **Execution progress** — Approval does not add a synthetic user bubble. The exact revision is injected into every agent cycle, while internal `update_plan` calls update existing steps or append adaptive steps with a deviation reason. Unreported steps remain visible when a run ends instead of being fabricated as complete.
+- **Recovery and boundaries** — Only a failed or stopped plan that was approved and already started execution can resume remaining work. A planning run that was stopped or interrupted by a process restart must be revised or discarded; it cannot bypass approval. When the model has not produced a new revision yet, submitted answers or revision feedback are restored in the plan card so the user can inspect and resubmit them. On startup, LingClaw recovers leftover `planning` and `executing` process states as `stopped`. A ready plan must be executed or discarded before an ordinary Execute message can start. Groups currently reject Plan Mode.
+- **Automatic execution outline** — The compatibility key remains `enableTaskPlan`. It only supplies runtime guidance for ordinary Execute runs without an approved plan and is suppressed during Plan-only and approved-plan execution.
 - **Think level** — Controls effort for supported reasoning models. `auto` derives a level from task signals; Auto Debug only displays the most recent local decision trace.
 - **Reasoning visibility** — Changes presentation only, not provider output or agent behavior.
 

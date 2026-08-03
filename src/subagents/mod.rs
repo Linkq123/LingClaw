@@ -595,11 +595,8 @@ pub(crate) fn filter_tools_for_agent(spec: &SubAgentSpec) -> Vec<String> {
         .collect()
 }
 
-/// Classify whether an MCP tool is likely read-only based on name/description heuristics.
-///
-/// Splits the tool name (on `_`, `.`, `-`, `/`) and description into words,
-/// then checks for mutation indicators.  Conservative: if uncertain, the tool
-/// is treated as mutating (i.e. not read-only).
+/// Trust an MCP server's explicit read-only annotation and fail closed when it
+/// is absent or contradicted by a destructive annotation.
 pub(crate) fn is_mcp_tool_read_only(descriptor: &crate::tools::mcp::McpToolDescriptor) -> bool {
     crate::tools::mcp::is_read_only_tool_descriptor(descriptor)
 }

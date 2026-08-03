@@ -44,7 +44,17 @@ Each run maintains an ephemeral `WorkingState` containing intent, goal, evidence
 - HTTP-level retries handle only transient connection, timeout, 429, and 5xx failures. Agent cycles are a higher decision layer.
 - `/stop` and service shutdown cancel the active run and propagate into in-flight tools and sub-agents; hard caps and timeouts terminate work at their respective boundaries. A browser disconnect only detaches the connection and does not stop a retained active run.
 - Normal user text received while busy becomes a delayed intervention before the next Analyze phase rather than interrupting a tool transaction.
-- Plan Mode uses a separate `PlanOnly` boundary with read-only capabilities. Approval starts a normal run by persistent plan ID.
+- Plan Mode uses a separate `PlanOnly` boundary with explicitly read-only capabilities, while groups reject `plan_only` at the protocol boundary. Approval starts a normal run by persistent `plan_id + revision` without writing a synthetic user message.
+
+### Plan Mode lifecycle
+
+`src/plan.rs` owns structured artifacts, validation, evidence fingerprints, and progress updates. A Plan-only loop can terminate only through internal `submit_plan`: `needs_input` requires blocking questions, while `ready` requires stable step IDs. Models without Tool Calling fall back to a single legacy step that retains the original Markdown.
+
+SQLite v5 separates lifecycle state into `session_plans`, immutable `session_plan_revisions`, and `session_plan_progress`, keeps feedback that has not yet produced a new revision on the active plan, and persists both the initial-submission marker and the stale-evidence override confirmation time. A session may have only one active plan, revisions use optimistic concurrency, and History restores at most the latest 50 read-only revisions while always retaining the current revision. Local files/directories and constrained `git_inspect` calls contribute up to 256 evidence records: filesystem entries store workspace-relative SHA-256 fingerprints, while Git inspections store their constrained selector and result fingerprint. The runtime rechecks them before approval. A stale override token binds both the plan revision and the actual evidence snapshot observed during that check, preventing another change between the warning and execution from being silently accepted. The explicit override decision remains durable even when evidence capture was incomplete but produced no changed path; MCP and HTTP observations are not included in the re-verifiable set.
+
+Every execution cycle receives the complete `ApprovedPlanContext`. Internal `update_plan` may update step status or append a step with a required deviation reason; it cannot remove original steps or change the approved goal and acceptance criteria. `enableTaskPlan` remains compatibility guidance only for ordinary Execute runs without an approved plan.
+
+Both `planning` and `executing` depend on an in-memory Agent run reservation. Before loading sessions at process startup, the storage layer transactionally recovers either leftover state as `stopped`. Resume is available only when the plan retains an approval timestamp and a positive execution-attempt count; an interrupted planning run can only be revised or discarded. The model-facing `feedback` prompt is retained with the active plan, while a `refresh` prompt lives only in its Plan-only run; neither is persisted as a user transcript message.
 
 ### Execution Stack
 
@@ -65,6 +75,7 @@ When historical data has no reliable start time, the frontend omits duration. A 
 | `context.rs` | Token estimates, request budgets, pruning |
 | `hooks.rs` | LLM/Tool/Command lifecycle and automatic context compression |
 | `prompts.rs` | Workspace prompts, Bootstrap, skill discovery and injection |
+| `plan.rs` | Plan artifacts, revisions, evidence fingerprints, progress, and internal tool schemas |
 | `storage/` | SQLite schema, session/group repositories, legacy JSON migration, status inspection, and online backup |
 | `session_store.rs` | Session runtime adapter, normalization, and workspace compatibility logic |
 | `session_group.rs` | Group model, members, admins, voting, and replay payloads |
@@ -72,7 +83,7 @@ When historical data has no reliable start time, the frontend omits duration. A 
 | `todos.rs` | Todo validation, revision conflicts, and broadcast |
 | `memory.rs` | Structured Memory, Daily Reflection, and queues |
 | `image_uploads.rs` | PNG/JPEG validation, S3 upload, signing, configuration identity |
-| `tools/` | ToolSpec, dispatch, file/shell/network/MCP/view_image |
+| `tools/` | ToolSpec, dispatch, file/shell/network/MCP/view_image, and constrained read-only `git_inspect` |
 | `subagents/` | Discovery, isolated execution, and DAG orchestration |
 
 `src/main.rs` owns protocol boundaries rather than every business rule. Module tests live under `src/tests/` and are included by the corresponding source module.
