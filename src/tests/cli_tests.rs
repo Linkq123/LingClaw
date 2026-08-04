@@ -528,6 +528,48 @@ fn install_release_artifacts_copies_binary_and_frontend_assets() {
 }
 
 #[test]
+fn recommended_install_scripts_reuse_the_release_target() {
+    let windows = include_str!("../../scripts/install-windows.ps1");
+    let linux = include_str!("../../scripts/install-linux.sh");
+    let windows_normalized = windows.replace("\r\n", "\n");
+
+    assert!(windows.contains("'--target-dir'"));
+    assert!(windows.contains("'--offline'"));
+    assert!(windows.contains("(Join-Path $RootDir 'target')"));
+    assert!(!windows.contains("@('install', '--path', '.', '--force')"));
+    assert!(windows.contains("function Test-InstalledServiceRunning"));
+    assert!(windows.contains("$ErrorActionPreference = 'Continue'"));
+    assert!(windows.contains("if (Test-InstalledServiceRunning -InstalledExe $installedExe)"));
+    assert!(windows.contains("$stopOutput = @(& $installedExe stop 2>&1)"));
+    assert!(windows.contains("function Test-RustNativeToolchain"));
+    assert!(windows.contains("function Ensure-RustNativeToolchain"));
+    assert!(windows.contains("Microsoft.VisualStudio.Workload.VCTools"));
+    assert!(windows.contains("@('build', '--release', '--locked', '--jobs'"));
+    assert!(windows.contains("$CargoBuildJobs.ToString()"));
+    assert!(windows.contains("function Get-CargoBuildFailureGuidance"));
+    assert!(windows.contains("Full Cargo log: $logPath"));
+    assert!(windows_normalized.contains("Ensure-Rust\nEnsure-RustNativeToolchain\nBuild-Frontend"));
+
+    assert!(linux.contains("--locked --offline --target-dir \"$ROOT_DIR/target\""));
+    assert!(!linux.contains("cargo install --path . --force\n"));
+}
+
+#[test]
+fn health_probe_fails_for_an_unreachable_port() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("an ephemeral loopback port should be available");
+    let port = listener
+        .local_addr()
+        .expect("listener address should be available")
+        .port();
+    drop(listener);
+
+    let error = probe_health(port).expect_err("a closed port must fail the health probe");
+
+    assert_eq!(error, format!("Not running (port {port} unreachable)"));
+}
+
+#[test]
 fn parse_version_triple_parses_major_minor_patch() {
     assert_eq!(parse_version_triple("1.85.0"), Some((1, 85, 0)));
     assert_eq!(parse_version_triple("2.0.1"), Some((2, 0, 1)));

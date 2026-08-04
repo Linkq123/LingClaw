@@ -3394,16 +3394,22 @@ async fn api_shutdown(headers: HeaderMap, State(state): State<Arc<AppState>>) ->
     (StatusCode::OK, Json(json!({ "status": "shutting_down" })))
 }
 
-async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let sessions = state.sessions.lock().await;
+fn api_health_payload(state: &AppState, session_count: usize) -> serde_json::Value {
     let config = state.config();
-    Json(json!({
+    let model = config.explicit_primary_model_ref();
+    json!({
         "status": "ok",
         "version": VERSION,
-        "model": config.model,
-        "sessions": sessions.len(),
-        "storage": storage_status_payload(&state),
-    }))
+        "model": model,
+        "model_configured": model.is_some(),
+        "sessions": session_count,
+        "storage": storage_status_payload(state),
+    })
+}
+
+async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions = state.sessions.lock().await;
+    Json(api_health_payload(&state, sessions.len()))
 }
 
 async fn api_sessions(

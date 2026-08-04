@@ -1418,9 +1418,7 @@ fn handle_mcp_check_command() -> bool {
     true
 }
 
-fn handle_health_command(port_override: Option<u16>) -> bool {
-    let config = Config::load();
-    let port = port_override.unwrap_or(config.port);
+fn probe_health(port: u16) -> Result<String, String> {
     let addr = format!("127.0.0.1:{port}");
     match std::net::TcpStream::connect_timeout(&loopback_addr(port), Duration::from_secs(3)) {
         Ok(mut stream) => {
@@ -1432,12 +1430,24 @@ fn handle_health_command(port_override: Option<u16>) -> bool {
             let _ = stream.read_to_string(&mut buf);
             if let Some(pos) = buf.find("\r\n\r\n") {
                 let body = buf[pos + 4..].trim();
-                println!("✅ {body}");
+                Ok(body.to_string())
             } else {
-                println!("✅ Running (port {port})");
+                Ok(format!("Running (port {port})"))
             }
         }
-        Err(_) => eprintln!("❌ Not running (port {port} unreachable)"),
+        Err(_) => Err(format!("Not running (port {port} unreachable)")),
+    }
+}
+
+fn handle_health_command(port_override: Option<u16>) -> bool {
+    let config = Config::load();
+    let port = port_override.unwrap_or(config.port);
+    match probe_health(port) {
+        Ok(status) => println!("✅ {status}"),
+        Err(error) => {
+            eprintln!("❌ {error}");
+            process::exit(1);
+        }
     }
     true
 }
@@ -1652,9 +1662,15 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
         );
         println!("  Service file:  {}", SYSTEMD_SERVICE_PATH);
     }
-    println!("  Default model: {}", config.model);
-    println!("  Provider:      {}", config.provider.label());
-    println!("  API base:      {}", config.api_base);
+    if let Some(model) = config.explicit_primary_model_ref() {
+        println!("  Default model: {model}");
+        println!("  Provider:      {}", config.provider.label());
+        println!("  API base:      {}", config.api_base);
+    } else {
+        println!("  Default model: (not configured or unavailable)");
+        println!("  Provider:      (not configured)");
+        println!("  API base:      (not configured)");
+    }
     println!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
     println!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
     println!(

@@ -33,7 +33,7 @@ LingClaw 把个人 AI 助手需要的模型路由、工具执行、会话工作�
 
 - Git，以及能够访问 Rust、Node.js 和模型 Provider 的网络环境。
 - Windows 使用 PowerShell 5.1 或更高版本；Linux 使用 Bash。
-- 安装脚本会检查 Rust 和 Node.js `>= 20.19.0`。如果无法准备 Node.js，会在仓库包含可用 `static/` 时使用预构建前端。
+- 安装脚本会检查 Rust、Rust 原生链接器和 Node.js `>= 20.19.0`。Windows 的 MSVC 工具链缺少 C++ Build Tools 时，安装器会在构建前说明原因并询问是否通过 `winget` 安装；如果无法准备 Node.js，会在仓库包含可用 `static/` 时使用预构建前端。
 
 ### Windows
 

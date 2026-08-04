@@ -36,9 +36,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 The script:
 
 - Checks Rust and installs rustup through `winget` when missing.
+- Compiles a minimal Rust native-linker probe; when the MSVC C++ Build Tools workload is missing, it offers a `winget` installation before the main build.
 - Checks Node.js >= 20.19.0 and npm, installing Node.js LTS when needed.
 - Runs `frontend\npm ci` and `npm run build`; if Node cannot be prepared, it falls back to an existing `static/index.html`.
-- Builds and installs the release binary in Cargo bin.
+- Builds the release binary once from the lockfile with at most two parallel jobs, reuses that artifact when installing into Cargo bin, and preserves the complete Cargo log path when a build fails.
 - Deploys `static/`, bundled skills, and bundled sub-agents.
 - Verifies the binary, frontend asset, and version command.
 - Offers Install, Install-daemon, or no global installation yet.
@@ -58,9 +59,10 @@ $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.c
 
 ### Manual build
 
-A manual build requires Node.js >= 20.19.0 and npm as well. Install Rust and Node.js with winget:
+A manual build also requires the Microsoft C++ Build Tools "Desktop development with C++" workload, Node.js >= 20.19.0, and npm. Install Build Tools, Rust, and Node.js with winget:
 
 ```powershell
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 winget install Rustlang.Rustup
 winget install OpenJS.NodeJS.LTS
 ```
@@ -115,7 +117,7 @@ The script supports common dependency paths for Ubuntu/Debian/Kali and CentOS/RH
 - Installs or reuses Rust.
 - Prepares OpenSSL and pkg-config build dependencies.
 - Builds the frontend with Node.js >= 20.19.0, downloading a temporary runtime or using system packages when needed.
-- Builds and installs the binary, `static/`, bundled skills, and bundled sub-agents.
+- Builds the release binary once, reuses that artifact for installation, and deploys `static/`, bundled skills, and bundled sub-agents.
 - Runs post-install checks and can configure PATH and systemd.
 
 ### Manual build

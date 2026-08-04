@@ -8644,6 +8644,31 @@ fn model_list_omits_implicit_fallback_and_includes_a_dynamic_session_override() 
 }
 
 #[test]
+fn health_payload_does_not_advertise_the_implicit_fallback_model() {
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    config.providers.clear();
+    let state = test_app_state_with_config(config);
+
+    let payload = api_health_payload(&state, 1);
+
+    assert_eq!(payload["model"], serde_json::Value::Null);
+    assert_eq!(payload["model_configured"], false);
+    assert_eq!(payload["sessions"], 1);
+}
+
+#[test]
+fn health_payload_reports_an_explicit_primary_model() {
+    let state = test_app_state_with_config(test_config());
+
+    let payload = api_health_payload(&state, 2);
+
+    assert_eq!(payload["model"], "gpt-4o-mini");
+    assert_eq!(payload["model_configured"], true);
+    assert_eq!(payload["sessions"], 2);
+}
+
+#[test]
 fn model_list_keeps_a_valid_legacy_environment_model_with_an_empty_dynamic_catalog() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let session_id = format!("legacy-env-model-list-{}", now_epoch());

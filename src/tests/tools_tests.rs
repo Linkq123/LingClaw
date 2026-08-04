@@ -129,13 +129,21 @@ fn stdout_payload_args(payload: &str) -> serde_json::Value {
     }
 }
 
-fn stdout_and_stderr_payload_args(payload: &str) -> serde_json::Value {
+fn stdout_and_stderr_payload_args(payload_len: usize) -> serde_json::Value {
     if cfg!(windows) {
         json!({
-            "program": "cmd",
-            "args": ["/C", format!("echo {payload} & echo {payload} 1>&2")],
+            "program": "powershell.exe",
+            "args": [
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                format!(
+                    "[Console]::Out.Write('B' * {payload_len}); [Console]::Error.Write('B' * {payload_len})"
+                )
+            ],
         })
     } else {
+        let payload = "B".repeat(payload_len);
         json!({
             "program": "sh",
             "args": ["-c", format!("printf '%s' '{payload}'; printf '%s' '{payload}' 1>&2")],
@@ -798,10 +806,9 @@ async fn execute_tool_caps_combined_stdout_and_stderr_output_to_budget() {
 
     let mut config = test_config();
     config.max_output_bytes = 320;
-    let payload = "B".repeat(220);
     let outcome = execute_tool(
         "exec",
-        &serde_json::to_string(&stdout_and_stderr_payload_args(&payload))
+        &serde_json::to_string(&stdout_and_stderr_payload_args(220))
             .expect("args should serialize"),
         &config,
         &reqwest::Client::new(),
@@ -810,7 +817,11 @@ async fn execute_tool_caps_combined_stdout_and_stderr_output_to_budget() {
     )
     .await;
 
-    assert!(!outcome.is_error, "dual-stream exec should succeed");
+    assert!(
+        !outcome.is_error,
+        "dual-stream exec should succeed: {}",
+        outcome.output
+    );
     assert!(
         outcome.output.len() <= config.max_output_bytes,
         "combined exec output should respect max_output_bytes"

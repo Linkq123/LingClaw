@@ -36,9 +36,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 脚本会：
 
 - 检查 Rust；缺失时通过 `winget` 安装 rustup。
+- 使用最小 Rust 程序验证原生链接器；MSVC C++ Build Tools 缺失时，在正式构建前提供 `winget` 安装选项。
 - 检查 Node.js >= 20.19.0 与 npm；需要时安装 Node.js LTS。
 - 执行 `frontend\npm ci` 与 `npm run build`；无法准备 Node 时回退到仓库已有 `static/index.html`。
-- 构建 release 二进制并安装到 Cargo bin。
+- 使用锁文件和最多 2 个并行任务构建一次 release 二进制，并复用同一构建产物安装到 Cargo bin；失败时保留包含首个错误的完整 Cargo 日志路径。
 - 部署 `static/`、系统 Skills 和系统 Sub-agents。
 - 运行二进制、静态资源和版本自检。
 - 让用户选择 Install、Install-daemon 或暂不全局安装。
@@ -58,9 +59,10 @@ $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.c
 
 ### 手动构建
 
-手动构建同时需要 Node.js >= 20.19.0 与 npm。使用 winget 安装 Rust 和 Node.js：
+手动构建同时需要 Microsoft C++ Build Tools 的“使用 C++ 的桌面开发”工作负载、Node.js >= 20.19.0 与 npm。使用 winget 安装 Build Tools、Rust 和 Node.js：
 
 ```powershell
+winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 winget install Rustlang.Rustup
 winget install OpenJS.NodeJS.LTS
 ```
@@ -115,7 +117,7 @@ bash scripts/install-linux.sh
 - 安装或复用 Rust。
 - 准备 OpenSSL 和 pkg-config 构建依赖。
 - 使用 Node.js >= 20.19.0 构建前端；必要时下载临时 Node runtime 或回退系统包。
-- 构建并安装二进制、`static/`、系统 Skills 与系统 Sub-agents。
+- 构建一次 release 二进制并复用该产物安装，同时部署 `static/`、系统 Skills 与系统 Sub-agents。
 - 运行安装后自检，并可选择 PATH 与 systemd。
 
 ### 手动构建

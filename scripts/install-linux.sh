@@ -272,7 +272,9 @@ ensure_node() {
 
 install_release() {
   local cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
-  cargo install --path . --force
+  # Reuse the release artifacts built above. Without an explicit target dir,
+  # `cargo install` recompiles the whole crate in a temporary directory.
+  cargo install --path . --force --locked --offline --target-dir "$ROOT_DIR/target"
   if [[ -d "$ROOT_DIR/static" ]]; then
     mkdir -p "$cargo_bin/static"
     cp -R "$ROOT_DIR/static/." "$cargo_bin/static/"

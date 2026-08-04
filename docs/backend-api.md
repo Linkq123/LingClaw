@@ -110,6 +110,7 @@
   "status": "ok",
   "version": "2.x.x",
   "model": "openai/gpt-4o-mini",
+  "model_configured": true,
   "sessions": 1,
   "storage": {
     "mode": "healthy"
@@ -121,7 +122,8 @@
 
 - `status`：固定为 `ok`
 - `version`：后端版本
-- `model`：当前默认模型
+- `model`：显式配置且当前可解析的默认模型；未配置或已失效时为 `null`
+- `model_configured`：`model` 是否已显式配置且当前可解析；首次安装尚未配置模型时为 `false`
 - `sessions`：当前内存中会话数量
 - `storage.mode`：`healthy` 或 `protected`
 - `storage.code`：仅保护模式存在，固定为 `storage_protected`。健康接口本身仍返回 `200`，客户端应检查该字段决定是否允许核心数据写入

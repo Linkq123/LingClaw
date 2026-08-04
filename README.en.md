@@ -33,7 +33,7 @@ LingClaw brings model routing, tool execution, isolated workspaces, memory, MCP,
 
 - Git and network access to Rust, Node.js, and the model providers you choose.
 - PowerShell 5.1 or newer on Windows; Bash on Linux.
-- The installers check Rust and Node.js `>= 20.19.0`. If Node.js cannot be prepared, they can use the prebuilt frontend when a valid `static/` bundle is present.
+- The installers check Rust, its native linker, and Node.js `>= 20.19.0`. On Windows, the installer detects a missing MSVC C++ Build Tools workload before compiling and offers to install it through `winget`; if Node.js cannot be prepared, it can use the prebuilt frontend when a valid `static/` bundle is present.
 
 ### Windows
 

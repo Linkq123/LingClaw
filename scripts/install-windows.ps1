@@ -11,6 +11,8 @@ $ErrorActionPreference = 'Stop'
 
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $MinimumNodeVersion = [Version]'20.19.0'
+$RustWindowsSetupUrl = 'https://learn.microsoft.com/windows/dev-environment/rust/setup'
+$CargoBuildJobs = 2
 
 function Write-Info {
     param([string]$Message)
@@ -129,6 +131,180 @@ function Ensure-Rust {
     }
 
     Write-Info "Rust environment installed: $(& rustc --version)"
+}
+
+function Get-RustHostTriple {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $versionOutput = @(& rustc -vV 2>$null)
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    foreach ($line in $versionOutput) {
+        $text = $line.ToString()
+        if ($text -match '^host:\s*(.+)$') {
+            return $Matches[1].Trim()
+        }
+    }
+    return $null
+}
+
+function Test-RustNativeToolchain {
+    param([ref]$FailureOutput)
+
+    $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) (
+        'lingclaw-rust-probe-{0}-{1}' -f $PID, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    )
+    $sourcePath = Join-Path $probeDir 'main.rs'
+    $binaryPath = Join-Path $probeDir 'lingclaw-rust-probe.exe'
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+    [System.IO.File]::WriteAllText($sourcePath, "fn main() {}`r`n", [System.Text.Encoding]::ASCII)
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $probeOutput = @()
+    $probeExitCode = -1
+    try {
+        $ErrorActionPreference = 'Continue'
+        $probeOutput = @(& rustc $sourcePath --crate-name lingclaw_rust_probe -o $binaryPath 2>&1)
+        $probeExitCode = $LASTEXITCODE
+    } catch {
+        $probeOutput += $_.Exception.Message
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    $FailureOutput.Value = ($probeOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+    $success = ($probeExitCode -eq 0) -and (Test-Path -LiteralPath $binaryPath)
+    Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+    return $success
+}
+
+function Install-MsvcBuildTools {
+    Write-Info 'Installing Microsoft C++ Build Tools. This is required by the Rust MSVC toolchain and may take several minutes.'
+    $override = '--wait --passive --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+    $previousErrorActionPreference = $ErrorActionPreference
+    $installExitCode = -1
+    try {
+        $ErrorActionPreference = 'Continue'
+        & winget install --source winget --id Microsoft.VisualStudio.2022.BuildTools -e --accept-package-agreements --accept-source-agreements --override $override
+        $installExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($installExitCode -ne 0) {
+        throw "Microsoft C++ Build Tools installation failed with exit code $installExitCode. Install the 'Desktop development with C++' workload manually, then open a new PowerShell window. See $RustWindowsSetupUrl"
+    }
+}
+
+function Ensure-RustNativeToolchain {
+    $probeFailure = ''
+    if (Test-RustNativeToolchain ([ref]$probeFailure)) {
+        Write-Info 'Rust native linker check passed.'
+        return
+    }
+
+    $hostTriple = Get-RustHostTriple
+    if ($probeFailure -match '(?i)access is denied|os error 5|拒绝访问') {
+        throw "Rust could not run a native build probe because Windows denied access. Check antivirus or Controlled Folder Access, unblock the repository files, and retry from a user-writable directory. Probe output:`n$probeFailure"
+    }
+
+    if ($hostTriple -and $hostTriple.EndsWith('-pc-windows-msvc')) {
+        Write-Warn "The Rust MSVC linker probe failed. Microsoft C++ Build Tools with the 'Desktop development with C++' workload is required."
+        if (-not (Test-Tool 'winget')) {
+            throw "winget is unavailable. Install Microsoft C++ Build Tools manually, select 'Desktop development with C++', then open a new PowerShell window and retry. See $RustWindowsSetupUrl`nProbe output:`n$probeFailure"
+        }
+        if (-not (Prompt-YesNo 'Install Microsoft C++ Build Tools now? This requires administrator approval and several GB of disk space.')) {
+            throw "Microsoft C++ Build Tools is required. Install the 'Desktop development with C++' workload and retry. See $RustWindowsSetupUrl`nProbe output:`n$probeFailure"
+        }
+
+        Install-MsvcBuildTools
+        $probeFailure = ''
+        if (Test-RustNativeToolchain ([ref]$probeFailure)) {
+            Write-Info 'Rust native linker check passed after installing Microsoft C++ Build Tools.'
+            return
+        }
+        throw "Microsoft C++ Build Tools was installed, but the Rust linker probe still fails. Open a new PowerShell window and rerun the installer. If it still fails, repair the 'Desktop development with C++' workload. See $RustWindowsSetupUrl`nProbe output:`n$probeFailure"
+    }
+
+    throw "The Rust native toolchain is incomplete for host '$hostTriple'. Repair the active rustup toolchain and its native linker, then retry.`nProbe output:`n$probeFailure"
+}
+
+function Get-CargoBuildFailureGuidance {
+    param([string]$BuildLog)
+
+    if ($BuildLog -match '(?i)linker.+link\.exe.+not found|msvc targets depend on the msvc linker|program not found.+link\.exe') {
+        return "Microsoft C++ Build Tools is missing or incomplete. Install the 'Desktop development with C++' workload, then open a new PowerShell window. See $RustWindowsSetupUrl"
+    }
+    if ($BuildLog -match '(?i)access is denied|os error 5|拒绝访问') {
+        return 'Windows blocked a generated build executable. Check antivirus or Controlled Folder Access, unblock the repository, and retry from a user-writable local directory.'
+    }
+    if ($BuildLog -match '(?i)paging file is too small|os error 1455|not enough memory|insufficient memory|页面文件太小|内存不足') {
+        return "The build ran out of memory or paging-file capacity. Close memory-heavy applications, enable a system-managed paging file, and retry. The installer already limits Cargo to $CargoBuildJobs parallel jobs."
+    }
+    if ($BuildLog -match '(?i)no space left|disk full|os error 112|磁盘空间不足') {
+        return 'The build drive is out of free space. Free several GB on the repository, TEMP, and Cargo drives, then retry.'
+    }
+    if ($BuildLog -match '(?i)failed to download|failed to fetch|could not resolve host|certificate verify failed|connection reset') {
+        return 'Cargo could not download dependencies. Check proxy, TLS certificate, and crates.io access, then retry.'
+    }
+    return "Inspect the first error in the full Cargo log below; the final 'could not compile' lines are only a summary."
+}
+
+function Invoke-CargoBuild {
+    $logPath = Join-Path ([System.IO.Path]::GetTempPath()) (
+        'lingclaw-cargo-build-{0}-{1}.log' -f $PID, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    )
+    $stdoutPath = "$logPath.stdout"
+    $stderrPath = "$logPath.stderr"
+    $buildExitCode = -1
+    $startError = $null
+
+    try {
+        $cargoCommand = Get-Command 'cargo' -ErrorAction Stop
+        $cargoProgram = if ($cargoCommand.Source) { $cargoCommand.Source } else { $cargoCommand.Path }
+        $process = Start-Process -FilePath $cargoProgram `
+            -ArgumentList @('build', '--release', '--locked', '--jobs', $CargoBuildJobs.ToString()) `
+            -WorkingDirectory $RootDir `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+        $buildExitCode = $process.ExitCode
+    } catch {
+        $startError = $_.Exception.Message
+    }
+
+    $stdoutText = if (Test-Path -LiteralPath $stdoutPath) {
+        Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
+    } else { '' }
+    $stderrText = if (Test-Path -LiteralPath $stderrPath) {
+        Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
+    } else { '' }
+    $buildLog = @($stdoutText, $stderrText, $startError) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $buildLog = $buildLog -join [Environment]::NewLine
+    [System.IO.File]::WriteAllText($logPath, $buildLog, [System.Text.Encoding]::UTF8)
+
+    if (-not [string]::IsNullOrWhiteSpace($stdoutText)) {
+        Write-Host $stdoutText.TrimEnd()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
+        Write-Host $stderrText.TrimEnd()
+    }
+
+    Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+
+    if ($buildExitCode -eq 0) {
+        Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    $guidance = Get-CargoBuildFailureGuidance -BuildLog $buildLog
+    throw "cargo build failed with exit code $buildExitCode.`n$guidance`nFull Cargo log: $logPath"
 }
 
 function Get-NpmProgram {
@@ -401,6 +577,25 @@ function Get-InstalledBinaryPath {
     return (Join-Path (Get-CargoBinDir) 'lingclaw.exe')
 }
 
+function Test-InstalledServiceRunning {
+    param([string]$InstalledExe)
+
+    # Windows PowerShell 5.1 can promote redirected native stderr to a
+    # terminating NativeCommandError when ErrorActionPreference is Stop.
+    # A stopped service is an expected probe result, not an installer error.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $healthExitCode = -1
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $InstalledExe health *> $null
+        $healthExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    return $healthExitCode -eq 0
+}
+
 function Stop-InstalledServiceIfNeeded {
     $installedExe = Get-InstalledBinaryPath
     $wasRunning = $false
@@ -412,12 +607,22 @@ function Stop-InstalledServiceIfNeeded {
         }
     }
 
-    & $installedExe health *> $null
-    if ($LASTEXITCODE -eq 0) {
+    if (Test-InstalledServiceRunning -InstalledExe $installedExe) {
         $wasRunning = $true
         Write-Info 'Stopping existing LingClaw service before installing.'
-        & $installedExe stop
-        if ($LASTEXITCODE -ne 0) {
+        $previousErrorActionPreference = $ErrorActionPreference
+        $stopExitCode = -1
+        try {
+            $ErrorActionPreference = 'Continue'
+            $stopOutput = @(& $installedExe stop 2>&1)
+            $stopExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        foreach ($line in $stopOutput) {
+            Write-Host $line
+        }
+        if ($stopExitCode -ne 0) {
             Write-Warn 'Stop command returned a non-zero exit code. The install may fail if the old binary is still locked.'
         }
     }
@@ -457,7 +662,18 @@ function Install-Release {
     $cargoBin = Get-CargoBinDir
     $configDir = Join-Path $HOME '.lingclaw'
 
-    Invoke-Step -Program 'cargo' -Arguments @('install', '--path', '.', '--force') -WorkingDirectory $RootDir -Label 'cargo install'
+    # Reuse the release artifacts built above. Without an explicit target dir,
+    # `cargo install` compiles the whole crate again in a temporary directory.
+    Invoke-Step -Program 'cargo' -Arguments @(
+        'install',
+        '--path',
+        '.',
+        '--force',
+        '--locked',
+        '--offline',
+        '--target-dir',
+        (Join-Path $RootDir 'target')
+    ) -WorkingDirectory $RootDir -Label 'cargo install'
 
     $staticSource = Join-Path $RootDir 'static'
     if (Test-Path -LiteralPath $staticSource) {
@@ -537,12 +753,13 @@ function Read-InstallChoice {
 }
 
 Ensure-Rust
+Ensure-RustNativeToolchain
 Build-Frontend
 
 Write-Info 'Building LingClaw release binary.'
 $oldExe = Rename-TargetExeForBuild
 try {
-    Invoke-Step -Program 'cargo' -Arguments @('build', '--release') -WorkingDirectory $RootDir -Label 'cargo build'
+    Invoke-CargoBuild
     Remove-StaleTargetExe $oldExe
 } catch {
     Restore-TargetExe $oldExe
