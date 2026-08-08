@@ -51,6 +51,7 @@ describe('composer model availability', () => {
     state.composerSessionIdentityPending = false;
     state.sessionSwitchInFlight = false;
     state.sessionIdentityMutationInFlight = false;
+    state.composerModelSwitchInFlight = false;
     state.imageUploadInFlight = false;
     state.composerConfigRevision = null;
     state.composerSessionModelRevision = null;
@@ -80,6 +81,19 @@ describe('composer model availability', () => {
       'Storage protected',
     );
     expect(dom.composerAvailabilityStatus?.hidden).toBe(false);
+  });
+
+  it('disables composer submission while an atomic model selection is being saved', () => {
+    state.composerModelAvailability = 'ready';
+    state.composerEffectiveModelConfigured = true;
+    state.composerModelSwitchInFlight = true;
+    dom.input!.value = 'use the newly selected model';
+
+    syncComposerAvailability();
+
+    expect(dom.sendBtn?.disabled).toBe(true);
+    expect(dom.input?.placeholder).toBe('Saving model selection...');
+    expect(dom.sendBtn?.title).toBe('Saving model selection...');
   });
 
   it('does not offer model recovery actions while storage protection overrides the reason', () => {

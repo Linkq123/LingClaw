@@ -866,7 +866,9 @@ Bad policy.
 // These tests call the production `resolve_subagent_model()` function.
 
 use crate::Config;
-use crate::config::{JsonMcpServerConfig, JsonModelEntry, JsonProviderConfig, Provider};
+use crate::config::{
+    JsonMcpServerConfig, JsonModelEffortConfig, JsonModelEntry, JsonProviderConfig, Provider,
+};
 use crate::hooks::{AgentHook, HookInput, HookOutput, HookRegistry, ToolHookInput};
 use crate::subagents::executor::resolve_subagent_model;
 use std::collections::HashMap;
@@ -2094,6 +2096,7 @@ async fn run_subagent_configured_openai_gateway_auto_disables_reasoning_controls
                 id: "kimi-k2.6".to_string(),
                 name: None,
                 reasoning: Some(true),
+                effort: None,
                 input: Some(vec!["text".to_string(), "image".to_string()]),
                 cost: None,
                 context_window: Some(256_000),
@@ -2156,6 +2159,81 @@ async fn run_subagent_configured_openai_gateway_auto_disables_reasoning_controls
         unique_tool_names.len(),
         "sub-agent requests should not duplicate tool definitions"
     );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_subagent_uses_configured_model_default_effort_when_auto_is_unavailable() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-configured-default-effort");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+
+    let response_body = build_openai_content_stream("Review complete.");
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server_with_capture("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.providers.insert(
+        "gateway".to_string(),
+        JsonProviderConfig {
+            base_url: api_base,
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "reasoner".to_string(),
+                name: None,
+                reasoning: Some(true),
+                effort: Some(JsonModelEffortConfig {
+                    levels: vec!["high".to_string(), "max".to_string()],
+                    default: "high".to_string(),
+                }),
+                input: Some(vec!["text".to_string()]),
+                cost: None,
+                context_window: Some(64_000),
+                max_tokens: Some(8_000),
+                compat: None,
+            }],
+        },
+    );
+    config
+        .sub_agent_model_overrides
+        .insert("reviewer".to_string(), "gateway/reasoner".to_string());
+
+    let spec = SubAgentSpec {
+        name: "reviewer".into(),
+        description: String::new(),
+        system_prompt: "Review the requested change.".into(),
+        max_turns: 1,
+        tools: ToolPermissions::default(),
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let http = test_http_client();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Review the change.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        None,
+        "test-task-configured-default-effort",
+    )
+    .await;
+
+    let request = request_rx.recv().expect("request should be captured");
+    handle.join().expect("server thread should join");
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+
+    assert!(!outcome.aborted);
+    assert_eq!(body["reasoning_effort"], "high");
 
     let _ = fs::remove_dir_all(&workspace);
 }

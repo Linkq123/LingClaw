@@ -128,6 +128,8 @@ describe('main model payload ordering', () => {
     socket.receive({
       type: 'session_model_configuration',
       id: 'main',
+      model: 'gateway/reasoner',
+      effort: 'high',
       modelOverridePresent: false,
       modelOverrideConfigured: false,
       effectiveModelConfigured: false,
@@ -136,12 +138,16 @@ describe('main model payload ordering', () => {
       configRevision: 101,
     });
     expect(stateModule.state.composerSessionModelRevision).toBe(101);
+    expect(stateModule.state.composerCurrentModel).toBe('gateway/reasoner');
+    expect(stateModule.state.composerCurrentEffort).toBe('high');
 
     stateModule.state.sessionSwitchInFlight = true;
     socket.receive({
       type: 'session',
       id: 'main',
       name: 'Main metadata from older snapshot',
+      model: 'gateway/stale',
+      effort: 'low',
       modelOverridePresent: true,
       modelOverrideConfigured: true,
       effectiveModelConfigured: true,
@@ -156,6 +162,8 @@ describe('main model payload ordering', () => {
     expect(stateModule.state.dailyInputTokens).toBe(7);
     expect(stateModule.state.composerSessionModelRevision).toBe(101);
     expect(stateModule.state.composerEffectiveModelConfigured).toBe(false);
+    expect(stateModule.state.composerCurrentModel).toBe('gateway/reasoner');
+    expect(stateModule.state.composerCurrentEffort).toBe('high');
     expect(stateModule.state.imageCapable).toBe(false);
     expect(stateModule.state.sessionSwitchInFlight).toBe(false);
 
@@ -550,7 +558,7 @@ describe('main model payload ordering', () => {
     clientS3ConfigId = 's3-a';
   });
 
-  it('locks attachment changes for the full asynchronous Session create request', async () => {
+  it('locks attachment changes but keeps the options menu reachable during Session creation', async () => {
     let resolveCreate!: (response: Response) => void;
     deferredSessionCreateResponse = new Promise<Response>((resolveResponse) => {
       resolveCreate = resolveResponse;
@@ -576,7 +584,9 @@ describe('main model payload ordering', () => {
     expect(stateModule.state.sessionIdentityMutationInFlight).toBe(true);
     expect(stateModule.state.sessionSwitchInFlight).toBe(false);
     expect(createButton.disabled).toBe(true);
-    expect(stateModule.dom.attachBtn?.disabled).toBe(true);
+    expect(stateModule.dom.attachBtn?.disabled).toBe(false);
+    expect(stateModule.dom.attachLocalBtn?.disabled).toBe(false);
+    expect(stateModule.dom.attachLocalBtn?.getAttribute('aria-disabled')).toBe('true');
 
     socket.receive({
       type: 'session',
@@ -591,7 +601,9 @@ describe('main model payload ordering', () => {
       configRevision: configResponseRevision,
     });
     expect(stateModule.state.sessionIdentityMutationInFlight).toBe(true);
-    expect(stateModule.dom.attachBtn?.disabled).toBe(true);
+    expect(stateModule.dom.attachBtn?.disabled).toBe(false);
+    expect(stateModule.dom.attachLocalBtn?.disabled).toBe(false);
+    expect(stateModule.dom.attachLocalBtn?.getAttribute('aria-disabled')).toBe('true');
 
     const uploadFetchesBefore = uploadTokenFetchCount;
     const { uploadLocalImages } = await import('../src/images.js');

@@ -196,6 +196,7 @@ function identityNavigationBlocked(): boolean {
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
     state.composerSessionIdentityPending ||
+    state.composerModelSwitchInFlight ||
     state.imageUploadInFlight
   );
 }

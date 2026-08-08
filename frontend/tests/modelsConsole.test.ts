@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 
 import { setLanguage } from '../src/i18n.js';
 import { ModelsConsole } from '../src/pages/ModelsConsole.js';
+import { THINKING_EFFORT_LEVELS } from '../src/types/config.js';
 import type { AppConfig } from '../src/types/config.js';
 
 const config = {
@@ -125,6 +126,120 @@ describe('ModelsConsole', () => {
       id: 'vision-model-v2',
       priceTier: 'internal',
       compat: { thinkingFormat: 'custom-gateway', passthrough: true },
+    });
+  });
+
+  it('configures supported reasoning efforts and their default from the model inspector', async () => {
+    const { onChange } = await render();
+    const card = container.querySelector<HTMLButtonElement>('.models-console-card')!;
+    expect(card.textContent).toContain('Auto');
+    expect(card.textContent).toContain('8 levels');
+
+    await act(async () => card.click());
+    const effortEditor = container.querySelector<HTMLElement>('.models-console-effort-editor')!;
+    const effortInputs = Array.from(
+      effortEditor.querySelectorAll<HTMLInputElement>('.models-console-effort-levels input'),
+    );
+    expect(effortInputs).toHaveLength(8);
+    expect(effortInputs.every((input) => input.checked)).toBe(true);
+
+    const auto = effortInputs.find((input) => input.parentElement?.textContent?.trim() === 'Auto')!;
+    await act(async () => {
+      auto.click();
+      await flush();
+    });
+    let latest = onChange.mock.calls.at(-1)?.[0] as AppConfig;
+    expect(latest.models?.providers?.gateway.models?.[0].effort).toEqual({
+      levels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+      default: 'off',
+    });
+
+    const defaultEffort = effortEditor.querySelector<HTMLSelectElement>(
+      '.models-console-effort-default select',
+    )!;
+    await act(async () => {
+      defaultEffort.value = 'high';
+      defaultEffort.dispatchEvent(new Event('change', { bubbles: true }));
+      await flush();
+    });
+    latest = onChange.mock.calls.at(-1)?.[0] as AppConfig;
+    expect(latest.models?.providers?.gateway.models?.[0].effort?.default).toBe('high');
+  });
+
+  it('preserves provider-specific effort metadata while editing known effort fields', async () => {
+    const configured = structuredClone(config) as AppConfig;
+    configured.models!.providers!.gateway.models![0].effort = {
+      levels: ['low', 'high'],
+      default: 'high',
+      providerScale: 'turbo',
+      vendor: { budget: 4096 },
+    };
+    const { onChange } = await render(vi.fn(), vi.fn(), { config: configured });
+
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('.models-console-card')!.click(),
+    );
+    const effortEditor = container.querySelector<HTMLElement>('.models-console-effort-editor')!;
+    const defaultEffort = effortEditor.querySelector<HTMLSelectElement>(
+      '.models-console-effort-default select',
+    )!;
+    await act(async () => {
+      defaultEffort.value = 'low';
+      defaultEffort.dispatchEvent(new Event('change', { bubbles: true }));
+      await flush();
+    });
+
+    let latest = onChange.mock.calls.at(-1)?.[0] as AppConfig;
+    expect(latest.models?.providers?.gateway.models?.[0].effort).toEqual({
+      levels: ['low', 'high'],
+      default: 'low',
+      providerScale: 'turbo',
+      vendor: { budget: 4096 },
+    });
+
+    const low = Array.from(
+      effortEditor.querySelectorAll<HTMLInputElement>('.models-console-effort-levels input'),
+    ).find((input) => input.parentElement?.textContent?.trim() === 'Low')!;
+    await act(async () => {
+      low.click();
+      await flush();
+    });
+    latest = onChange.mock.calls.at(-1)?.[0] as AppConfig;
+    expect(latest.models?.providers?.gateway.models?.[0].effort).toEqual({
+      levels: ['high'],
+      default: 'high',
+      providerScale: 'turbo',
+      vendor: { budget: 4096 },
+    });
+
+    const reasoningToggle = Array.from(
+      container.querySelectorAll<HTMLInputElement>('.models-console-capability-editor input'),
+    ).find((input) => input.parentElement?.textContent?.includes('Reasoning'))!;
+    await act(async () => {
+      reasoningToggle.click();
+      await flush();
+    });
+    latest = onChange.mock.calls.at(-1)?.[0] as AppConfig;
+    expect(latest.models?.providers?.gateway.models?.[0].effort).toEqual({
+      levels: ['off'],
+      default: 'off',
+      providerScale: 'turbo',
+      vendor: { budget: 4096 },
+    });
+
+    const disabledReasoningToggle = Array.from(
+      container.querySelectorAll<HTMLInputElement>('.models-console-capability-editor input'),
+    ).find((input) => input.parentElement?.textContent?.includes('Reasoning'))!;
+    await act(async () => {
+      disabledReasoningToggle.click();
+      await flush();
+    });
+    latest = onChange.mock.calls.at(-1)?.[0] as AppConfig;
+    expect(latest.models?.providers?.gateway.models?.[0].effort).toEqual({
+      levels: [...THINKING_EFFORT_LEVELS],
+      default: 'auto',
+      providerScale: 'turbo',
+      vendor: { budget: 4096 },
     });
   });
 

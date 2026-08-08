@@ -1,4 +1,11 @@
-import type { AppConfig, ModelEntry, ProviderConfig } from '../types/config.js';
+import { THINKING_EFFORT_LEVELS } from '../types/config.js';
+import type {
+  AppConfig,
+  ModelEffortConfig,
+  ModelEntry,
+  ProviderConfig,
+  ThinkingEffort,
+} from '../types/config.js';
 
 export interface ModelFormEntry extends ModelEntry {
   _key: string;
@@ -39,6 +46,34 @@ function normalizeModelCompat(compat: unknown): Record<string, unknown> | undefi
   }
 
   return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function normalizeModelEffort(effort: unknown, reasoning: boolean): ModelEffortConfig | undefined {
+  if (!effort || typeof effort !== 'object' || Array.isArray(effort)) {
+    return undefined;
+  }
+  const raw = effort as Record<string, unknown>;
+  const selected = new Set(
+    Array.isArray(raw.levels)
+      ? raw.levels.filter(
+          (level): level is ThinkingEffort =>
+            typeof level === 'string' &&
+            (THINKING_EFFORT_LEVELS as readonly string[]).includes(level),
+        )
+      : [],
+  );
+  const levels = reasoning
+    ? THINKING_EFFORT_LEVELS.filter((level) => selected.has(level))
+    : selected.has('off')
+      ? (['off'] as ThinkingEffort[])
+      : [];
+  if (levels.length === 0) return undefined;
+  const requestedDefault = raw.default;
+  const defaultEffort =
+    typeof requestedDefault === 'string' && levels.includes(requestedDefault as ThinkingEffort)
+      ? (requestedDefault as ThinkingEffort)
+      : levels[0];
+  return { ...raw, levels: [...levels], default: defaultEffort } as ModelEffortConfig;
 }
 
 function nextProviderFormKey(name: string): string {
@@ -133,6 +168,9 @@ export function serializeProviderForms(providers: ProviderFormData[]): AppConfig
         };
 
         if (!model.reasoning) delete entry.reasoning;
+        const effort = normalizeModelEffort(model.effort, model.reasoning === true);
+        if (effort) entry.effort = effort;
+        else delete entry.effort;
         if (model.contextWindow == null) delete entry.contextWindow;
         if (model.maxTokens == null) delete entry.maxTokens;
         if (!model.input || model.input.length === 0) delete entry.input;

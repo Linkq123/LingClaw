@@ -114,6 +114,12 @@ import {
   restorePlanModeForSession,
 } from './images.js';
 import {
+  applyComposerModelPayload,
+  initComposerModelPicker,
+  refreshComposerModelCatalog,
+  refreshLocalizedComposerModelPicker,
+} from './composerModels.js';
+import {
   activateGroupMentionTargetMode,
   sendCmd,
   initInputListeners,
@@ -368,6 +374,7 @@ function refreshLocalizedUi() {
   refreshExecutionStacks();
   refreshActionDialog();
   refreshPlanLanguage();
+  refreshLocalizedComposerModelPicker();
   if (state.activeToolPanel) {
     syncToolDrawer(state.activeToolPanel);
   }
@@ -1204,6 +1211,7 @@ function sessionIdentityActionBlocked(): boolean {
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
     state.composerSessionIdentityPending ||
+    state.composerModelSwitchInFlight ||
     state.imageUploadInFlight
   );
 }
@@ -1685,6 +1693,7 @@ function applySessionModelFields(data, completeTransition = true): boolean {
     data.configRevision,
     completeTransition,
   );
+  applyComposerModelPayload(data);
   captureComposerSessionTransitionTargetCapabilitiesBaseline();
   applySessionCapabilities(data);
   return true;
@@ -3251,6 +3260,7 @@ function installChatResizeObserver(): void {
 
 document.addEventListener('click', handleDocumentClick);
 window.addEventListener(CONFIG_SAVED_EVENT, handleComposerConfigSaved);
+window.addEventListener(CONFIG_SAVED_EVENT, refreshComposerModelCatalog);
 const unsubscribeLanguageChange = subscribeLanguageChange(refreshLocalizedUi);
 
 // ── Init ──
@@ -3264,6 +3274,7 @@ syncToolDrawerBounds();
 updateJumpToLatestVisibility();
 
 initImageListeners();
+initComposerModelPicker();
 initInputListeners({
   onGroupMentionTargetModeActivated: () => {
     renderGroupTargetControls();
@@ -3313,6 +3324,7 @@ if (import.meta.hot) {
     cancelReconnect();
     document.removeEventListener('click', handleDocumentClick);
     window.removeEventListener(CONFIG_SAVED_EVENT, handleComposerConfigSaved);
+    window.removeEventListener(CONFIG_SAVED_EVENT, refreshComposerModelCatalog);
     document.removeEventListener('keydown', handleDocumentKeydown);
     dom.chat.removeEventListener('scroll', handleChatScroll);
     window.removeEventListener('resize', syncToolDrawerBounds);

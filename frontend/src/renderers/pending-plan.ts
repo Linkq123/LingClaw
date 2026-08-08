@@ -111,7 +111,8 @@ function planIdentityTransitionInFlight(): boolean {
     state.sessionSwitchInFlight ||
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
-    state.composerSessionIdentityPending
+    state.composerSessionIdentityPending ||
+    state.composerModelSwitchInFlight
   );
 }
 
@@ -191,6 +192,10 @@ export function clearPlanStateForSessionTransition(nextSessionId: string): void 
   const targetSessionId = String(nextSessionId || 'main').trim() || 'main';
   if (activePlanSessionId === targetSessionId) return;
   clearPendingPlanAction();
+  state.planModeEnabled = state.activeGroupId
+    ? false
+    : (state.planModesBySession.get(targetSessionId) ?? false);
+  syncPlanModeToggle();
 }
 
 export function restorePendingPlanAction(): void {

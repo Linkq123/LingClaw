@@ -71,8 +71,9 @@ use runtime_loop::{
 #[cfg(test)]
 use session_store::load_session_from_disk;
 use session_store::{
-    SessionSummary, refresh_session_system_prompt, save_session_to_disk_locked,
-    session_persist_gate, sessions_dir,
+    SessionModelPreferences, SessionSummary, load_session_model_preferences_result,
+    refresh_session_system_prompt, save_session_to_disk_locked, session_persist_gate, sessions_dir,
+    update_session_think_level_locked,
 };
 use socket_sync::{
     broadcast_session_list_payload, build_session_info_payload, send_command_refresh,
@@ -536,6 +537,209 @@ pub(crate) struct SessionModelSnapshot {
     pub(crate) config: Arc<Config>,
     pub(crate) model: String,
     pub(crate) explicit: bool,
+}
+
+pub(crate) struct SessionModelPreferenceUpdate {
+    pub(crate) model: String,
+    pub(crate) effort: String,
+    pub(crate) image_capable: bool,
+    pub(crate) explicit_primary_model_configured: bool,
+    pub(crate) config_revision: u64,
+    pub(crate) payloads: socket_sync::ModelConfigurationPayloads,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionModelPreferenceError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+}
+
+impl SessionModelPreferenceError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+pub(crate) async fn update_session_model_preferences(
+    state: &AppState,
+    session_id: &str,
+    requested_model: Option<&str>,
+    requested_effort: Option<&str>,
+    reject_busy: bool,
+) -> Result<SessionModelPreferenceUpdate, SessionModelPreferenceError> {
+    let _config_guard = CONFIG_FILE_LOCK.write().await;
+    // Keep the reservation gate until the new pair is durable. This makes the
+    // operation linearizable with Agent startup: either the run already owns
+    // the Session and the update is rejected, or the complete model/effort
+    // pair lands before the run can take its model snapshot.
+    let active_runs_guard = if reject_busy {
+        Some(state.active_runs.lock().await)
+    } else {
+        None
+    };
+    if active_runs_guard
+        .as_ref()
+        .is_some_and(|runs| runs.contains_key(session_id))
+    {
+        return Err(SessionModelPreferenceError::new(
+            "session_busy",
+            "The Session model cannot be changed while an Agent run is active.",
+        ));
+    }
+    let config = state.config();
+    let persist_gate = session_persist_gate(session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let (mut candidate, selected_model) = {
+        let sessions = state.sessions.lock().await;
+        let candidate = sessions.get(session_id).cloned().ok_or_else(|| {
+            SessionModelPreferenceError::new("session_not_found", "Session not found")
+        })?;
+        let selected_model = if let Some(model) = requested_model {
+            config
+                .selectable_model_ref(model)
+                .map_err(|error| SessionModelPreferenceError::new("model_unavailable", error))?
+        } else {
+            let (model, _, configured) = candidate.model_configuration(&config);
+            if !configured {
+                return Err(SessionModelPreferenceError::new(
+                    "model_unavailable",
+                    "Configure an explicit model before selecting a thinking effort.",
+                ));
+            }
+            config
+                .selectable_model_ref(&model)
+                .map_err(|error| SessionModelPreferenceError::new("model_unavailable", error))?
+        };
+        (candidate, selected_model)
+    };
+
+    let effort_options = config.model_effort_options(&selected_model);
+    let selected_effort = if let Some(effort) = requested_effort {
+        let normalized = effort.trim().to_ascii_lowercase();
+        if !effort_options
+            .levels
+            .iter()
+            .any(|level| level == &normalized)
+        {
+            return Err(SessionModelPreferenceError::new(
+                "effort_not_supported",
+                format!("Thinking effort '{effort}' is not enabled for model '{selected_model}'."),
+            ));
+        }
+        normalized
+    } else {
+        config.normalize_model_effort(&selected_model, &candidate.think_level)
+    };
+
+    if requested_model.is_some() {
+        candidate.model_override = Some(selected_model.clone());
+    }
+    candidate.think_level = selected_effort.clone();
+    candidate.updated_at = now_epoch();
+    if let Err(error) = save_session_to_disk_locked(&candidate).await {
+        eprintln!(
+            "ERROR: failed to persist model preferences for Session '{}': {error}",
+            candidate.id
+        );
+        return Err(SessionModelPreferenceError::new(
+            "storage_protected",
+            "Local storage could not save the Session model preferences.",
+        ));
+    }
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            SessionModelPreferenceError::new("session_not_found", "Session not found")
+        })?;
+        session.model_override = candidate.model_override;
+        session.think_level = candidate.think_level;
+        session.updated_at = session.updated_at.max(candidate.updated_at);
+    }
+    drop(active_runs_guard);
+
+    let (config, config_revision) = state.bump_config_revision();
+    let payloads =
+        socket_sync::collect_model_configuration_payloads(state, &config, config_revision).await;
+    Ok(SessionModelPreferenceUpdate {
+        image_capable: config.model_supports_image(&selected_model),
+        explicit_primary_model_configured: config.explicit_primary_model_configured,
+        model: selected_model,
+        effort: selected_effort,
+        config_revision,
+        payloads,
+    })
+}
+
+async fn normalize_session_model_efforts(state: &AppState, config: &Config) -> Result<(), String> {
+    let mut session_ids = crate::session_store::list_saved_session_ids_result(&sessions_dir())?;
+    session_ids.extend({
+        let sessions = state.sessions.lock().await;
+        sessions.keys().cloned().collect::<Vec<_>>()
+    });
+    for session_id in session_ids {
+        let persist_gate = session_persist_gate(&session_id);
+        let _persist_guard = persist_gate.lock().await;
+        let loaded_candidate = {
+            let sessions = state.sessions.lock().await;
+            find_loaded_session_id(&sessions, &session_id)
+                .and_then(|loaded_id| sessions.get(&loaded_id).cloned())
+        };
+        let mut preferences = if let Some(session) = loaded_candidate.as_ref() {
+            SessionModelPreferences {
+                id: session.id.clone(),
+                model_override: session.model_override.clone(),
+                think_level: session.think_level.clone(),
+                updated_at: session.updated_at,
+            }
+        } else {
+            let Some(preferences) = load_session_model_preferences_result(&session_id)? else {
+                continue;
+            };
+            preferences
+        };
+
+        let model = if let Some(model_override) = preferences.model_override.as_deref() {
+            let Ok(model) = config.selectable_model_ref(model_override) else {
+                continue;
+            };
+            model
+        } else {
+            if !config.explicit_primary_model_configured {
+                continue;
+            }
+            config.model.clone()
+        };
+        let normalized = config.normalize_model_effort(&model, &preferences.think_level);
+        if normalized == preferences.think_level {
+            continue;
+        }
+        preferences.think_level = normalized;
+        preferences.updated_at = preferences.updated_at.max(now_epoch());
+
+        if !update_session_think_level_locked(&preferences).await? {
+            if loaded_candidate.is_some() {
+                return Err(format!(
+                    "Loaded Session '{}' is missing from persistent storage",
+                    preferences.id
+                ));
+            }
+            // The Session may have been deleted after the initial ID snapshot.
+            continue;
+        }
+
+        let mut sessions = state.sessions.lock().await;
+        if let Some(loaded_id) = find_loaded_session_id(&sessions, &preferences.id)
+            && let Some(session) = sessions.get_mut(&loaded_id)
+        {
+            session.think_level = preferences.think_level;
+            session.updated_at = session.updated_at.max(preferences.updated_at);
+        }
+    }
+    Ok(())
 }
 
 async fn session_model_snapshot(
@@ -2700,6 +2904,12 @@ struct SessionQuery {
 }
 
 #[derive(Deserialize)]
+struct SessionModelUpdateRequest {
+    model: String,
+    effort: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionSkillsUpdateRequest {
     enabled_system_skills: Vec<String>,
@@ -3325,6 +3535,7 @@ fn is_storage_mutation(method: &Method, path: &str) -> bool {
             "/api/session-group"
         ) | (&Method::PUT | &Method::DELETE, "/api/session-group/member")
             | (&Method::PUT, "/api/session-skills")
+            | (&Method::PUT, "/api/session-models")
             | (&Method::PUT, "/api/mcp/session-policy")
             | (&Method::PUT, "/api/todos")
             | (&Method::POST, "/api/upload-images")
@@ -3451,6 +3662,111 @@ async fn api_sessions(
 
     sort_session_json_values(&mut list);
     Ok(Json(json!({"sessions": list})))
+}
+
+async fn api_session_models(
+    Query(query): Query<SessionQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let _config_guard = CONFIG_FILE_LOCK.read().await;
+    let (config, config_revision) = state.config_snapshot_with_revision();
+    let (
+        model,
+        effort,
+        model_override_present,
+        model_override_configured,
+        effective_model_configured,
+    ) = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&session_id).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": format!("Session '{}' not found", session_id),
+                    "code": "session_not_found",
+                })),
+            )
+        })?;
+        let (model, model_override_configured, effective_model_configured) =
+            session.model_configuration(&config);
+        let effort = config.normalize_model_effort(&model, &session.think_level);
+        (
+            model,
+            effort,
+            session.model_override.is_some(),
+            model_override_configured,
+            effective_model_configured,
+        )
+    };
+    let image_capable = config.model_supports_image(&model);
+    Ok(Json(json!({
+        "session": {
+            "id": session_id,
+            "model": model,
+            "effort": effort,
+            "modelOverridePresent": model_override_present,
+            "modelOverrideConfigured": model_override_configured,
+            "effectiveModelConfigured": effective_model_configured,
+        },
+        "explicitPrimaryModelConfigured": config.explicit_primary_model_configured,
+        "capabilities": {
+            "image": image_capable,
+        },
+        "models": config.model_catalog(),
+        "configRevision": config_revision,
+    })))
+}
+
+async fn api_put_session_models(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SessionModelUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let update = update_session_model_preferences(
+        &state,
+        &session_id,
+        Some(&request.model),
+        Some(&request.effort),
+        true,
+    )
+    .await
+    .map_err(|error| {
+        let status = match error.code {
+            "session_not_found" => StatusCode::NOT_FOUND,
+            "session_busy" => StatusCode::CONFLICT,
+            "model_unavailable" | "effort_not_supported" => StatusCode::BAD_REQUEST,
+            "storage_protected" => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (
+            status,
+            Json(json!({ "error": error.message, "code": error.code })),
+        )
+    })?;
+    let response = json!({
+        "ok": true,
+        "session": {
+            "id": session_id,
+            "model": update.model,
+            "effort": update.effort,
+            "modelOverridePresent": true,
+            "modelOverrideConfigured": true,
+            "effectiveModelConfigured": true,
+        },
+        "explicitPrimaryModelConfigured": update.explicit_primary_model_configured,
+        "capabilities": {
+            "image": update.image_capable,
+        },
+        "configRevision": update.config_revision,
+    });
+    socket_sync::send_model_configuration_payloads(&state, update.payloads).await;
+    Ok(Json(response))
 }
 
 fn sort_session_json_values(list: &mut [serde_json::Value]) {
@@ -3616,12 +3932,14 @@ async fn api_put_session(
         let (config, config_revision) = state.config_snapshot_with_revision();
         let (model, model_override_configured, effective_model_configured) =
             session.model_configuration(&config);
+        let effort = config.normalize_model_effort(&model, &session.think_level);
         let usage = socket_sync::build_session_usage_payload(session);
         let session_event = socket_sync::build_session_info_payload(
             &session_id,
             &session.name,
             &config,
             &model,
+            &effort,
             session.model_override.is_some(),
             model_override_configured,
             effective_model_configured,
@@ -4901,7 +5219,7 @@ async fn api_put_config(
             ));
         }
     };
-    let config_value = body
+    let mut config_value = body
         .get("config")
         .ok_or_else(|| {
             (
@@ -4945,6 +5263,8 @@ async fn api_put_config(
     ) {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
     }
+
+    config::normalize_json_model_effort_order(&mut config_value);
 
     let path = config_file_path().ok_or_else(|| {
         (
@@ -5001,6 +5321,16 @@ async fn api_put_config(
     // model/MCP changes take effect without a restart.
     let new_config = Config::load();
     let (applied_config, config_revision) = state.apply_runtime_config(new_config);
+    if let Err(error) = normalize_session_model_efforts(&state, &applied_config).await {
+        // Config is independent filesystem state and has already been durably
+        // replaced above. A protected or newly failed SQLite store must not
+        // turn that successful save into a misleading 503/partial commit.
+        // Runtime request building still normalizes stale persisted efforts;
+        // durable repair can resume after storage is repaired and restarted.
+        eprintln!(
+            "WARNING: saved Config, but could not persist normalized Session Efforts: {error}"
+        );
+    }
     let s3_lifecycle_config_id = applied_config.s3.as_ref().and_then(|s3_cfg| {
         s3_lifecycle_needs_sync(Some(s3_cfg)).then(|| image_uploads::s3_config_id(s3_cfg))
     });
@@ -5726,6 +6056,13 @@ async fn main() {
         }
     }
 
+    if state.storage_status().mode == storage::StorageMode::Healthy {
+        let startup_config = state.config();
+        if let Err(error) = normalize_session_model_efforts(&state, &startup_config).await {
+            eprintln!("ERROR: Failed to normalize Session model Effort at startup: {error}");
+        }
+    }
+
     let static_dir = resolve_static_dir();
     eprintln!("  Static dir:    {}", static_dir.display());
 
@@ -5735,6 +6072,10 @@ async fn main() {
         .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
         .route("/api/session", post(api_post_session).put(api_put_session))
+        .route(
+            "/api/session-models",
+            get(api_session_models).put(api_put_session_models),
+        )
         .route(
             "/api/session-groups",
             get(session_control::api_session_groups),

@@ -5,10 +5,30 @@ export interface ModelCompat {
   [key: string]: unknown;
 }
 
+export const THINKING_EFFORT_LEVELS = [
+  'auto',
+  'off',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
+
+export type ThinkingEffort = (typeof THINKING_EFFORT_LEVELS)[number];
+
+export interface ModelEffortConfig {
+  levels: ThinkingEffort[];
+  default: ThinkingEffort;
+  [key: string]: unknown;
+}
+
 export interface ModelEntry {
   id: string;
   name?: string;
   reasoning?: boolean;
+  effort?: ModelEffortConfig;
   input?: string[];
   contextWindow?: number;
   maxTokens?: number;

@@ -272,7 +272,9 @@ describe('UsageView dashboard states', () => {
     );
     const descriptionId = trendPoint?.getAttribute('aria-describedby');
     expect(descriptionId).toBeTruthy();
-    expect(document.getElementById(descriptionId || '')?.textContent).toContain('2026-07');
+    expect(document.getElementById(descriptionId || '')?.textContent).toContain(
+      trendPoint?.getAttribute('aria-label'),
+    );
     expect(trendPoint?.querySelector('.usage-console-trend-tooltip')).not.toBeNull();
     expect(document.querySelector('svg[role="img"][aria-label="Input / Output"]')).not.toBeNull();
     expect(document.querySelectorAll('.usage-console-ranking')).toHaveLength(2);

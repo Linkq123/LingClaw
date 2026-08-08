@@ -443,7 +443,12 @@ function handleSlashCommandKeydown(e: KeyboardEvent): boolean {
 
 export function send() {
   if (!state.ws || state.ws.readyState !== 1) return;
-  if (state.sessionSwitchInFlight || state.sessionIdentityMutationInFlight) return;
+  if (
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerModelSwitchInFlight
+  )
+    return;
 
   const text = dom.input.value.trim();
   if (!text && state.pendingImages.length === 0) return;

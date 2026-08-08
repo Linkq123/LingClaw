@@ -42,6 +42,14 @@ pub(crate) struct SessionDeleteOutcome {
     pub(crate) affected_group_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionModelPreferences {
+    pub(crate) id: String,
+    pub(crate) model_override: Option<String>,
+    pub(crate) think_level: String,
+    pub(crate) updated_at: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SessionUsageSnapshot {
     pub(crate) daily_input: u64,
@@ -145,6 +153,19 @@ fn validate_persisted_session_identity(id: &str, name: &str) -> Result<(), Stora
         ));
     }
     Ok(())
+}
+
+fn validate_persisted_think_level(think_level: &str) -> Result<(), StorageError> {
+    if matches!(
+        think_level,
+        "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        Ok(())
+    } else {
+        Err(StorageError::new(format!(
+            "Invalid persisted session think level '{think_level}'"
+        )))
+    }
 }
 
 fn parse_session_flag(value: i64, field: &str) -> Result<bool, StorageError> {
@@ -837,6 +858,40 @@ impl Database {
     }
 
     #[cfg(not(test))]
+    pub(crate) fn load_session_model_preferences_blocking(
+        &self,
+        id: &str,
+    ) -> Result<Option<SessionModelPreferences>, StorageError> {
+        let id = id.to_string();
+        self.blocking_read(move |connection| query_session_model_preferences(connection, &id))
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn update_session_think_level(
+        &self,
+        id: &str,
+        think_level: &str,
+        updated_at: u64,
+    ) -> Result<bool, StorageError> {
+        let id = id.to_string();
+        let think_level = think_level.to_string();
+        let updated_at = to_i64(updated_at, "session updated_at")?;
+        self.call(move |connection| {
+            validate_persisted_session_id(&id)?;
+            validate_persisted_think_level(&think_level)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let updated = transaction.execute(
+                "UPDATE sessions SET think_level=?1, updated_at=MAX(updated_at, ?2) WHERE id=?3",
+                params![think_level, updated_at, id],
+            )?;
+            transaction.commit()?;
+            Ok(updated == 1)
+        })
+        .await
+    }
+
+    #[cfg(not(test))]
     pub(crate) fn session_name_map_blocking(
         &self,
     ) -> Result<HashMap<String, String>, StorageError> {
@@ -1154,6 +1209,40 @@ fn query_session_ids(
         validate_persisted_session_id(id)?;
     }
     Ok(ids)
+}
+
+#[cfg(not(test))]
+fn query_session_model_preferences(
+    connection: &mut rusqlite::Connection,
+    id: &str,
+) -> Result<Option<SessionModelPreferences>, StorageError> {
+    let Some(id) = canonical_session_id_record(connection, id)? else {
+        return Ok(None);
+    };
+    let preferences = connection
+        .query_row(
+            "SELECT model_override, think_level, updated_at FROM sessions WHERE id=?1",
+            [&id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((model_override, think_level, updated_at)) = preferences else {
+        return Ok(None);
+    };
+    validate_persisted_session_id(&id)?;
+    validate_persisted_think_level(&think_level)?;
+    Ok(Some(SessionModelPreferences {
+        id,
+        model_override,
+        think_level,
+        updated_at: to_u64(updated_at, "session updated_at")?,
+    }))
 }
 
 fn query_session_name_map(
@@ -1686,15 +1775,7 @@ fn rebuild_session(loaded: LoadedSession) -> Result<Session, StorageError> {
             loaded.version
         )));
     }
-    if !matches!(
-        loaded.think_level.as_str(),
-        "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-    ) {
-        return Err(StorageError::new(format!(
-            "Invalid persisted session think level '{}'",
-            loaded.think_level
-        )));
-    }
+    validate_persisted_think_level(&loaded.think_level)?;
     let show_react = parse_session_flag(loaded.show_react, "show_react")?;
     let show_tools = parse_session_flag(loaded.show_tools, "show_tools")?;
     let show_reasoning = parse_session_flag(loaded.show_reasoning, "show_reasoning")?;

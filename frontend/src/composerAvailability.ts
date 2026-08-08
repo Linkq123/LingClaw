@@ -1,6 +1,7 @@
 import { tr } from './i18n.js';
 import { mentionedGroupTargets } from './groupMentions.js';
 import { normalizeSlashCommandText } from './slashCommands.js';
+import { closeComposerPopovers } from './composerPopovers.js';
 import { dom, state } from './state.js';
 import type { AppConfig, ConfigApiResponse } from './types/config.js';
 
@@ -133,6 +134,47 @@ export function acceptComposerHttpModelPayloadRevision(value: unknown): boolean 
     void refreshComposerAvailability();
   }
   return accepted;
+}
+
+export function applyComposerHttpSessionModelState(
+  data: {
+    modelOverridePresent?: unknown;
+    modelOverrideConfigured?: unknown;
+    effectiveModelConfigured?: unknown;
+    explicitPrimaryModelConfigured?: unknown;
+  },
+  configRevision?: unknown,
+): boolean {
+  const revision = normalizeConfigRevision(configRevision);
+  if (!acceptComposerHttpModelPayloadRevision(configRevision)) return false;
+
+  if (typeof data.explicitPrimaryModelConfigured === 'boolean') {
+    if (
+      revision === null ||
+      data.explicitPrimaryModelConfigured !== state.composerExplicitPrimaryModelConfigured
+    ) {
+      explicitStateGeneration += 1;
+    }
+    state.composerExplicitPrimaryModelConfigured = data.explicitPrimaryModelConfigured;
+  }
+
+  if (typeof data.modelOverridePresent === 'boolean') {
+    const modelOverrideConfigured = data.modelOverrideConfigured === true;
+    state.composerSessionModelOverridePresent = data.modelOverridePresent;
+    state.composerEffectiveModelConfigured =
+      typeof data.effectiveModelConfigured === 'boolean'
+        ? data.effectiveModelConfigured
+        : data.modelOverridePresent
+          ? modelOverrideConfigured
+          : modelOverrideConfigured || state.composerExplicitPrimaryModelConfigured;
+  }
+
+  // The HTTP response is authoritative for the requested active Session. It
+  // must advance the Session snapshot together with the global revision so a
+  // missed or delayed WebSocket event cannot strand the Composer in checking.
+  state.composerSessionModelRevision = revision;
+  recomputeComposerAvailability();
+  return true;
 }
 
 export function resolveComposerModelAvailability(
@@ -291,6 +333,7 @@ export function syncComposerAvailability(): void {
   const uploadBlocksSubmission = state.imageUploadInFlight && !modelFreeSlashCommand;
   const identityChangeBlocked =
     state.sessionSwitchInFlight || state.sessionIdentityMutationInFlight;
+  const modelSwitchBlocked = state.composerModelSwitchInFlight;
   const targetedSwitchBlocked = Boolean(
     targetedSwitchCommand(inputValue) &&
     (state.composerSessionIdentityPending || state.imageUploadInFlight || identityChangeBlocked),
@@ -301,21 +344,23 @@ export function syncComposerAvailability(): void {
       ? 'group.slashUnsupported'
       : uploadBlocksSubmission
         ? 'composer.uploadInProgress'
-        : identityChangeBlocked
-          ? 'composer.sessionChangeInProgress'
-          : state.composerModelAvailability === 'config-unavailable'
-            ? placeholderKey()
-            : groupTargetsMissing
-              ? state.groupTargetMode === 'mentions'
-                ? 'group.mentionRequired'
-                : 'group.selectMember'
-              : state.activeGroupId && groupReady
-                ? state.busy
-                  ? 'composer.placeholderBusy'
-                  : 'composer.placeholder'
-                : missingGroupTargets.length > 0
-                  ? 'composer.groupTargetsUnconfigured'
-                  : placeholderKey();
+        : modelSwitchBlocked
+          ? 'composer.modelSwitchSaving'
+          : identityChangeBlocked
+            ? 'composer.sessionChangeInProgress'
+            : state.composerModelAvailability === 'config-unavailable'
+              ? placeholderKey()
+              : groupTargetsMissing
+                ? state.groupTargetMode === 'mentions'
+                  ? 'group.mentionRequired'
+                  : 'group.selectMember'
+                : state.activeGroupId && groupReady
+                  ? state.busy
+                    ? 'composer.placeholderBusy'
+                    : 'composer.placeholder'
+                  : missingGroupTargets.length > 0
+                    ? 'composer.groupTargetsUnconfigured'
+                    : placeholderKey();
   const vars =
     missingGroupTargets.length > 0
       ? {
@@ -332,6 +377,7 @@ export function syncComposerAvailability(): void {
     (!storageProtected || modelFreeSlashCommand) &&
     !groupSlashUnsupported &&
     !uploadBlocksSubmission &&
+    !modelSwitchBlocked &&
     !identityChangeBlocked &&
     !targetedSwitchBlocked &&
     (groupReady || modelFreeSlashCommand);
@@ -402,20 +448,27 @@ export function syncComposerAvailability(): void {
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
     state.composerSessionIdentityPending ||
+    state.composerModelSwitchInFlight ||
     state.imageUploadInFlight,
   );
   if (dom.attachBtn) {
-    dom.attachBtn.disabled = attachmentChangesBlocked;
-    dom.attachBtn.setAttribute('aria-disabled', String(attachmentChangesBlocked));
+    // The overflow menu remains available so disabled actions can explain how
+    // to recover (for example, a text-only model or missing S3 configuration).
+    dom.attachBtn.disabled = false;
+    dom.attachBtn.setAttribute('aria-disabled', 'false');
   }
-  if (
-    (state.sessionSwitchInFlight ||
-      state.sessionIdentityMutationInFlight ||
-      state.composerSessionTransitionPending ||
-      state.composerSessionIdentityPending) &&
-    dom.attachPopup
-  ) {
-    dom.attachPopup.style.display = 'none';
+  const composerIdentityChanging = Boolean(
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending,
+  );
+  if (composerIdentityChanging) {
+    closeComposerPopovers();
+  } else if (state.composerModelSwitchInFlight) {
+    // Keep the model picker mounted so its saving/error state remains visible,
+    // while ensuring the unrelated attachment menu cannot overlap it.
+    closeComposerPopovers('models');
   }
   document
     .querySelectorAll<HTMLButtonElement>('.image-preview-item .remove-btn')
@@ -427,7 +480,8 @@ export function syncComposerAvailability(): void {
     state.sessionSwitchInFlight ||
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
-    state.composerSessionIdentityPending,
+    state.composerSessionIdentityPending ||
+    state.composerModelSwitchInFlight,
   );
   const activeSessionId = state.activeSessionId || 'main';
   document.querySelectorAll<HTMLButtonElement>('.plan-write-btn').forEach((button) => {
@@ -460,6 +514,7 @@ export function syncComposerAvailability(): void {
       button.removeAttribute('aria-describedby');
     }
   });
+  document.dispatchEvent(new CustomEvent('lingclaw:composer-state-change'));
 }
 
 function recomputeComposerAvailability(): void {

@@ -1304,6 +1304,91 @@ impl Config {
             .and_then(|e| e.input.as_ref())
             .is_some_and(|inputs| inputs.iter().any(|i| i == "image"))
     }
+
+    /// Return the user-selectable thinking levels for a model. Older configs
+    /// keep the historic full set for reasoning models and `off` otherwise.
+    pub(crate) fn model_effort_options(&self, model_ref: &str) -> ModelEffortOptions {
+        let Some(entry) = self.find_model_entry(model_ref) else {
+            return ModelEffortOptions {
+                levels: vec!["off".to_string()],
+                default: "off".to_string(),
+            };
+        };
+        if let Some(effort) = entry.effort.as_ref() {
+            return ModelEffortOptions {
+                levels: THINKING_EFFORT_LEVELS
+                    .iter()
+                    .filter(|level| effort.levels.iter().any(|configured| configured == **level))
+                    .map(|level| (*level).to_string())
+                    .collect(),
+                default: effort.default.clone(),
+            };
+        }
+        if entry.reasoning.unwrap_or(false) {
+            return ModelEffortOptions {
+                levels: THINKING_EFFORT_LEVELS
+                    .iter()
+                    .map(|level| (*level).to_string())
+                    .collect(),
+                default: "auto".to_string(),
+            };
+        }
+        ModelEffortOptions {
+            levels: vec!["off".to_string()],
+            default: "off".to_string(),
+        }
+    }
+
+    pub(crate) fn normalize_model_effort(&self, model_ref: &str, effort: &str) -> String {
+        let options = self.model_effort_options(model_ref);
+        let normalized = effort.trim().to_ascii_lowercase();
+        if options.levels.iter().any(|level| level == &normalized) {
+            normalized
+        } else {
+            options.default
+        }
+    }
+
+    pub(crate) fn model_catalog(&self) -> Vec<ModelCatalogEntry> {
+        let mut model_refs = self.available_models();
+        model_refs.sort_unstable();
+        model_refs.dedup();
+        model_refs
+            .into_iter()
+            .map(|model_ref| {
+                let entry = self.find_model_entry(&model_ref);
+                let (provider, id) = model_ref
+                    .split_once('/')
+                    .map(|(provider, id)| (provider.to_string(), id.to_string()))
+                    .unwrap_or_else(|| {
+                        (
+                            self.resolve_provider_name(&model_ref),
+                            model_ref.to_string(),
+                        )
+                    });
+                let effort = self.model_effort_options(&model_ref);
+                let input = entry
+                    .and_then(|model| model.input.clone())
+                    .filter(|input| !input.is_empty())
+                    .unwrap_or_else(|| vec!["text".to_string()]);
+                let reasoning = entry.and_then(|model| model.reasoning).unwrap_or(false)
+                    || effort.levels.iter().any(|level| level != "off");
+                ModelCatalogEntry {
+                    model_ref,
+                    provider,
+                    id: id.clone(),
+                    name: entry
+                        .and_then(|model| model.name.clone())
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(id),
+                    input,
+                    reasoning,
+                    efforts: effort.levels,
+                    default_effort: effort.default,
+                }
+            })
+            .collect()
+    }
 }
 
 fn sanitize_loaded_json_config_with_lookup_and_status<F>(
@@ -1341,15 +1426,24 @@ where
     );
 
     for (name, provider) in providers.iter_mut() {
+        let mut model_index = 0_usize;
         provider.models.retain(|model| {
-            if model.id.trim().is_empty() {
-                eprintln!(
-                    "WARNING: Ignoring invalid models.providers.{name}.models entry with empty id."
-                );
-                false
+            let index = model_index;
+            model_index += 1;
+            let validation = if model.id.trim().is_empty() {
+                Err(format!(
+                    "Invalid models.providers.{name}.models[{index}].id: model id cannot be empty."
+                ))
+            } else if let Some(effort) = model.effort.as_ref() {
+                validate_model_effort_config(name, index, model, effort)
             } else {
-                true
+                Ok(())
+            };
+            if let Err(error) = validation {
+                eprintln!("WARNING: Ignoring invalid model: {error}");
+                return false;
             }
+            true
         });
     }
 
@@ -1612,6 +1706,8 @@ pub(crate) struct JsonModelEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<JsonModelEffortConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cost: Option<serde_json::Value>,
@@ -1621,6 +1717,36 @@ pub(crate) struct JsonModelEntry {
     pub(crate) max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) compat: Option<serde_json::Value>,
+}
+
+pub(crate) const THINKING_EFFORT_LEVELS: &[&str] = &[
+    "auto", "off", "minimal", "low", "medium", "high", "xhigh", "max",
+];
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JsonModelEffortConfig {
+    pub(crate) levels: Vec<String>,
+    pub(crate) default: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelEffortOptions {
+    pub(crate) levels: Vec<String>,
+    pub(crate) default: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelCatalogEntry {
+    #[serde(rename = "ref")]
+    pub(crate) model_ref: String,
+    pub(crate) provider: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) input: Vec<String>,
+    pub(crate) reasoning: bool,
+    pub(crate) efforts: Vec<String>,
+    pub(crate) default_effort: String,
 }
 
 pub(crate) fn validate_json_provider_names(json_cfg: &JsonConfig) -> Result<(), String> {
@@ -1780,9 +1906,94 @@ pub(crate) fn validate_json_provider_models(json_cfg: &JsonConfig) -> Result<(),
                     "Invalid models.providers.{name}.models[{index}].id: model id cannot be empty."
                 ));
             }
+            if let Some(effort) = model.effort.as_ref() {
+                validate_model_effort_config(name, index, model, effort)?;
+            }
         }
     }
 
+    Ok(())
+}
+
+/// Canonicalize the order of validated model Effort arrays without
+/// round-tripping the complete configuration through `JsonConfig`. Settings
+/// intentionally preserves unknown Provider and Model metadata, so this
+/// helper edits only the known `models.providers.*.models[].effort.levels`
+/// arrays in the original JSON value.
+pub(crate) fn normalize_json_model_effort_order(config_value: &mut serde_json::Value) {
+    let Some(providers) = config_value
+        .get_mut("models")
+        .and_then(|models| models.get_mut("providers"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for provider in providers.values_mut() {
+        let Some(models) = provider
+            .get_mut("models")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for model in models {
+            let Some(levels) = model
+                .get_mut("effort")
+                .and_then(|effort| effort.get_mut("levels"))
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            levels.sort_by_key(|level| {
+                level
+                    .as_str()
+                    .and_then(|value| {
+                        THINKING_EFFORT_LEVELS
+                            .iter()
+                            .position(|candidate| *candidate == value)
+                    })
+                    .unwrap_or(THINKING_EFFORT_LEVELS.len())
+            });
+        }
+    }
+}
+
+fn validate_model_effort_config(
+    provider_name: &str,
+    model_index: usize,
+    model: &JsonModelEntry,
+    effort: &JsonModelEffortConfig,
+) -> Result<(), String> {
+    let path = format!("models.providers.{provider_name}.models[{model_index}].effort");
+    if effort.levels.is_empty() {
+        return Err(format!(
+            "Invalid {path}.levels: at least one effort is required."
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for level in &effort.levels {
+        if !THINKING_EFFORT_LEVELS.contains(&level.as_str()) {
+            return Err(format!(
+                "Invalid {path}.levels: unsupported effort '{level}'. Expected one of: {}.",
+                THINKING_EFFORT_LEVELS.join(", ")
+            ));
+        }
+        if !seen.insert(level) {
+            return Err(format!(
+                "Invalid {path}.levels: duplicate effort '{level}'."
+            ));
+        }
+    }
+    if !effort.levels.iter().any(|level| level == &effort.default) {
+        return Err(format!(
+            "Invalid {path}.default: '{}' must be included in levels.",
+            effort.default
+        ));
+    }
+    if !model.reasoning.unwrap_or(false) && effort.levels.iter().any(|level| level != "off") {
+        return Err(format!(
+            "Invalid {path}.levels: non-'off' efforts require reasoning=true."
+        ));
+    }
     Ok(())
 }
 

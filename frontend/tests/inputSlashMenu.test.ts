@@ -35,6 +35,7 @@ describe('input slash command menu', () => {
     state.composerSessionIdentityPending = false;
     state.sessionSwitchInFlight = false;
     state.sessionIdentityMutationInFlight = false;
+    state.composerModelSwitchInFlight = false;
     state.imageUploadInFlight = false;
     state.storageMode = 'healthy';
   });
@@ -256,6 +257,26 @@ describe('input slash command menu', () => {
 
     expect(sendMock).not.toHaveBeenCalled();
     expect(stateModule.dom.input!.value).toBe('describe the uploaded image');
+  });
+
+  it('does not send while an atomic model selection is still being saved', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+    stateModule.state.composerModelSwitchInFlight = true;
+
+    const { send } = await import('../src/input.js');
+    stateModule.dom.input!.value = 'run with the new model';
+    send();
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(stateModule.dom.input!.value).toBe('run with the new model');
   });
 
   it('normalizes mixed-case slash commands on Enter instead of sending them unchanged', async () => {

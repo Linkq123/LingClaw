@@ -1062,11 +1062,12 @@ async fn prepare_analyze_snapshot(
     }
 
     phase_state.cycle_workspace = session.workspace.clone();
+    let think_level = config.normalize_model_effort(&model_str, &session.think_level);
 
     Some(AnalyzeSnapshot {
         model: model_str,
         usage_role,
-        think_level: session.think_level.clone(),
+        think_level,
         pruned_count: 0,
         user_msg_chars,
         latest_query,

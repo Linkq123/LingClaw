@@ -77,6 +77,60 @@ describe('settings validation', () => {
     expect(isBuiltinProviderName('openai-responses')).toBe(true);
   });
 
+  it('accepts a valid reasoning effort contract', () => {
+    expect(() =>
+      validateModelsConfigDraftShape({
+        providers: {
+          gateway: {
+            api: 'openai-responses',
+            baseUrl: 'https://gateway.example/v1',
+            apiKey: 'secret',
+            models: [
+              {
+                id: 'reasoner',
+                reasoning: true,
+                effort: { levels: ['auto', 'medium', 'high'], default: 'medium' },
+              },
+            ],
+          },
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects invalid reasoning effort contracts', () => {
+    const configWithEffort = (effort: unknown, reasoning = true) => ({
+      providers: {
+        gateway: {
+          api: 'openai-responses',
+          baseUrl: 'https://gateway.example/v1',
+          apiKey: 'secret',
+          models: [{ id: 'reasoner', reasoning, effort }],
+        },
+      },
+    });
+
+    expect(() =>
+      validateModelsConfigDraftShape(configWithEffort({ levels: [], default: 'auto' })),
+    ).toThrow('cannot be empty');
+    expect(() =>
+      validateModelsConfigDraftShape(
+        configWithEffort({ levels: ['medium', 'medium'], default: 'medium' }),
+      ),
+    ).toThrow('duplicates');
+    expect(() =>
+      validateModelsConfigDraftShape(configWithEffort({ levels: ['medium'], default: 'high' })),
+    ).toThrow('included in levels');
+    expect(() =>
+      validateModelsConfigDraftShape(configWithEffort({ levels: ['turbo'], default: 'turbo' })),
+    ).toThrow('unsupported');
+    expect(() =>
+      validateModelsConfigDraftShape(
+        configWithEffort({ levels: ['off', 'high'], default: 'off' }, false),
+      ),
+    ).toThrow('reasoning=true');
+  });
+
   it('rejects providers that omit apiKey', () => {
     expect(() =>
       validateModelsConfigDraftShape({

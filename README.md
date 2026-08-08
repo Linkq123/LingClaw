@@ -108,7 +108,7 @@ Session、Group、消息、Todos、Usage 和 Sub-agent 快照存放在 `~/.lingc
 
 LingClaw 使用 `Analyze → Act → Observe → Finish` 的 ReAct 状态机组织每轮工作。推理、工具调用、计划、Sub-agent 和 Orchestration 会聚合为可展开的执行栈；你可以查看过程、检查工具结果、在运行中追加指令或立即停止。
 
-输入区可按 Session 切换“执行 / 规划”。规划模式只做只读分析和必要提问，并生成带版本、步骤、风险与验收标准的结构化计划；批准后，Runtime 会在每个执行 cycle 注入精确 revision，并持续回写步骤进度与偏离原因。工作区证据变化时必须刷新计划或明确选择继续，批准动作不会伪造用户消息。Group 当前不开放规划模式。
+输入区默认直接执行；需要规划时，从始终可打开的 `+` 菜单进入，界面才显示“规划”标记。规划模式只做只读分析和必要提问，并生成带版本、步骤、风险与验收标准的结构化计划；批准后，Runtime 会在每个执行 cycle 注入精确 revision，并持续回写步骤进度与偏离原因。工作区证据变化时必须刷新计划或明确选择继续，批准动作不会伪造用户消息。Group 当前不开放规划模式。
 
 ### 连接不同模型与协议
 
@@ -120,7 +120,7 @@ LingClaw 使用 `Analyze → Act → Observe → Finish` 的 ReAct 状态机组�
 - Gemini
 - Ollama
 
-模型按 `provider/model` 路由。Primary、Fast、Sub-agent、Memory、Reflection 和 Context 可以分别配置，Session 也可以保存自己的 `/model` 覆盖。
+模型按 `provider/model` 路由。Primary、Fast、Sub-agent、Memory、Reflection 和 Context 可以分别配置。普通 Session 可直接在输入区搜索并原子切换模型与其允许的 Thinking Effort，选择会持久化；`/model` 与 `/think` 保持兼容。
 
 ### 用 Session 隔离上下文，用 Group 组织协作
 
@@ -158,7 +158,7 @@ Group 上下文栏提供“全部 / 已选 / @提及”三种派发模式。Main
   <img src="docs/assets/readme/zh/mobile.webp" alt="LingClaw 中文移动端工作台" width="390">
 </p>
 
-会话导航在手机上使用全屏抽屉，工具详情改为底部面板，输入区适配安全区域与多行内容。关键触控目标不小于 44px，并保留键盘、焦点返回和减少动效支持。
+会话导航在手机上使用全屏抽屉，工具详情改为底部面板。双层输入区把多行正文与附件、模型/Effort、规划、停止和发送操作分开；图片不可用时 `+` 菜单仍会解释原因。关键触控目标不小于 44px，并保留键盘、焦点返回和减少动效支持。
 
 ### 全屏 Console 与可视化 Usage
 

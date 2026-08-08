@@ -68,6 +68,10 @@
             "id": "gpt-5.5",
             "name": "gpt-5.5",
             "reasoning": true,
+            "effort": {
+              "levels": ["auto", "low", "medium", "high", "xhigh"],
+              "default": "medium"
+            },
             "compat": {
               "reasoning": {
                 "summary": "auto"

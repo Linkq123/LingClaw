@@ -108,7 +108,7 @@ See the [deployment guide](docs/deploy.en.md) for installation details, systemd,
 
 LingClaw organizes every run as an `Analyze → Act → Observe → Finish` ReAct state machine. Reasoning, tool calls, plans, sub-agents, and orchestration appear in an expandable execution stack. You can inspect the process, review tool output, add delayed guidance, or stop a run immediately.
 
-The composer exposes per-session Execute and Plan modes. Plan Mode performs read-only analysis, asks only blocking questions, and produces a versioned artifact with steps, risks, and acceptance criteria. Once approved, the runtime injects that exact revision into every execution cycle and records step progress and deviations. Changed workspace evidence requires a refresh or explicit override, and approval never fabricates a user message. Plan Mode is currently unavailable in groups.
+The composer executes by default. Choose Plan Mode from the always-available `+` menu only when needed, and the Plan chip appears only then. Plan Mode performs read-only analysis, asks only blocking questions, and produces a versioned artifact with steps, risks, and acceptance criteria. Once approved, the runtime injects that exact revision into every execution cycle and records step progress and deviations. Changed workspace evidence requires a refresh or explicit override, and approval never fabricates a user message. Plan Mode is currently unavailable in groups.
 
 ### Route work across models and protocols
 
@@ -120,7 +120,7 @@ The same session and tool system supports:
 - Gemini
 - Ollama
 
-Models use `provider/model` routing. Primary, Fast, Sub-agent, Memory, Reflection, and Context roles can use different models, while each session may persist its own `/model` override.
+Models use `provider/model` routing. Primary, Fast, Sub-agent, Memory, Reflection, and Context roles can use different models. A regular session can search and atomically switch its model and allowed Thinking Effort directly in the composer; the choice persists, while `/model` and `/think` remain compatible.
 
 ### Isolate context with sessions and collaborate through groups
 
@@ -158,7 +158,7 @@ The group context bar provides All, Selected, and @mention dispatch modes. Main 
   <img src="docs/assets/readme/en/mobile.webp" alt="LingClaw mobile workspace" width="390">
 </p>
 
-Session navigation becomes a full-screen drawer on phones, tool details become a bottom sheet, and the composer respects safe areas and multiline content. Critical touch targets remain at least 44px, with keyboard navigation, focus return, and reduced-motion support intact.
+Session navigation becomes a full-screen drawer on phones, and tool details become a bottom sheet. The two-level composer separates multiline content from attachments, model/Effort, Plan, stop, and send actions; when images are unavailable, the `+` menu still explains why. Critical touch targets remain at least 44px, with keyboard navigation, focus return, and reduced-motion support intact.
 
 ### Full-screen Console and visual Usage
 

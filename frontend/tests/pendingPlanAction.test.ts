@@ -39,8 +39,9 @@ function mountDom() {
     <button id="stop"></button>
     <button id="send"></button>
     <span id="send-icon"></span>
-    <button id="execute-mode-toggle"></button>
-    <button id="plan-mode-toggle"></button>
+    <button id="plan-mode-menu-item" aria-pressed="false"></button>
+    <small id="plan-mode-menu-reason" hidden></small>
+    <button id="plan-mode-indicator" hidden><span></span></button>
     <div id="plan-progress" hidden></div>
   `;
   dom.chat = document.getElementById('chat') as HTMLElement;
@@ -48,8 +49,9 @@ function mountDom() {
   dom.stopBtn = document.getElementById('stop') as HTMLButtonElement;
   dom.sendBtn = document.getElementById('send') as HTMLButtonElement;
   dom.sendIcon = document.getElementById('send-icon');
-  dom.executeModeToggle = document.getElementById('execute-mode-toggle') as HTMLButtonElement;
-  dom.planModeToggle = document.getElementById('plan-mode-toggle') as HTMLButtonElement;
+  dom.planModeMenuItem = document.getElementById('plan-mode-menu-item') as HTMLButtonElement;
+  dom.planModeMenuReason = document.getElementById('plan-mode-menu-reason');
+  dom.planModeIndicator = document.getElementById('plan-mode-indicator') as HTMLButtonElement;
   dom.planProgress = document.getElementById('plan-progress') as HTMLElement;
 }
 
@@ -95,8 +97,9 @@ describe('pending plan action', () => {
     dom.stopBtn = null;
     dom.sendBtn = null;
     dom.sendIcon = null;
-    dom.executeModeToggle = null;
-    dom.planModeToggle = null;
+    dom.planModeMenuItem = null;
+    dom.planModeMenuReason = null;
+    dom.planModeIndicator = null;
     dom.planProgress = null;
   });
 
@@ -332,14 +335,18 @@ describe('pending plan action', () => {
       progress: [{ id: 'finish', title: 'Finish alpha', status: 'pending' }],
     });
 
-    expect(dom.executeModeToggle?.disabled).toBe(true);
+    expect(dom.planModeMenuItem?.disabled).toBe(false);
+    expect(dom.planModeMenuItem?.getAttribute('aria-disabled')).toBe('true');
+    expect(dom.planModeIndicator?.hidden).toBe(false);
 
     clearPlanStateForSessionTransition('session-beta');
 
     expect(state.activePlan).toBeNull();
     expect(state.pendingPlanId).toBe('');
-    expect(dom.executeModeToggle?.disabled).toBe(false);
-    expect(dom.executeModeToggle?.title).toBe('');
+    expect(dom.planModeMenuItem?.disabled).toBe(false);
+    expect(dom.planModeMenuItem?.getAttribute('aria-disabled')).toBe('false');
+    expect(dom.planModeMenuItem?.title).toBe('');
+    expect(dom.planModeIndicator?.hidden).toBe(true);
     expect(document.querySelector('.plan-artifact-card')).toBeNull();
   });
 
@@ -1068,8 +1075,9 @@ describe('pending plan action', () => {
       <button id="stop"></button>
       <button id="send"></button>
       <span id="send-icon"></span>
-      <button id="execute-mode-toggle"></button>
-      <button id="plan-mode-toggle"></button>
+      <button id="plan-mode-menu-item" aria-pressed="false"></button>
+      <small id="plan-mode-menu-reason" hidden></small>
+      <button id="plan-mode-indicator" hidden><span></span></button>
       <div id="plan-progress" hidden></div>
     `;
     dom.chat = document.getElementById('chat') as HTMLElement;
@@ -1077,8 +1085,9 @@ describe('pending plan action', () => {
     dom.stopBtn = document.getElementById('stop') as HTMLButtonElement;
     dom.sendBtn = document.getElementById('send') as HTMLButtonElement;
     dom.sendIcon = document.getElementById('send-icon');
-    dom.executeModeToggle = document.getElementById('execute-mode-toggle') as HTMLButtonElement;
-    dom.planModeToggle = document.getElementById('plan-mode-toggle') as HTMLButtonElement;
+    dom.planModeMenuItem = document.getElementById('plan-mode-menu-item') as HTMLButtonElement;
+    dom.planModeMenuReason = document.getElementById('plan-mode-menu-reason');
+    dom.planModeIndicator = document.getElementById('plan-mode-indicator') as HTMLButtonElement;
     dom.planProgress = document.getElementById('plan-progress') as HTMLElement;
 
     const base = {
@@ -1193,7 +1202,7 @@ describe('pending plan action', () => {
     },
   );
 
-  it('keeps Execute mode unavailable while an unresolved plan is active', () => {
+  it('locks the Plan marker while an unresolved plan is active', () => {
     const plan = {
       plan_id: 'plan_mode_lock',
       revision: 1,
@@ -1212,10 +1221,12 @@ describe('pending plan action', () => {
     renderPlanState(plan);
 
     expect(state.planModeEnabled).toBe(true);
-    expect(dom.planModeToggle?.getAttribute('aria-pressed')).toBe('true');
-    expect(dom.executeModeToggle?.getAttribute('aria-pressed')).toBe('false');
-    expect(dom.executeModeToggle?.disabled).toBe(true);
-    expect(dom.executeModeToggle?.title).not.toBe('');
+    expect(dom.planModeMenuItem?.getAttribute('aria-pressed')).toBe('true');
+    expect(dom.planModeMenuItem?.disabled).toBe(false);
+    expect(dom.planModeMenuItem?.getAttribute('aria-disabled')).toBe('true');
+    expect(dom.planModeIndicator?.hidden).toBe(false);
+    expect(dom.planModeIndicator?.disabled).toBe(true);
+    expect(dom.planModeIndicator?.title).not.toBe('');
 
     renderPlanState({
       ...plan,
@@ -1224,9 +1235,11 @@ describe('pending plan action', () => {
     });
 
     expect(state.planModeEnabled).toBe(false);
-    expect(dom.executeModeToggle?.disabled).toBe(false);
-    expect(dom.executeModeToggle?.getAttribute('aria-pressed')).toBe('true');
-    expect(dom.executeModeToggle?.title).toBe('');
+    expect(dom.planModeMenuItem?.disabled).toBe(false);
+    expect(dom.planModeMenuItem?.getAttribute('aria-disabled')).toBe('false');
+    expect(dom.planModeMenuItem?.getAttribute('aria-pressed')).toBe('false');
+    expect(dom.planModeMenuItem?.title).toBe('');
+    expect(dom.planModeIndicator?.hidden).toBe(true);
   });
 
   it('offers revision instead of execution for a stopped unapproved planning run', () => {

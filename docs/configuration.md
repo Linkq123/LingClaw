@@ -118,6 +118,7 @@ Settings → Models 的 Test 操作会发送一个轻量请求验证端点。它
 | `id` | 上游模型 ID，必填 |
 | `name` | 展示名称；省略时使用 ID |
 | `reasoning` | 模型是否支持推理 effort |
+| `effort` | 可选的 Effort 级别与默认值；仅影响当前模型允许用户选择的范围 |
 | `input` | `text` 和可选 `image` 能力声明 |
 | `contextWindow` | 上下文窗口 Token |
 | `maxTokens` | 单次最大输出 Token |
@@ -125,6 +126,25 @@ Settings → Models 的 Test 操作会发送一个轻量请求验证端点。它
 | `compat` | Provider/模型兼容覆盖 |
 
 `input: ["text", "image"]` 是 LingClaw 暴露图片附件和工具图片能力的必要条件之一，不代表上游端点一定接受所有组合。OpenAI-compatible Chat 在明确拒绝图片/tool 内容时会移除工具图片并重试一次；普通鉴权、限流或 schema 错误不会触发该降级。
+
+### Thinking Effort
+
+推理模型可以显式限制输入区与 `/think` 可选择的 Effort，并指定切换到该模型时使用的默认值：
+
+```json
+{
+  "id": "reasoning-model",
+  "reasoning": true,
+  "effort": {
+    "levels": ["auto", "low", "medium", "high"],
+    "default": "medium"
+  }
+}
+```
+
+可配置值按固定顺序为 `auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。`levels` 不能为空或重复，`default` 必须包含在 `levels` 中；除 `off` 外的值要求 `reasoning: true`。关闭 Reasoning 会清除非 `off` 的 Effort 配置。
+
+旧版推理模型没有 `effort` 时继续兼容完整集合并默认使用 `auto`；非推理模型等效为 `levels: ["off"]`。输入区会把模型与 Effort 作为当前 Session 的一个原子选择持久化；切换模型时，若原 Effort 不受支持则使用目标模型的 `default`。Settings 热重载移除了当前 Effort 后也会执行相同规范化并保存。
 
 ### Thinking compatibility
 
@@ -150,7 +170,7 @@ OpenAI-compatible 模型可以设置 `compat.thinkingFormat`。Settings 下拉�
 }
 ```
 
-不同模型对 `off`、`minimal`、`xhigh` 和 `max` 的支持并不一致。LingClaw 会按已知方言收敛到上游接受的级别；`/status` 显示当前解析后的模型与 think 状态。
+模型配置定义用户可选范围，`compat.thinkingFormat` 则负责把已选 Effort 映射到上游方言。不同模型对 `off`、`minimal`、`xhigh` 和 `max` 的支持并不一致；`/status` 显示当前解析后的模型与 think 状态。
 
 ## Agent 模型路由
 

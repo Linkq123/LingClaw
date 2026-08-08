@@ -2528,6 +2528,66 @@ async fn delete_session_with_safety_checks_guards_current_and_delegated_work() {
 }
 
 #[tokio::test]
+async fn delete_session_waits_for_in_flight_session_persistence() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "delete-persist-gate-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session = test_session_with_workspace(&session_id, "Delete Persist Gate", workspace);
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("session should save");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let persist_gate = session_store::session_persist_gate(&session_id);
+    let persist_guard = persist_gate.lock().await;
+    let control_lock = session_control_lock(&state, &session_id).await;
+    let delete_state = Arc::clone(&state);
+    let delete_session_id = session_id.clone();
+    let delete_task = tokio::spawn(async move {
+        delete_session_with_safety_checks(&delete_state, &delete_session_id, Some(MAIN_SESSION_ID))
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if control_lock.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete should reach the Session control lock");
+    assert!(
+        !delete_task.is_finished(),
+        "delete must wait for the shared Session persistence gate"
+    );
+    assert!(state.sessions.lock().await.contains_key(&session_id));
+
+    drop(persist_guard);
+    let message = delete_task
+        .await
+        .expect("delete task should not panic")
+        .expect("delete should succeed after persistence finishes");
+    assert!(message.contains("Deleted"));
+    assert!(!state.sessions.lock().await.contains_key(&session_id));
+    assert!(session_store::load_session_from_disk(&session_id).is_none());
+    cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
 async fn delete_session_prunes_ghost_member_from_all_groups() {
     let _guard = control_registry_test_guard();
     clear_direct_runs_for_test();

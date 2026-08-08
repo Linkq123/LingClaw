@@ -80,6 +80,7 @@ fn configured_models_available_uses_the_runtime_provider_catalog() {
                 id: "good".to_string(),
                 name: None,
                 reasoning: None,
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: None,
@@ -153,6 +154,7 @@ async fn invalid_session_override_blocks_the_global_model_fallback() {
         &session.name,
         &snapshot.config,
         &model,
+        "off",
         true,
         override_configured,
         effective_configured,
@@ -163,6 +165,8 @@ async fn invalid_session_override_blocks_the_global_model_fallback() {
     assert_eq!(payload["modelOverridePresent"], true);
     assert_eq!(payload["modelOverrideConfigured"], false);
     assert_eq!(payload["effectiveModelConfigured"], false);
+    assert_eq!(payload["model"], "removed-provider/model");
+    assert_eq!(payload["effort"], "off");
     assert_eq!(payload["configRevision"], config_revision);
 }
 
@@ -179,6 +183,7 @@ fn session_payload_exposes_the_validated_global_model_state() {
         "Main",
         &config,
         "gpt-4o-mini",
+        "off",
         false,
         false,
         false,
@@ -190,6 +195,8 @@ fn session_payload_exposes_the_validated_global_model_state() {
     assert_eq!(payload["modelOverridePresent"], false);
     assert_eq!(payload["modelOverrideConfigured"], false);
     assert_eq!(payload["effectiveModelConfigured"], false);
+    assert_eq!(payload["model"], "gpt-4o-mini");
+    assert_eq!(payload["effort"], "off");
     assert_eq!(payload["configRevision"], config_revision);
 }
 
@@ -395,6 +402,48 @@ fn test_app_state_with_config(config: Config) -> AppState {
         hooks: HookRegistry::new(),
         memory_queue: std::sync::Mutex::new(None),
     }
+}
+
+fn session_model_preferences_config() -> Config {
+    let mut config = test_config();
+    config.provider_catalog_declared = true;
+    config.model = "gateway/reasoner".to_string();
+    config.providers.insert(
+        "gateway".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "session-model-secret".to_string(),
+            api: "openai-responses".to_string(),
+            models: vec![
+                JsonModelEntry {
+                    id: "reasoner".to_string(),
+                    name: Some("Gateway Reasoner".to_string()),
+                    reasoning: Some(true),
+                    effort: Some(crate::config::JsonModelEffortConfig {
+                        levels: vec!["low".to_string(), "medium".to_string(), "high".to_string()],
+                        default: "medium".to_string(),
+                    }),
+                    input: Some(vec!["text".to_string(), "image".to_string()]),
+                    cost: None,
+                    context_window: Some(128_000),
+                    max_tokens: Some(16_000),
+                    compat: None,
+                },
+                JsonModelEntry {
+                    id: "plain".to_string(),
+                    name: Some("Plain Text".to_string()),
+                    reasoning: Some(false),
+                    effort: None,
+                    input: Some(vec!["text".to_string()]),
+                    cost: None,
+                    context_window: Some(32_000),
+                    max_tokens: Some(4_000),
+                    compat: None,
+                },
+            ],
+        },
+    );
+    config
 }
 
 #[tokio::test]
@@ -1712,6 +1761,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3345,6 +3395,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
                 id: "llama3.2".to_string(),
                 name: None,
                 reasoning: Some(true),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3411,6 +3462,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3429,6 +3481,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3501,6 +3554,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(1_000_000),
@@ -3519,6 +3573,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3583,6 +3638,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3601,6 +3657,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3665,6 +3722,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(1_000_000),
@@ -3683,6 +3741,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(200000),
@@ -3747,6 +3806,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
                 id: "qwen3".to_string(),
                 name: None,
                 reasoning: Some(true),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3765,6 +3825,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
                 id: "qwen3".to_string(),
                 name: None,
                 reasoning: Some(true),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(256000),
@@ -3831,6 +3892,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
                 id: "claude-opus-4-7".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(1_000_000),
@@ -3894,6 +3956,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3912,6 +3975,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3977,6 +4041,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -3995,6 +4060,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -4058,6 +4124,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
                 id: "gpt-4o".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -4121,6 +4188,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
                 id: "gpt-4o".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -4381,6 +4449,7 @@ fn build_session_status_reports_resolved_target() {
                 id: "claude-opus-4-7".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(1_000_000),
@@ -5932,6 +6001,220 @@ async fn api_client_config_returns_upload_token_and_s3_identity() {
 
     assert_eq!(payload["upload_token"], state.upload_token);
     assert_eq!(payload["s3_config_id"], expected_s3_config_id);
+}
+
+#[tokio::test]
+async fn session_models_api_returns_a_safe_catalog_and_persists_model_effort_atomically() {
+    let session_id = format!("session-model-api-{}-{}", std::process::id(), now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let state = Arc::new(test_app_state_with_config(
+        session_model_preferences_config(),
+    ));
+    let mut session = test_session(&session_id, "Session Model API", Some("gateway/reasoner"));
+    session.think_level = "low".to_string();
+    session.workspace = workspace;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let Json(catalog) = api_session_models(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        State(state.clone()),
+    )
+    .await
+    .expect("safe model catalog should load");
+    assert_eq!(catalog["session"]["model"], "gateway/reasoner");
+    assert_eq!(catalog["session"]["effort"], "low");
+    assert_eq!(catalog["session"]["modelOverridePresent"], true);
+    assert_eq!(catalog["session"]["modelOverrideConfigured"], true);
+    assert_eq!(catalog["session"]["effectiveModelConfigured"], true);
+    assert_eq!(catalog["capabilities"]["image"], true);
+    assert_eq!(catalog["models"][0]["provider"], "gateway");
+    assert_eq!(catalog["models"][0]["efforts"], json!(["off"]));
+    assert_eq!(
+        catalog["models"][1]["efforts"],
+        json!(["low", "medium", "high"])
+    );
+    assert!(!catalog.to_string().contains("session-model-secret"));
+    assert!(!catalog.to_string().contains("gateway.example"));
+
+    let revision_before = catalog["configRevision"].as_u64().unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let Json(updated) = api_put_session_models(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers.clone(),
+        State(state.clone()),
+        Json(SessionModelUpdateRequest {
+            model: "gateway/plain".to_string(),
+            effort: "off".to_string(),
+        }),
+    )
+    .await
+    .expect("model and effort should update together");
+    assert_eq!(updated["session"]["model"], "gateway/plain");
+    assert_eq!(updated["session"]["effort"], "off");
+    assert_eq!(updated["session"]["modelOverridePresent"], true);
+    assert_eq!(updated["session"]["effectiveModelConfigured"], true);
+    assert_eq!(updated["capabilities"]["image"], false);
+    assert!(updated["configRevision"].as_u64().unwrap_or_default() > revision_before);
+
+    let persisted = load_session_from_disk(&session_id).expect("Session should be persisted");
+    assert_eq!(persisted.model_override.as_deref(), Some("gateway/plain"));
+    assert_eq!(persisted.think_level, "off");
+
+    let (status, Json(error)) = api_put_session_models(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+        Json(SessionModelUpdateRequest {
+            model: "gateway/plain".to_string(),
+            effort: "high".to_string(),
+        }),
+    )
+    .await
+    .expect_err("unsupported effort should be rejected");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["code"], "effort_not_supported");
+    let session = state.sessions.lock().await;
+    assert_eq!(
+        session[&session_id].model_override.as_deref(),
+        Some("gateway/plain")
+    );
+    assert_eq!(session[&session_id].think_level, "off");
+}
+
+#[tokio::test]
+async fn session_model_update_rejects_an_active_run_before_persisting() {
+    let session_id = format!("session-model-busy-{}-{}", std::process::id(), now_epoch());
+    let state = test_app_state_with_config(session_model_preferences_config());
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        test_session(&session_id, "Busy Session", Some("gateway/reasoner")),
+    );
+    state.active_runs.lock().await.insert(
+        session_id.clone(),
+        SessionRunBinding {
+            connection_id: 1,
+            cancel: CancellationToken::new(),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+        },
+    );
+
+    let error = update_session_model_preferences(
+        &state,
+        &session_id,
+        Some("gateway/plain"),
+        Some("off"),
+        true,
+    )
+    .await
+    .err()
+    .expect("active run should own the model snapshot");
+    assert_eq!(error.code, "session_busy");
+    let sessions = state.sessions.lock().await;
+    assert_eq!(
+        sessions[&session_id].model_override.as_deref(),
+        Some("gateway/reasoner")
+    );
+}
+
+#[tokio::test]
+async fn config_reload_normalizes_unsupported_loaded_session_effort() {
+    let session_id = format!(
+        "session-model-normalize-{}-{}",
+        std::process::id(),
+        now_epoch()
+    );
+    let workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let config = session_model_preferences_config();
+    let state = test_app_state_with_config(config.clone());
+    let mut session = test_session(
+        &session_id,
+        "Normalize Session Effort",
+        Some("gateway/reasoner"),
+    );
+    session.think_level = "max".to_string();
+    session.workspace = workspace;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session.clone());
+    save_session_to_disk_locked(&session)
+        .await
+        .expect("loaded Session should already be durable before reload");
+
+    normalize_session_model_efforts(&state, &config)
+        .await
+        .expect("normalization should persist");
+
+    assert_eq!(
+        state.sessions.lock().await[&session_id].think_level,
+        "medium"
+    );
+    assert_eq!(
+        load_session_from_disk(&session_id)
+            .expect("normalized Session should persist")
+            .think_level,
+        "medium"
+    );
+}
+
+#[tokio::test]
+async fn config_reload_normalizes_unsupported_unloaded_session_effort() {
+    let session_id = format!(
+        "session-model-normalize-unloaded-{}-{}",
+        std::process::id(),
+        now_epoch()
+    );
+    let workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let config = session_model_preferences_config();
+    let state = test_app_state_with_config(config.clone());
+    let mut session = test_session(
+        &session_id,
+        "Normalize Unloaded Session Effort",
+        Some("gateway/reasoner"),
+    );
+    session.think_level = "max".to_string();
+    session.workspace = workspace;
+    save_session_to_disk_locked(&session)
+        .await
+        .expect("unloaded Session should persist before reload");
+    assert!(!state.sessions.lock().await.contains_key(&session_id));
+
+    normalize_session_model_efforts(&state, &config)
+        .await
+        .expect("normalization should include unloaded Sessions");
+
+    assert!(!state.sessions.lock().await.contains_key(&session_id));
+    assert_eq!(
+        load_session_from_disk(&session_id)
+            .expect("normalized unloaded Session should remain persisted")
+            .think_level,
+        "medium"
+    );
 }
 
 #[tokio::test]
@@ -8762,7 +9045,47 @@ fn handle_command_persists_model_think_and_react_changes() {
     session.workspace = workspace.clone();
     session.version = SESSION_VERSION;
 
-    let state = test_app_state();
+    let mut config = test_config();
+    config.provider_catalog_declared = true;
+    config.providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "openai-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "gpt-4o-mini".to_string(),
+                name: None,
+                reasoning: Some(false),
+                effort: None,
+                input: Some(vec!["text".to_string()]),
+                cost: None,
+                context_window: None,
+                max_tokens: None,
+                compat: None,
+            }],
+        },
+    );
+    config.providers.insert(
+        "anthropic".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key: "anthropic-key".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![JsonModelEntry {
+                id: "claude-sonnet-4-6".to_string(),
+                name: None,
+                reasoning: Some(true),
+                effort: None,
+                input: Some(vec!["text".to_string()]),
+                cost: None,
+                context_window: None,
+                max_tokens: None,
+                compat: None,
+            }],
+        },
+    );
+    let state = test_app_state_with_config(config);
     {
         let mut sessions = rt.block_on(state.sessions.lock());
         sessions.insert(session_id.clone(), session);
@@ -14139,6 +14462,7 @@ fn context_input_budget_reserves_headroom() {
                 id: "claude-opus-4-7".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(1_000_000),

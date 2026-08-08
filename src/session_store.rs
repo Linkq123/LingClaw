@@ -23,6 +23,8 @@ use crate::{
 
 use super::{AppState, ChatMessage};
 
+pub(crate) use crate::storage::SessionModelPreferences;
+
 #[derive(Clone)]
 #[cfg(test)]
 struct PersistedSessionCacheEntry {
@@ -615,6 +617,61 @@ async fn reset_session_context_on_disk_inner(session: &Session) -> Result<(), St
 
 pub(crate) async fn save_session_to_disk_locked(session: &Session) -> Result<(), String> {
     save_session_to_disk_inner(session).await
+}
+
+pub(crate) fn load_session_model_preferences_result(
+    id: &str,
+) -> Result<Option<SessionModelPreferences>, String> {
+    #[cfg(not(test))]
+    {
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .load_session_model_preferences_blocking(id)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    {
+        Ok(
+            load_session_from_storage_result(id)?.map(|session| SessionModelPreferences {
+                id: session.id,
+                model_override: session.model_override,
+                think_level: session.think_level,
+                updated_at: session.updated_at,
+            }),
+        )
+    }
+}
+
+/// Persist only the model-effort portion of a Session while its persist gate
+/// is held. Config hot reload uses this path for every Session so it does not
+/// rewrite histories or create workspaces merely to normalize effort.
+pub(crate) async fn update_session_think_level_locked(
+    preferences: &SessionModelPreferences,
+) -> Result<bool, String> {
+    #[cfg(not(test))]
+    {
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .update_session_think_level(
+                &preferences.id,
+                &preferences.think_level,
+                preferences.updated_at,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    {
+        let Some(mut session) = load_session_from_storage_result(&preferences.id)? else {
+            return Ok(false);
+        };
+        session.think_level = preferences.think_level.clone();
+        session.updated_at = session.updated_at.max(preferences.updated_at);
+        save_session_to_disk_inner(&session).await?;
+        Ok(true)
+    }
 }
 
 pub(crate) async fn reset_session_context_on_disk_locked(session: &Session) -> Result<(), String> {

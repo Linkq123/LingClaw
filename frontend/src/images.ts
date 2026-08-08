@@ -3,6 +3,7 @@ import { addSystem } from './renderers/chat.js';
 import { tr } from './i18n.js';
 import { createIcon } from './icons.js';
 import { syncComposerAvailability } from './composerAvailability.js';
+import { closeComposerPopovers, registerComposerPopover } from './composerPopovers.js';
 import { renderSessionDrawer } from './renderers/sessions.js';
 
 // Guard: prevent double-registration on Vite HMR re-execution of main.ts.
@@ -56,6 +57,7 @@ function attachmentChangesBlocked(): boolean {
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
     state.composerSessionIdentityPending ||
+    state.composerModelSwitchInFlight ||
     state.imageUploadInFlight,
   );
 }
@@ -66,13 +68,27 @@ export function updateAttachButton() {
     state.sessionSwitchInFlight ||
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
-    state.composerSessionIdentityPending,
+    state.composerSessionIdentityPending ||
+    state.composerModelSwitchInFlight,
   );
-  const changesBlocked = attachmentChangesBlocked();
   if (dom.attachBtn) dom.attachBtn.style.display = '';
-  if (dom.attachBtn) dom.attachBtn.disabled = changesBlocked;
+  if (dom.attachBtn) {
+    dom.attachBtn.disabled = false;
+    dom.attachBtn.setAttribute('aria-disabled', 'false');
+  }
   if (dom.attachLocalBtn) {
-    dom.attachLocalBtn.hidden = changesBlocked || !(state.imageCapable && state.s3Capable);
+    const reason = imageAttachmentBlockReason();
+    dom.attachLocalBtn.hidden = false;
+    // Disabled menu items remain focusable so keyboard and screen-reader
+    // users can reach the localized explanation referenced below.
+    dom.attachLocalBtn.disabled = false;
+    dom.attachLocalBtn.setAttribute('aria-disabled', String(Boolean(reason)));
+    dom.attachLocalBtn.title = reason;
+    dom.attachLocalBtn.setAttribute('aria-describedby', 'attach-local-reason');
+    if (dom.attachLocalReason) {
+      dom.attachLocalReason.textContent = reason;
+      dom.attachLocalReason.hidden = !reason;
+    }
   }
   if (sessionTransitionBlocked) closeAttachPopup();
   syncPlanModeToggle();
@@ -82,34 +98,88 @@ export function updateAttachButton() {
   }
 }
 
+function imageAttachmentBlockReason(): string {
+  if (state.activeGroupId) return tr('group.imagesUnsupported');
+  if (state.storageMode === 'protected') return tr('storage.protectedLabel');
+  if (
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending
+  ) {
+    return tr('composer.sessionChangeInProgress');
+  }
+  if (state.composerModelSwitchInFlight) return tr('composer.modelSwitchSaving');
+  if (state.imageUploadInFlight) return tr('composer.uploadInProgress');
+  if (!state.imageCapable) return tr('composer.imageModelUnsupported');
+  if (!state.s3Capable) return tr('composer.imageStorageUnavailable');
+  return '';
+}
+
 export function syncPlanModeToggle() {
   const groupDisabled = Boolean(state.activeGroupId);
-  const executeDisabled = Boolean(
-    !groupDisabled &&
-    state.activePlan &&
-    ['planning', 'needs_input', 'ready'].includes(state.activePlan.status),
+  const identityBlocked = Boolean(
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending ||
+    state.composerModelSwitchInFlight,
+  );
+  const activePlan = Boolean(
+    state.activePlan && !['completed', 'discarded'].includes(state.activePlan.status),
   );
   if (groupDisabled) state.planModeEnabled = false;
-  if (dom.planModeToggle) {
-    dom.planModeToggle.setAttribute('aria-pressed', state.planModeEnabled ? 'true' : 'false');
-    dom.planModeToggle.classList.toggle('is-active', state.planModeEnabled);
-    dom.planModeToggle.disabled = groupDisabled;
-    dom.planModeToggle.title = groupDisabled ? tr('composer.groupPlanUnsupported') : '';
+  const reason = groupDisabled
+    ? tr('composer.groupPlanUnsupported')
+    : activePlan
+      ? tr('plan.composer.resolveActive')
+      : identityBlocked
+        ? tr(
+            state.composerModelSwitchInFlight
+              ? 'composer.modelSwitchSaving'
+              : 'composer.sessionChangeInProgress',
+          )
+        : '';
+  if (dom.planModeMenuItem) {
+    const selected = state.planModeEnabled || activePlan;
+    dom.planModeMenuItem.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    dom.planModeMenuItem.setAttribute('aria-checked', selected ? 'true' : 'false');
+    dom.planModeMenuItem.classList.toggle('is-active', selected);
+    dom.planModeMenuItem.disabled = false;
+    dom.planModeMenuItem.setAttribute('aria-disabled', String(Boolean(reason)));
+    dom.planModeMenuItem.title = reason;
+    if (dom.planModeMenuReason) {
+      dom.planModeMenuReason.textContent = reason;
+      dom.planModeMenuReason.hidden = !reason;
+    }
   }
-  if (dom.executeModeToggle) {
-    dom.executeModeToggle.setAttribute('aria-pressed', state.planModeEnabled ? 'false' : 'true');
-    dom.executeModeToggle.classList.toggle('is-active', !state.planModeEnabled);
-    dom.executeModeToggle.disabled = executeDisabled;
-    dom.executeModeToggle.title = executeDisabled ? tr('plan.composer.resolveActive') : '';
+  if (dom.planModeIndicator) {
+    const visible = !groupDisabled && (state.planModeEnabled || activePlan);
+    dom.planModeIndicator.hidden = !visible;
+    dom.planModeIndicator.disabled = activePlan;
+    const status =
+      activePlan && state.activePlan ? tr(`plan.status.${state.activePlan.status}`) : '';
+    const label = status ? `${tr('composer.planMode')} · ${status}` : tr('composer.planMode');
+    const labelNode = dom.planModeIndicator.querySelector('span');
+    if (labelNode) labelNode.textContent = label;
+    dom.planModeIndicator.title = activePlan
+      ? tr('plan.composer.resolveActive')
+      : tr('composer.cancelPlanMode');
+    dom.planModeIndicator.setAttribute(
+      'aria-label',
+      activePlan ? tr('plan.composer.resolveActive') : tr('composer.cancelPlanMode'),
+    );
   }
 }
 
 export function setPlanMode(enabled: boolean) {
   if (enabled && state.activeGroupId) return;
+  if (state.activePlan && !['completed', 'discarded'].includes(state.activePlan.status)) return;
   state.planModeEnabled = enabled;
   const sessionId = state.activeSessionId || 'main';
   state.planModesBySession.set(sessionId, enabled);
   syncPlanModeToggle();
+  closeAttachPopup(true);
 }
 
 export function togglePlanMode() {
@@ -166,24 +236,34 @@ export function syncRestoredSessionCapabilities(restored: boolean): void {
   updateAttachButton();
 }
 
-export function closeAttachPopup() {
+export function closeAttachPopup(returnFocus = false) {
+  const wasOpen = dom.attachPopup?.style.display !== 'none';
   if (dom.attachPopup) dom.attachPopup.style.display = 'none';
+  dom.attachBtn?.setAttribute('aria-expanded', 'false');
   if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
   if (dom.attachUploadStatus) dom.attachUploadStatus.style.display = 'none';
   if (dom.attachMenu) dom.attachMenu.style.display = 'flex';
+  if (returnFocus && wasOpen) queueMicrotask(() => dom.attachBtn?.focus());
 }
+
+registerComposerPopover('attachments', closeAttachPopup);
 
 export function openAttachPopup() {
   if (!dom.attachPopup) return;
-  if (attachmentChangesBlocked()) {
-    closeAttachPopup();
-    return;
-  }
+  closeComposerPopovers('attachments');
   updateAttachButton();
   if (dom.attachMenu) dom.attachMenu.style.display = 'flex';
   if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
   if (dom.attachUploadStatus) dom.attachUploadStatus.style.display = 'none';
   dom.attachPopup.style.display = 'block';
+  dom.attachBtn?.setAttribute('aria-expanded', 'true');
+  queueMicrotask(() => {
+    if (dom.attachPopup?.style.display === 'none') return;
+    const firstItem = dom.attachMenu?.querySelector<HTMLButtonElement>(
+      '.attach-menu-item:not([disabled])',
+    );
+    if (firstItem?.isConnected) firstItem.focus();
+  });
 }
 
 export function toggleAttachPopup() {
@@ -191,7 +271,7 @@ export function toggleAttachPopup() {
   if (dom.attachPopup.style.display === 'none' || !dom.attachPopup.style.display) {
     openAttachPopup();
   } else {
-    closeAttachPopup();
+    closeAttachPopup(true);
   }
 }
 
@@ -456,15 +536,18 @@ export function initImageListeners() {
     });
   if (dom.attachLocalBtn)
     dom.attachLocalBtn.addEventListener('click', () => {
+      if (dom.attachLocalBtn?.getAttribute('aria-disabled') === 'true') return;
+      closeAttachPopup(false);
       if (dom.imageFileInput) dom.imageFileInput.click();
     });
-  if (dom.planModeToggle)
-    dom.planModeToggle.addEventListener('click', (e) => {
+  if (dom.planModeMenuItem)
+    dom.planModeMenuItem.addEventListener('click', (e) => {
       e.stopPropagation();
-      setPlanMode(true);
+      if (dom.planModeMenuItem?.getAttribute('aria-disabled') === 'true') return;
+      togglePlanMode();
     });
-  if (dom.executeModeToggle)
-    dom.executeModeToggle.addEventListener('click', (e) => {
+  if (dom.planModeIndicator)
+    dom.planModeIndicator.addEventListener('click', (e) => {
       e.stopPropagation();
       setPlanMode(false);
     });
@@ -500,5 +583,23 @@ export function initImageListeners() {
       }
     }
   });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && dom.attachPopup?.style.display !== 'none') {
+      event.preventDefault();
+      closeAttachPopup(true);
+    }
+  });
+  dom.attachMenu?.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    const items = Array.from(
+      dom.attachMenu?.querySelectorAll<HTMLButtonElement>('.attach-menu-item') || [],
+    );
+    if (!items.length) return;
+    event.preventDefault();
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    const delta = event.key === 'ArrowDown' ? 1 : -1;
+    items[(current + delta + items.length) % items.length]?.focus();
+  });
+  document.addEventListener('lingclaw:composer-state-change', updateAttachButton);
   updateAttachButton();
 }

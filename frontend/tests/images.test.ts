@@ -17,6 +17,7 @@ import {
 import {
   beginComposerSessionTransition,
   restoreComposerSessionTransition,
+  syncComposerAvailability,
 } from '../src/composerAvailability.js';
 import { dom, initDomRefs, state } from '../src/state.js';
 import { setLanguage, translateDom } from '../src/i18n.js';
@@ -45,11 +46,14 @@ describe('ensureUploadTokenInternal', () => {
         <div id="attach-popup" style="display: none">
           <div id="attach-menu">
             <button id="attach-local-btn"></button>
-            <button id="plan-mode-toggle" class="attach-menu-toggle" aria-pressed="false"></button>
+            <small id="attach-local-reason" hidden></small>
+            <button id="plan-mode-menu-item" class="attach-menu-toggle" aria-pressed="false"></button>
+            <small id="plan-mode-menu-reason" hidden></small>
           </div>
           <div id="attach-upload-status" style="display: none"></div>
         </div>
       </div>
+      <button id="plan-mode-indicator" hidden><span></span></button>
       <div id="image-preview-bar"></div>
     `;
     initDomRefs();
@@ -60,12 +64,15 @@ describe('ensureUploadTokenInternal', () => {
     state.s3Capable = false;
     state.s3ConfigId = '';
     state.planModeEnabled = false;
+    state.activeSessionId = 'main';
+    state.activeGroupId = '';
     state.pendingImages = [];
     state.imageUploadInFlight = false;
     state.sessionSwitchInFlight = false;
     state.sessionIdentityMutationInFlight = false;
     state.composerSessionIdentityPending = false;
     state.composerSessionTransitionPending = false;
+    state.composerModelSwitchInFlight = false;
   });
 
   afterEach(() => {
@@ -109,11 +116,14 @@ describe('attachment menu', () => {
         <div id="attach-popup" style="display: none">
           <div id="attach-menu">
             <button id="attach-local-btn"></button>
-            <button id="plan-mode-toggle" class="attach-menu-toggle" aria-pressed="false"></button>
+            <small id="attach-local-reason" hidden></small>
+            <button id="plan-mode-menu-item" class="attach-menu-toggle" aria-pressed="false"></button>
+            <small id="plan-mode-menu-reason" hidden></small>
           </div>
           <div id="attach-upload-status" style="display: none"></div>
         </div>
       </div>
+      <button id="plan-mode-indicator" hidden><span></span></button>
       <div id="image-preview-bar"></div>
     `;
     initDomRefs();
@@ -121,28 +131,55 @@ describe('attachment menu', () => {
     state.s3Capable = false;
     state.s3ConfigId = '';
     state.planModeEnabled = false;
+    state.activeSessionId = 'main';
+    state.activeGroupId = '';
     state.pendingImages = [];
     state.imageUploadInFlight = false;
     state.sessionSwitchInFlight = false;
     state.sessionIdentityMutationInFlight = false;
     state.composerSessionIdentityPending = false;
     state.composerSessionTransitionPending = false;
+    state.composerModelSwitchInFlight = false;
   });
 
-  it('keeps the plus menu visible and only shows image upload when uploads are available', () => {
+  it('resets popup and ARIA state when a Session transition starts', () => {
+    openAttachPopup();
+    if (dom.attachMenu) dom.attachMenu.style.display = 'none';
+    if (dom.attachUploadStatus) dom.attachUploadStatus.style.display = 'block';
+
+    state.sessionSwitchInFlight = true;
+    syncComposerAvailability();
+
+    expect(dom.attachPopup?.style.display).toBe('none');
+    expect(dom.attachBtn?.getAttribute('aria-expanded')).toBe('false');
+    expect(dom.attachMenu?.style.display).toBe('flex');
+    expect(dom.attachUploadStatus?.style.display).toBe('none');
+  });
+
+  it('keeps the plus menu and disabled image action visible until uploads are available', () => {
     updateAttachButton();
 
     expect(dom.attachBtn?.style.display).toBe('');
-    expect(dom.attachLocalBtn?.hidden).toBe(true);
+    expect(dom.attachBtn?.disabled).toBe(false);
+    expect(dom.attachLocalBtn?.hidden).toBe(false);
+    expect(dom.attachLocalBtn?.disabled).toBe(false);
+    expect(dom.attachLocalBtn?.getAttribute('aria-disabled')).toBe('true');
+    expect(dom.attachLocalReason?.textContent).toContain('does not support image');
 
     state.imageCapable = true;
     updateAttachButton();
-    expect(dom.attachLocalBtn?.hidden).toBe(true);
+    expect(dom.attachLocalBtn?.hidden).toBe(false);
+    expect(dom.attachLocalBtn?.disabled).toBe(false);
+    expect(dom.attachLocalBtn?.getAttribute('aria-disabled')).toBe('true');
+    expect(dom.attachLocalReason?.textContent).toContain('S3');
 
     state.s3Capable = true;
     state.s3ConfigId = 's3-a';
     updateAttachButton();
     expect(dom.attachLocalBtn?.hidden).toBe(false);
+    expect(dom.attachLocalBtn?.disabled).toBe(false);
+    expect(dom.attachLocalBtn?.getAttribute('aria-disabled')).toBe('false');
+    expect(dom.attachLocalReason?.hidden).toBe(true);
   });
 
   it('opens the compact menu instead of the legacy URL input', () => {
@@ -155,14 +192,17 @@ describe('attachment menu', () => {
 
   it('syncs plan mode switch state', () => {
     syncPlanModeToggle();
-    expect(dom.planModeToggle?.getAttribute('aria-pressed')).toBe('false');
-    expect(dom.planModeToggle?.classList.contains('is-active')).toBe(false);
+    expect(dom.planModeMenuItem?.getAttribute('aria-pressed')).toBe('false');
+    expect(dom.planModeMenuItem?.classList.contains('is-active')).toBe(false);
+    expect(dom.planModeIndicator?.hidden).toBe(true);
 
     togglePlanMode();
 
     expect(state.planModeEnabled).toBe(true);
-    expect(dom.planModeToggle?.getAttribute('aria-pressed')).toBe('true');
-    expect(dom.planModeToggle?.classList.contains('is-active')).toBe(true);
+    expect(dom.planModeMenuItem?.getAttribute('aria-pressed')).toBe('true');
+    expect(dom.planModeMenuItem?.classList.contains('is-active')).toBe(true);
+    expect(dom.planModeIndicator?.hidden).toBe(false);
+    expect(dom.planModeIndicator?.textContent).toContain('Plan');
   });
 
   it('keeps the Plan Mode choice isolated per Session and disables it for Groups', () => {
@@ -181,7 +221,10 @@ describe('attachment menu', () => {
     state.activeGroupId = 'group-a';
     restorePlanModeForSession('alpha');
     expect(state.planModeEnabled).toBe(false);
-    expect(dom.planModeToggle?.disabled).toBe(true);
+    expect(dom.planModeMenuItem?.disabled).toBe(false);
+    expect(dom.planModeMenuItem?.getAttribute('aria-disabled')).toBe('true');
+    expect(dom.planModeMenuReason?.textContent).toContain('Group chats');
+    expect(dom.planModeIndicator?.hidden).toBe(true);
   });
 
   it('uses the shared close icon for pending image removal', () => {
@@ -205,12 +248,32 @@ describe('attachment menu', () => {
     beginComposerSessionTransition(true, 'missing-session');
     updateAttachButton();
 
-    expect(dom.attachBtn?.disabled).toBe(true);
+    expect(dom.attachBtn?.disabled).toBe(false);
+    expect(dom.attachLocalBtn?.disabled).toBe(false);
+    expect(dom.attachLocalBtn?.getAttribute('aria-disabled')).toBe('true');
+    expect(dom.attachLocalReason?.textContent).toContain('Session change');
     addImageUrl('https://example.com/new.png');
     removeImage(0);
     expect(state.pendingImages).toEqual([{ url: 'https://example.com/source.png' }]);
 
     restoreComposerSessionTransition();
+    expect(state.pendingImages).toEqual([{ url: 'https://example.com/source.png' }]);
+  });
+
+  it('keeps the plus menu explanatory while blocking attachment edits during a model switch', () => {
+    state.imageCapable = true;
+    state.s3Capable = true;
+    state.s3ConfigId = 's3-a';
+    state.pendingImages = [{ url: 'https://example.com/source.png' }];
+    state.composerModelSwitchInFlight = true;
+
+    updateAttachButton();
+
+    expect(dom.attachBtn?.disabled).toBe(false);
+    expect(dom.attachLocalBtn?.getAttribute('aria-disabled')).toBe('true');
+    expect(dom.attachLocalReason?.textContent).toContain('Saving model selection');
+    addImageUrl('https://example.com/new.png');
+    removeImage(0);
     expect(state.pendingImages).toEqual([{ url: 'https://example.com/source.png' }]);
   });
 });
@@ -246,6 +309,7 @@ describe('local image upload lifecycle', () => {
     state.sessionIdentityMutationInFlight = false;
     state.composerSessionIdentityPending = false;
     state.composerSessionTransitionPending = false;
+    state.composerModelSwitchInFlight = false;
     state.storageMode = 'healthy';
     state.composerModelAvailability = 'ready';
     state.imageCapable = true;

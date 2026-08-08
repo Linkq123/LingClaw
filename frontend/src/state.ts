@@ -59,12 +59,17 @@ export interface DomRefs {
   attachPopup: HTMLElement | null;
   attachMenu: HTMLElement | null;
   attachLocalBtn: HTMLButtonElement | null;
+  attachLocalReason: HTMLElement | null;
   attachUrlBtn: HTMLButtonElement | null;
   attachUrlInput: HTMLElement | null;
   imageUrlField: HTMLInputElement | null;
   imageUrlAddBtn: HTMLButtonElement | null;
-  planModeToggle: HTMLButtonElement | null;
-  executeModeToggle: HTMLButtonElement | null;
+  planModeMenuItem: HTMLButtonElement | null;
+  planModeMenuReason: HTMLElement | null;
+  planModeIndicator: HTMLButtonElement | null;
+  composerModelBtn: HTMLButtonElement | null;
+  composerModelLabel: HTMLElement | null;
+  composerModelPopup: HTMLElement | null;
   planProgress: HTMLElement | null;
   groupTargetBar: HTMLElement | null;
   attachUploadStatus: HTMLElement | null;
@@ -91,6 +96,9 @@ export interface AppState {
   composerConfigRevision: number | null;
   composerSessionModelRevision: number | null;
   composerGroupModelRevision: number | null;
+  composerCurrentModel: string;
+  composerCurrentEffort: string;
+  composerModelSwitchInFlight: boolean;
   groupModelConfiguredMembers: Set<string>;
   activeSessionId: string;
   activeGroupId: string;
@@ -213,6 +221,9 @@ export const state: AppState = {
   composerConfigRevision: null,
   composerSessionModelRevision: null,
   composerGroupModelRevision: null,
+  composerCurrentModel: '',
+  composerCurrentEffort: 'off',
+  composerModelSwitchInFlight: false,
   groupModelConfiguredMembers: new Set(),
   activeSessionId: '',
   activeGroupId: '',
@@ -375,14 +386,19 @@ export function initDomRefs() {
   dom.attachPopup = document.getElementById('attach-popup');
   dom.attachMenu = document.getElementById('attach-menu');
   dom.attachLocalBtn = document.getElementById('attach-local-btn') as HTMLButtonElement | null;
+  dom.attachLocalReason = document.getElementById('attach-local-reason');
   dom.attachUrlBtn = document.getElementById('attach-url-btn') as HTMLButtonElement | null;
   dom.attachUrlInput = document.getElementById('attach-url-input');
   dom.imageUrlField = document.getElementById('image-url-field') as HTMLInputElement | null;
   dom.imageUrlAddBtn = document.getElementById('image-url-add') as HTMLButtonElement | null;
-  dom.planModeToggle = document.getElementById('plan-mode-toggle') as HTMLButtonElement | null;
-  dom.executeModeToggle = document.getElementById(
-    'execute-mode-toggle',
+  dom.planModeMenuItem = document.getElementById('plan-mode-menu-item') as HTMLButtonElement | null;
+  dom.planModeMenuReason = document.getElementById('plan-mode-menu-reason');
+  dom.planModeIndicator = document.getElementById(
+    'plan-mode-indicator',
   ) as HTMLButtonElement | null;
+  dom.composerModelBtn = document.getElementById('composer-model-btn') as HTMLButtonElement | null;
+  dom.composerModelLabel = document.getElementById('composer-model-label');
+  dom.composerModelPopup = document.getElementById('composer-model-popup');
   dom.planProgress = document.getElementById('plan-progress');
   dom.groupTargetBar = document.getElementById('group-target-bar');
   dom.attachUploadStatus = document.getElementById('attach-upload-status');

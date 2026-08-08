@@ -3910,6 +3910,14 @@ pub(crate) async fn delete_session_with_safety_checks(
         ));
     }
 
+    // Session writers (including `/think`, the Composer model picker and
+    // config-reload Effort normalization) all serialize through this gate.
+    // Hold it until both SQLite and the in-memory map no longer contain the
+    // Session, so an in-flight preference write cannot resurrect a deleted
+    // row and a late writer observes `session_not_found` instead.
+    let persist_gate = session_store::session_persist_gate(&target_session_id);
+    let session_persist_guard = persist_gate.lock().await;
+
     let roster_gate = session_group::group_roster_gate();
     let roster_guard = roster_gate.lock().await;
     #[cfg(not(test))]
@@ -3979,6 +3987,7 @@ pub(crate) async fn delete_session_with_safety_checks(
         let mut sessions = state.sessions.lock().await;
         sessions.remove(&target_session_id).is_some()
     };
+    drop(session_persist_guard);
     #[cfg(not(test))]
     let mut group_notifications_incomplete = false;
     #[cfg(test)]

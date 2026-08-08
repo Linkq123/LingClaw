@@ -266,4 +266,71 @@ describe('settings model helpers', () => {
       },
     });
   });
+
+  it('normalizes configured efforts to the standard order and preserves the selected default', () => {
+    const providers = buildProviderForms({
+      gateway: {
+        api: 'openai-responses',
+        baseUrl: 'https://gateway.example/v1',
+        apiKey: 'secret',
+        models: [
+          {
+            id: 'reasoner',
+            input: ['text'],
+            reasoning: true,
+            effort: {
+              levels: ['high', 'low', 'medium'],
+              default: 'high',
+              providerScale: 'turbo',
+              vendor: { budget: 4096 },
+            },
+          },
+        ],
+      },
+    });
+
+    expect(serializeProviderForms(providers)?.providers?.gateway.models?.[0]).toMatchObject({
+      reasoning: true,
+      effort: {
+        levels: ['low', 'medium', 'high'],
+        default: 'high',
+        providerScale: 'turbo',
+        vendor: { budget: 4096 },
+      },
+    });
+  });
+
+  it('preserves off-only effort metadata when reasoning is disabled', () => {
+    const providers = buildProviderForms({
+      gateway: {
+        api: 'openai-completions',
+        baseUrl: 'https://gateway.example/v1',
+        apiKey: 'secret',
+        models: [
+          {
+            id: 'plain',
+            input: ['text'],
+            reasoning: false,
+            effort: {
+              levels: ['off'],
+              default: 'off',
+              providerScale: 'disabled',
+              vendor: { budget: 0 },
+            },
+          },
+        ],
+      },
+    });
+
+    expect(serializeProviderForms(providers)?.providers?.gateway.models?.[0]).toEqual({
+      id: 'plain',
+      input: ['text'],
+      effort: {
+        levels: ['off'],
+        default: 'off',
+        providerScale: 'disabled',
+        vendor: { budget: 0 },
+      },
+    });
+  });
 });

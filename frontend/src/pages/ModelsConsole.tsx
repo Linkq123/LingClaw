@@ -3,7 +3,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { iconHref } from '../icons.js';
 import { isChinese, subscribeLanguageChange, tr } from '../i18n.js';
 import { validateModelsConfigDraftShape, validateProviderName } from '../settingsValidation.js';
-import type { AppConfig } from '../types/config.js';
+import { THINKING_EFFORT_LEVELS } from '../types/config.js';
+import type { AppConfig, ModelEffortConfig, ThinkingEffort } from '../types/config.js';
 import { trapDialogFocus } from './dialogFocus.js';
 import {
   buildProviderForms,
@@ -98,6 +99,10 @@ const COPY = {
     selectedModel: 'Selected model',
     selectModelHint: 'Select a card to inspect or edit its configuration.',
     customThinkingFormat: 'Custom values are supported.',
+    thinkingEffort: 'Thinking effort',
+    effortHint: 'Choose the efforts this model accepts and the Session default.',
+    defaultEffort: 'Default effort',
+    effortSummary: '{default} · {count} levels',
     externalConflict:
       'Model configuration changed outside this editor. Resolve the current draft before reloading.',
     modelCount: '{count} models',
@@ -148,6 +153,10 @@ const COPY = {
     selectedModel: '已选模型',
     selectModelHint: '选择模型卡片以检查或编辑配置。',
     customThinkingFormat: '支持输入自定义值。',
+    thinkingEffort: '思考强度',
+    effortHint: '选择此模型允许的强度，并指定 Session 默认值。',
+    defaultEffort: '默认强度',
+    effortSummary: '{default} · {count} 档',
     externalConflict: '模型配置已在此编辑器之外发生变化，请先处理当前草稿再重新加载。',
     modelCount: '{count} 个模型',
     apiKeyHint: '仅保存在本机 LingClaw 配置中。',
@@ -207,6 +216,40 @@ function withThinkingFormat(model: ModelFormEntry, value: string): ModelFormEntr
   if (trimmed) compat.thinkingFormat = trimmed;
   else delete compat.thinkingFormat;
   return { ...model, compat: Object.keys(compat).length > 0 ? compat : undefined };
+}
+
+function effectiveModelEffort(model: ModelFormEntry): ModelEffortConfig {
+  if (!model.reasoning) return { levels: ['off'], default: 'off' };
+  const configured = model.effort;
+  if (configured?.levels?.length) {
+    const selected = new Set(configured.levels);
+    const levels = THINKING_EFFORT_LEVELS.filter((level) => selected.has(level));
+    if (levels.length > 0) {
+      return {
+        levels: [...levels],
+        default: levels.includes(configured.default) ? configured.default : levels[0],
+      };
+    }
+  }
+  return { levels: [...THINKING_EFFORT_LEVELS], default: 'auto' };
+}
+
+function withModelEffort(
+  model: ModelFormEntry,
+  levels: ThinkingEffort[],
+  defaultEffort: ThinkingEffort,
+): ModelEffortConfig {
+  return {
+    ...plainRecord(model.effort),
+    levels: [...levels],
+    default: defaultEffort,
+  } as ModelEffortConfig;
+}
+
+function effortLabel(effort: ThinkingEffort): string {
+  const key = `composer.effort.${effort}`;
+  const translated = tr(key);
+  return translated === key ? effort : translated;
 }
 
 function providerInitial(name: string): string {
@@ -885,6 +928,9 @@ export function ModelsConsole({
       ? selectedModel.model.input
       : ['text']
     : [];
+  const effortForSelected = selectedModel
+    ? effectiveModelEffort(selectedModel.model)
+    : ({ levels: ['off'], default: 'off' } satisfies ModelEffortConfig);
 
   return (
     <section className="models-console" aria-labelledby="models-console-heading">
@@ -1229,8 +1275,13 @@ export function ModelsConsole({
                             <strong>{model.maxTokens?.toLocaleString() || '—'}</strong>
                           </span>
                           <span>
-                            <small>{tr('settings.thinkingFormat')}</small>
-                            <strong>{thinkingFormat(model) || tr('common.default')}</strong>
+                            <small>{copy('thinkingEffort')}</small>
+                            <strong>
+                              {copy('effortSummary', {
+                                default: effortLabel(effectiveModelEffort(model).default),
+                                count: effectiveModelEffort(model).levels.length,
+                              })}
+                            </strong>
                           </span>
                         </span>
                       </button>
@@ -1339,15 +1390,90 @@ export function ModelsConsole({
                         <input
                           type="checkbox"
                           checked={!!selectedModel.model.reasoning}
-                          onChange={(event) =>
+                          onChange={(event) => {
+                            const reasoning = event.target.checked;
                             updateModel(selectedModel.provider._key, selectedModel.model._key, {
-                              reasoning: event.target.checked || undefined,
-                            })
-                          }
+                              reasoning: reasoning || undefined,
+                              effort: reasoning
+                                ? withModelEffort(
+                                    selectedModel.model,
+                                    [...THINKING_EFFORT_LEVELS],
+                                    'auto',
+                                  )
+                                : selectedModel.model.effort
+                                  ? withModelEffort(selectedModel.model, ['off'], 'off')
+                                  : undefined,
+                            });
+                          }}
                         />
                         {tr('settings.field.reasoning')}
                       </label>
                     </fieldset>
+
+                    {selectedModel.model.reasoning ? (
+                      <fieldset className="models-console-effort-editor">
+                        <legend>{copy('thinkingEffort')}</legend>
+                        <p>{copy('effortHint')}</p>
+                        <div className="models-console-effort-levels">
+                          {THINKING_EFFORT_LEVELS.map((effort) => {
+                            const checked = effortForSelected.levels.includes(effort);
+                            return (
+                              <label key={effort}>
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  disabled={checked && effortForSelected.levels.length === 1}
+                                  onChange={(event) => {
+                                    const selected = new Set(effortForSelected.levels);
+                                    if (event.target.checked) selected.add(effort);
+                                    else selected.delete(effort);
+                                    const levels = THINKING_EFFORT_LEVELS.filter((level) =>
+                                      selected.has(level),
+                                    );
+                                    if (levels.length === 0) return;
+                                    updateModel(
+                                      selectedModel.provider._key,
+                                      selectedModel.model._key,
+                                      {
+                                        effort: withModelEffort(
+                                          selectedModel.model,
+                                          [...levels],
+                                          levels.includes(effortForSelected.default)
+                                            ? effortForSelected.default
+                                            : levels[0],
+                                        ),
+                                      },
+                                    );
+                                  }}
+                                />
+                                {effortLabel(effort)}
+                              </label>
+                            );
+                          })}
+                        </div>
+                        <label className="models-console-effort-default">
+                          <span>{copy('defaultEffort')}</span>
+                          <select
+                            value={effortForSelected.default}
+                            onChange={(event) =>
+                              updateModel(selectedModel.provider._key, selectedModel.model._key, {
+                                effort: withModelEffort(
+                                  selectedModel.model,
+                                  [...effortForSelected.levels],
+                                  event.target.value as ThinkingEffort,
+                                ),
+                              })
+                            }
+                          >
+                            {effortForSelected.levels.map((effort) => (
+                              <option key={effort} value={effort}>
+                                {effortLabel(effort)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </fieldset>
+                    ) : null}
 
                     <div className="models-console-number-grid">
                       <label>

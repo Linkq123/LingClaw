@@ -491,28 +491,7 @@
 
           <div id="input-area">
             <div id="group-target-bar" class="group-target-bar" hidden></div>
-            <div class="composer-mode-row">
-              <div class="composer-mode-switch" role="group" aria-label="Agent mode">
-                <button
-                  id="execute-mode-toggle"
-                  type="button"
-                  aria-pressed="true"
-                  data-i18n="composer.executeMode"
-                >
-                  Execute
-                </button>
-                <button
-                  id="plan-mode-toggle"
-                  type="button"
-                  aria-pressed="false"
-                  data-i18n="composer.planMode"
-                >
-                  Plan
-                </button>
-              </div>
-              <div id="plan-progress" class="plan-progress" hidden></div>
-            </div>
-            <div id="image-preview-bar" class="image-preview-bar" style="display: none"></div>
+            <div id="plan-progress" class="plan-progress" hidden></div>
             <div
               id="slash-command-menu"
               class="slash-command-menu"
@@ -521,33 +500,6 @@
               hidden
             ></div>
             <div class="input-composer">
-              <div class="attach-wrapper">
-                <button
-                  id="attach-btn"
-                  class="attach-btn"
-                  data-i18n-aria-label="composer.moreOptions"
-                  data-i18n-title="composer.moreOptions"
-                  aria-label="More options"
-                  title="More options"
-                >
-                  <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>
-                </button>
-                <div id="attach-popup" class="attach-popup" style="display: none">
-                  <div id="attach-menu" class="attach-menu">
-                    <button class="attach-menu-item" id="attach-local-btn" type="button" hidden>
-                      <span class="attach-menu-icon"
-                        ><svg class="icon" aria-hidden="true">
-                          <use href="#icon-paperclip"></use></svg
-                      ></span>
-                      <span data-i18n="composer.addImage">Add image</span>
-                    </button>
-                  </div>
-                  <div id="attach-upload-status" class="attach-upload-status" style="display: none">
-                    <span class="upload-spinner"></span>
-                    <span data-i18n="composer.uploading">Uploading...</span>
-                  </div>
-                </div>
-              </div>
               <input
                 type="file"
                 id="image-file-input"
@@ -555,47 +507,173 @@
                 multiple
                 hidden
               />
-              <textarea
-                id="input"
-                data-i18n-placeholder="composer.checkingModel"
-                data-i18n-aria-label="composer.aria"
-                placeholder="Checking model configuration..."
-                rows="1"
-                role="combobox"
-                aria-label="Message input"
-                aria-describedby="composer-availability-detail"
-                aria-autocomplete="list"
-                aria-controls="slash-command-menu"
-                aria-expanded="false"
-                aria-haspopup="listbox"
-                enterkeyhint="send"
-                autocomplete="off"
-                autocapitalize="sentences"
-                spellcheck="true"
-              ></textarea>
-              <button
-                id="stop"
-                data-i18n-aria-label="composer.stop"
-                data-i18n-title="composer.stop"
-                aria-label="Stop agent"
-                title="Stop"
-                style="display: none"
-              >
-                <span id="stop-icon"
-                  ><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg
-                ></span>
-              </button>
-              <button
-                id="send"
-                data-i18n-aria-label="composer.send"
-                aria-label="Send message"
-                aria-describedby="composer-availability-detail"
-                disabled
-              >
-                <span id="send-icon"
-                  ><svg class="icon" aria-hidden="true"><use href="#icon-send"></use></svg
-                ></span>
-              </button>
+              <div class="composer-input-stack">
+                <div id="image-preview-bar" class="image-preview-bar" style="display: none"></div>
+                <textarea
+                  id="input"
+                  data-i18n-placeholder="composer.checkingModel"
+                  data-i18n-aria-label="composer.aria"
+                  placeholder="Checking model configuration..."
+                  rows="1"
+                  role="combobox"
+                  aria-label="Message input"
+                  aria-describedby="composer-availability-detail"
+                  aria-autocomplete="list"
+                  aria-controls="slash-command-menu"
+                  aria-expanded="false"
+                  aria-haspopup="listbox"
+                  enterkeyhint="send"
+                  autocomplete="off"
+                  autocapitalize="sentences"
+                  spellcheck="true"
+                ></textarea>
+              </div>
+              <div class="composer-toolbar">
+                <div class="composer-toolbar-left">
+                  <div class="attach-wrapper">
+                    <button
+                      id="attach-btn"
+                      class="attach-btn"
+                      type="button"
+                      data-i18n-aria-label="composer.moreOptions"
+                      data-i18n-title="composer.moreOptions"
+                      aria-label="More options"
+                      aria-expanded="false"
+                      aria-haspopup="menu"
+                      aria-controls="attach-popup"
+                      title="More options"
+                    >
+                      <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>
+                    </button>
+                    <div id="attach-popup" class="attach-popup" style="display: none">
+                      <div
+                        id="attach-menu"
+                        class="attach-menu"
+                        role="menu"
+                        data-i18n-aria-label="composer.moreOptions"
+                        aria-label="More options"
+                      >
+                        <button
+                          class="attach-menu-item"
+                          id="attach-local-btn"
+                          type="button"
+                          role="menuitem"
+                          aria-describedby="attach-local-reason"
+                        >
+                          <span class="attach-menu-icon"
+                            ><svg class="icon" aria-hidden="true">
+                              <use href="#icon-paperclip"></use></svg
+                          ></span>
+                          <span class="attach-menu-copy">
+                            <span data-i18n="composer.addImage">Add image</span>
+                            <small id="attach-local-reason" hidden></small>
+                          </span>
+                        </button>
+                        <button
+                          class="attach-menu-item attach-menu-toggle"
+                          id="plan-mode-menu-item"
+                          type="button"
+                          role="menuitemcheckbox"
+                          aria-pressed="false"
+                          aria-checked="false"
+                          aria-describedby="plan-mode-menu-reason"
+                        >
+                          <span class="attach-menu-leading">
+                            <span class="attach-menu-icon"
+                              ><svg class="icon" aria-hidden="true">
+                                <use href="#icon-task-plan"></use></svg
+                            ></span>
+                            <span class="attach-menu-copy">
+                              <span data-i18n="composer.planMode">Plan</span>
+                              <small id="plan-mode-menu-reason" hidden></small>
+                            </span>
+                          </span>
+                          <span class="toggle-switch" aria-hidden="true"><span></span></span>
+                        </button>
+                      </div>
+                      <div
+                        id="attach-upload-status"
+                        class="attach-upload-status"
+                        style="display: none"
+                      >
+                        <span class="upload-spinner"></span>
+                        <span data-i18n="composer.uploading">Uploading...</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="composer-model-wrapper">
+                    <button
+                      id="composer-model-btn"
+                      class="composer-model-btn"
+                      type="button"
+                      aria-expanded="false"
+                      aria-haspopup="dialog"
+                      aria-controls="composer-model-popup"
+                      data-i18n-aria-label="composer.chooseModel"
+                      aria-label="Choose model"
+                    >
+                      <svg class="icon" aria-hidden="true">
+                        <use href="#icon-reasoning"></use>
+                      </svg>
+                      <span id="composer-model-label" data-i18n="composer.loadingModels"
+                        >Loading models...</span
+                      >
+                      <svg class="icon composer-model-chevron" aria-hidden="true">
+                        <use href="#icon-chevron-down"></use>
+                      </svg>
+                    </button>
+                    <div
+                      id="composer-model-popup"
+                      class="composer-model-popup"
+                      role="dialog"
+                      data-i18n-aria-label="composer.chooseModel"
+                      aria-label="Choose model"
+                      hidden
+                    ></div>
+                  </div>
+                  <button
+                    id="plan-mode-indicator"
+                    class="plan-mode-indicator"
+                    type="button"
+                    hidden
+                    data-i18n-title="composer.cancelPlanMode"
+                    data-i18n-aria-label="composer.cancelPlanMode"
+                    aria-label="Cancel Plan mode"
+                    title="Cancel Plan mode"
+                  >
+                    <svg class="icon" aria-hidden="true"><use href="#icon-task-plan"></use></svg>
+                    <span data-i18n="composer.planMode">Plan</span>
+                    <svg class="icon plan-mode-close" aria-hidden="true">
+                      <use href="#icon-close"></use>
+                    </svg>
+                  </button>
+                </div>
+                <div class="composer-toolbar-actions">
+                  <button
+                    id="stop"
+                    data-i18n-aria-label="composer.stop"
+                    data-i18n-title="composer.stop"
+                    aria-label="Stop agent"
+                    title="Stop"
+                    style="display: none"
+                  >
+                    <span id="stop-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg
+                    ></span>
+                  </button>
+                  <button
+                    id="send"
+                    data-i18n-aria-label="composer.send"
+                    aria-label="Send message"
+                    aria-describedby="composer-availability-detail"
+                    disabled
+                  >
+                    <span id="send-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-send"></use></svg
+                    ></span>
+                  </button>
+                </div>
+              </div>
             </div>
             <p id="composer-availability-status" class="composer-availability-status" hidden>
               <svg class="icon composer-availability-icon" aria-hidden="true">

@@ -124,39 +124,6 @@ where
     Ok(())
 }
 
-/// Persist a candidate model override before exposing it to live readers. The
-/// caller holds `CONFIG_FILE_LOCK` for writing, so committing the in-memory
-/// override and advancing the revision is atomic with respect to all guarded
-/// model-status snapshot builders.
-async fn persist_session_model_override(
-    state: &AppState,
-    current_session_id: &str,
-    canonical: &str,
-) -> Result<(std::sync::Arc<crate::Config>, u64), String> {
-    let persist_gate = session_persist_gate(current_session_id);
-    let _persist_guard = persist_gate.lock().await;
-    let candidate = {
-        let sessions = state.sessions.lock().await;
-        let mut candidate = sessions
-            .get(current_session_id)
-            .cloned()
-            .ok_or_else(|| "Session not found".to_string())?;
-        candidate.model_override = Some(canonical.to_string());
-        candidate.updated_at = now_epoch();
-        candidate
-    };
-
-    save_session_to_disk_locked(&candidate).await?;
-
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions
-        .get_mut(current_session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
-    session.model_override = candidate.model_override;
-    session.updated_at = session.updated_at.max(candidate.updated_at);
-    Ok(state.bump_config_revision())
-}
-
 fn parse_toggle_value(arg: &str, command_name: &str) -> Result<bool, String> {
     match arg.to_lowercase().as_str() {
         "on" | "true" | "1" => Ok(true),
@@ -871,12 +838,9 @@ async fn handle_model_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
-    // Keep validation, candidate persistence, live commit, revision advance,
-    // and payload collection in one write-locked transaction. Network sends
-    // happen later, after this guard has been released.
-    let _config_guard = crate::CONFIG_FILE_LOCK.write().await;
-    let config = state.config();
     if arg.is_empty() {
+        let _config_guard = crate::CONFIG_FILE_LOCK.read().await;
+        let config = state.config();
         let sessions = state.sessions.lock().await;
         let (model, session_override_configured, effective_model_configured) = sessions
             .get(current_session_id)
@@ -925,26 +889,26 @@ async fn handle_model_command(
         );
     }
 
-    let canonical = match config.selectable_model_ref(arg) {
-        Ok(value) => value,
-        Err(err) => return command_result(err, "error", false),
-    };
-    match persist_session_model_override(state, current_session_id, &canonical).await {
-        Ok((config, config_revision)) => {
-            let payloads = crate::socket_sync::collect_model_configuration_payloads(
-                state,
-                &config,
-                config_revision,
-            )
-            .await;
-            let mut result =
-                command_result(format!("Model switched to: {canonical}"), "system", true);
-            result.model_configuration_payloads = Some(payloads);
+    match crate::update_session_model_preferences(state, current_session_id, Some(arg), None, true)
+        .await
+    {
+        Ok(update) => {
+            let mut result = command_result(
+                format!(
+                    "Model switched to: {} (think: {})",
+                    update.model, update.effort
+                ),
+                "system",
+                true,
+            );
+            result.model_configuration_payloads = Some(update.payloads);
             result
         }
-        Err(err) if err == "Session not found" => command_result(err, "system", false),
-        Err(err) => command_result(
-            format!("Failed to persist model switch: {err}"),
+        Err(error) if error.code == "session_not_found" => {
+            command_result(error.message, "system", false)
+        }
+        Err(error) => command_result(
+            format!("Failed to persist model switch: {}", error.message),
             "error",
             false,
         ),
@@ -1480,16 +1444,17 @@ pub(crate) async fn handle_think_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
-    const VALID_LEVELS: &[&str] = &[
-        "auto", "off", "minimal", "low", "medium", "high", "xhigh", "max",
-    ];
-
     if arg.is_empty() {
+        let _config_guard = crate::CONFIG_FILE_LOCK.read().await;
+        let config = state.config();
         let sessions = state.sessions.lock().await;
-        let level = sessions
-            .get(current_session_id)
-            .map(|s| s.think_level.as_str())
-            .unwrap_or("auto");
+        let level = sessions.get(current_session_id).map_or_else(
+            || config.normalize_model_effort(&config.model, "auto"),
+            |session| {
+                let (model, _, _) = session.model_configuration(&config);
+                config.normalize_model_effort(&model, &session.think_level)
+            },
+        );
         return command_result(
             format!("think: {level}\nUsage: /think <auto|off|minimal|low|medium|high|xhigh|max>"),
             "system",
@@ -1498,7 +1463,7 @@ pub(crate) async fn handle_think_command(
     }
 
     let level = arg.to_lowercase();
-    if !VALID_LEVELS.contains(&level.as_str()) {
+    if !crate::config::THINKING_EFFORT_LEVELS.contains(&level.as_str()) {
         return command_result(
             format!(
                 "Invalid think level: {arg}\nValid: auto, off, minimal, low, medium, high, xhigh, max"
@@ -1508,24 +1473,32 @@ pub(crate) async fn handle_think_command(
         );
     }
 
-    match persist_session_update(
+    match crate::update_session_model_preferences(
         state,
         current_session_id,
-        |session| (session.think_level.clone(), session.updated_at),
-        |session| {
-            session.think_level = level.clone();
-        },
-        |session, (think_level, updated_at)| {
-            session.think_level = think_level;
-            session.updated_at = updated_at;
-        },
+        None,
+        Some(&level),
+        // Keep the established busy-run control path: `/think` adjusts the
+        // following provider cycle, while the Composer model picker remains
+        // blocked through the HTTP API's `reject_busy` guard.
+        false,
     )
     .await
     {
-        Ok(()) => command_result(format!("Think mode set to: {level}"), "system", true),
-        Err(err) if err == "Session not found" => command_result(err, "system", false),
-        Err(err) => command_result(
-            format!("Failed to persist think level: {err}"),
+        Ok(update) => {
+            let mut result = command_result(
+                format!("Think mode set to: {}", update.effort),
+                "system",
+                true,
+            );
+            result.model_configuration_payloads = Some(update.payloads);
+            result
+        }
+        Err(error) if error.code == "session_not_found" => {
+            command_result(error.message, "system", false)
+        }
+        Err(error) => command_result(
+            format!("Failed to persist think level: {}", error.message),
             "error",
             false,
         ),

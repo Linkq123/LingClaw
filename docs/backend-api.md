@@ -614,7 +614,7 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
 
 三个模型状态字段的语义与 `GET /api/config` 相同，供保存配置后的前端即时刷新模型可用状态。保存完成后，服务端也会向所有已连接 Session/Group 推送具有相同 `configRevision` 的更新状态。
 
-`configRevision` 是进程内严格递增、以 Unix epoch 毫秒为初始种子的模型配置状态序号：每次成功应用 `PUT /api/config`，以及每次成功持久化 Session `/model` override 都会推进它。时间种子使它通常也能跨重启递增，但协议只保证单个服务端进程内的严格单调性。前端应持续保留已接受的最大序号并忽略更小的异步状态包；普通 WebSocket 重连不应无条件清零该比较状态。若新连接收到的首个带版本 Session/Group 模型状态小于当前基线，客户端可将其视为后端进程重启并建立新基线；HTTP 响应不能消费这次连接握手。
+`configRevision` 是进程内严格递增、以 Unix epoch 毫秒为初始种子的模型配置状态序号：每次成功应用 `PUT /api/config`，以及每次成功持久化 Session 模型/Effort 偏好（包括 `/model`、`/think` 和 `PUT /api/session-models`）都会推进它。时间种子使它通常也能跨重启递增，但协议只保证单个服务端进程内的严格单调性。前端应持续保留已接受的最大序号并忽略更小的异步状态包；普通 WebSocket 重连不应无条件清零该比较状态。若新连接收到的首个带版本 Session/Group 模型状态小于当前基线，客户端可将其视为后端进程重启并建立新基线；HTTP 响应不能消费这次连接握手。
 
 若 `baseConfigFileEtag` 与写锁内重新读取到的文件内容不一致，服务端返回 `409 Conflict`，不会写文件或热重载。响应包含当前 `config`（若仍可解析）、`configRevision` 与 `configFileEtag`；客户端应保留本地编辑并明确让用户重新加载，而不是自动覆盖任一版本。只执行 Session `/model` 不会改变文件 ETag，因此不会产生无关的 Settings 保存冲突。
 
@@ -652,6 +652,10 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
       "id": "string",
       "name": "string?",
       "reasoning": true,
+      "effort": {
+        "levels": ["auto", "low", "medium", "high"],
+        "default": "medium"
+      },
       "input": ["text", "image"],
       "contextWindow": 128000,
       "maxTokens": 8192,
@@ -682,6 +686,9 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
 - `baseUrl` 不能为空
 - `baseUrl` / `apiKey` 可以直接写字面值，也可以写成精确的 `${ENV_NAME}` 占位符；运行时会按环境变量展开
 - `models[].id` 不能为空
+- `models[].effort.levels` 如提供，必须是固定集合 `auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` 的非空、无重复子集；保存时按该固定顺序规范化
+- `models[].effort.default` 必须存在于 `levels`；除 `off` 外的 Effort 要求 `models[].reasoning = true`
+- 未配置 `effort` 的旧推理模型兼容完整集合并默认 `auto`；非推理模型等效为仅支持 `off`
 - `models[].compat` 如提供，必须是对象
 - `models[].compat.thinkingFormat` 如提供，必须是字符串；用于显式声明 OpenAI-compatible 的 thinking / reasoning 方言（例如 `openai`、`qwen`、`doubao`、`deepseek-v4`、`ollama`、`gpt-oss`）
 - `models[].compat.reasoning.summary` 如提供，必须是字符串；仅 `openai-responses` 使用，会透传到 Responses API 的 `reasoning.summary`
@@ -809,6 +816,89 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
   "error": "Invalid agents.defaults.model.primary: unknown provider 'missing'. Add it in models.providers first."
 }
 ```
+
+## 4.6.1 GET/PUT /api/session-models
+
+读取或原子更新一个普通 Session 的有效模型与 Thinking Effort。省略 `session` 时使用 `main`；Group 不使用此接口，因为各成员保留自己的模型路由。
+
+### GET
+
+```http
+GET /api/session-models?session=main
+```
+
+```json
+{
+  "session": {
+    "id": "main",
+    "model": "openai/gpt-5.5",
+    "effort": "medium",
+    "modelOverridePresent": true,
+    "modelOverrideConfigured": true,
+    "effectiveModelConfigured": true
+  },
+  "explicitPrimaryModelConfigured": true,
+  "capabilities": {
+    "image": true
+  },
+  "models": [
+    {
+      "ref": "openai/gpt-5.5",
+      "provider": "openai",
+      "id": "gpt-5.5",
+      "name": "GPT-5.5",
+      "input": ["text", "image"],
+      "reasoning": true,
+      "efforts": ["auto", "low", "medium", "high", "xhigh"],
+      "defaultEffort": "medium"
+    }
+  ],
+  "configRevision": 1720684800125
+}
+```
+
+模型目录只包含展示、能力和 Effort 元数据，不返回 `apiKey`、`baseUrl`、Provider headers 或其他密钥。
+
+### PUT
+
+```http
+PUT /api/session-models?session=main
+Content-Type: application/json
+
+{
+  "model": "openai/gpt-5.5",
+  "effort": "high"
+}
+```
+
+服务端在同一持久化操作中更新 `model_override` 与 `think_level`，成功前不会向 Agent run 暴露中间组合。运行中、Session 切换或存储保护时不得切换。
+
+```json
+{
+  "ok": true,
+  "session": {
+    "id": "main",
+    "model": "openai/gpt-5.5",
+    "effort": "high",
+    "modelOverridePresent": true,
+    "modelOverrideConfigured": true,
+    "effectiveModelConfigured": true
+  },
+  "explicitPrimaryModelConfigured": true,
+  "capabilities": {
+    "image": true
+  },
+  "configRevision": 1720684800126
+}
+```
+
+`capabilities.image` 与已提交模型来自同一个运行时配置快照，客户端可立即同步图片入口，无需等待后续 WebSocket 广播。成功后服务端推进 `configRevision`，并通过 `session_model_configuration` / `group_model_configuration` 刷新相关客户端。稳定错误码：
+
+- `model_unavailable`：模型引用不存在或当前不可用，`400`
+- `effort_not_supported`：目标模型不允许该 Effort，`400`
+- `session_busy`：Session 已有活动 run，`409`
+- `session_not_found`：Session 不存在，`404`
+- `storage_protected`：SQLite 处于保护模式，`503`
 
 ## 4.7 POST /api/config/test-model
 
@@ -1726,6 +1816,8 @@ Group socket 初始化顺序通常为：
   "type": "session",
   "id": "main",
   "name": "Main",
+  "model": "openai/gpt-5.5",
+  "effort": "medium",
   "explicitPrimaryModelConfigured": false,
   "modelOverridePresent": true,
   "modelOverrideConfigured": false,
@@ -1748,6 +1840,8 @@ Group socket 初始化顺序通常为：
 字段说明：
 
 - `capabilities.image`: 当前有效模型是否支持图片输入
+- `model`: 当前 Session 的有效模型引用
+- `effort`: 已按当前模型配置规范化的 Thinking Effort；非推理模型为 `off`
 - `capabilities.s3`: 当前服务端是否可用 S3 上传能力
 - `capabilities.s3_config_id`: 当前 S3 配置身份；S3 不可用时为 `null`。身份变化时客户端必须丢弃尚未发送的本地上传附件，远程 URL 附件不受影响
 - `modelOverridePresent`: 当前 Session 是否持久化了 `/model` override。它只表示值存在，不表示该值仍能在当前 Config 中解析
@@ -1758,12 +1852,14 @@ Group socket 初始化顺序通常为：
 
 ### `session_model_configuration`
 
-配置保存或任一 Session 成功执行 `/model` 后，服务端向每个已连接 Session 发送最小模型状态事件：
+配置保存或任一 Session 成功更新模型/Effort 后，服务端向每个已连接 Session 发送最小模型状态事件：
 
 ```json
 {
   "type": "session_model_configuration",
   "id": "main",
+  "model": "openai/gpt-5.5",
+  "effort": "high",
   "explicitPrimaryModelConfigured": true,
   "modelOverridePresent": false,
   "modelOverrideConfigured": false,
@@ -2213,7 +2309,7 @@ History 顶层还可包含结构化计划历史：
 }
 ```
 
-配置保存或任一 Session 成功执行 `/model` 后，Group 连接收到只含模型状态的专用事件：
+配置保存或任一 Session 成功更新模型/Effort（包括 `/model`、`/think` 与 `PUT /api/session-models`）后，Group 连接收到只含模型状态的专用事件：
 
 ```json
 {
@@ -2235,7 +2331,7 @@ History 顶层还可包含结构化计划历史：
 
 `model_override_members` 只列出持久化 Session `/model` override 在当前 Config 中仍然有效的成员，保留用于诊断和兼容。`model_configured_members` 列出最终允许启动 Agent run 的成员：无 override 的成员可使用经过校验的全局模型；存在 override 的成员必须保证 override 仍有效，失效 override 不会回退到全局模型。前端 Group 门禁必须直接使用 `model_configured_members`，服务端也会按相同语义拒绝包含未配置目标的 dispatch。
 
-`explicitPrimaryModelConfigured` 与 Session payload 中同名字段语义相同。`configRevision` 与 Session payload 使用同一修订序列；同一个 Group payload 内的全局和成员模型状态都基于该修订号对应的 Config 快照。成员执行 `/model` 后，所有已连接 Session 和 Group 都会收到相同新序号的状态 payload，避免全局序列推进后未关联页面永久保留旧序号。配置保存广播同样会在一个不可变 Config 快照下生成全部 Session/Group 模型字段，并与 `/model` 广播及其他配置保存串行，避免混合新旧状态。
+`explicitPrimaryModelConfigured` 与 Session payload 中同名字段语义相同。`configRevision` 与 Session payload 使用同一修订序列；同一个 Group payload 内的全局和成员模型状态都基于该修订号对应的 Config 快照。成员成功更新模型或 Effort 后，所有已连接 Session 和 Group 都会收到相同新序号的状态 payload，避免全局序列推进后未关联页面永久保留旧序号。配置保存广播同样会在一个不可变 Config 快照下生成全部 Session/Group 模型字段，并与 Session 模型偏好广播及其他配置保存串行，避免混合新旧状态。
 
 每个 Agent run 会在取得 reservation 后、写入目标消息前获取经过校验的 Config/Session 模型快照，并在整个 run 内复用该快照；task/orchestrate 未配置专用子代理模型时继承该快照中的 Session 模型。因此普通消息、busy intervention rerun、直接 `session_control.dispatch`、成员回复触发的后续 `@session-id` 派发，以及排队期间发生的配置热重载都不能落入内置默认模型；`/new` 压缩也在实际命令入口使用同样的快照规则。自动 mention 后续派发若缺少有效模型，会生成可见的 failed group run，而不是只写服务端日志。
 

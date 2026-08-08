@@ -26,7 +26,7 @@ use tokio_rusqlite::Connection;
 
 pub(crate) use admin::handle_db_cli;
 pub(crate) use legacy::{migrate_legacy_json_if_needed, preflight_legacy_storage_path_conflicts};
-pub(crate) use session::{SessionDeleteOutcome, SessionUsageSnapshot};
+pub(crate) use session::{SessionDeleteOutcome, SessionModelPreferences, SessionUsageSnapshot};
 
 pub(crate) const GROUP_MISSING_SESSIONS_ERROR_PREFIX: &str = "Group references missing sessions: ";
 

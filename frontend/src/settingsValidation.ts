@@ -1,5 +1,7 @@
 // Pure validation helpers for settings forms — ported from settings.ts
 
+import { THINKING_EFFORT_LEVELS } from './types/config.js';
+
 export function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
@@ -150,6 +152,52 @@ export function validateModelsConfigDraftShape(parsed: unknown): void {
           m['reasoning'],
           `Models JSON field "providers.${name}.models[${index}].reasoning"`,
         );
+        if (!isAbsent(m['effort'])) {
+          if (!isPlainObject(m['effort'])) {
+            throw new Error(
+              `Models JSON field "providers.${name}.models[${index}].effort" must be an object.`,
+            );
+          }
+          const effort = m['effort'] as Record<string, unknown>;
+          ensureStringArray(
+            effort['levels'],
+            `Models JSON field "providers.${name}.models[${index}].effort.levels"`,
+          );
+          const levels = effort['levels'] as string[];
+          if (levels.length === 0) {
+            throw new Error(
+              `Models JSON field "providers.${name}.models[${index}].effort.levels" cannot be empty.`,
+            );
+          }
+          const unique = new Set(levels);
+          if (unique.size !== levels.length) {
+            throw new Error(
+              `Models JSON field "providers.${name}.models[${index}].effort.levels" cannot contain duplicates.`,
+            );
+          }
+          const allowed = THINKING_EFFORT_LEVELS as readonly string[];
+          const unsupported = levels.find((level) => !allowed.includes(level));
+          if (unsupported) {
+            throw new Error(
+              `Models JSON field "providers.${name}.models[${index}].effort.levels" contains unsupported value '${unsupported}'.`,
+            );
+          }
+          if (typeof effort['default'] !== 'string') {
+            throw new Error(
+              `Models JSON field "providers.${name}.models[${index}].effort.default" must be a string.`,
+            );
+          }
+          if (!levels.includes(effort['default'] as string)) {
+            throw new Error(
+              `Models JSON field "providers.${name}.models[${index}].effort.default" must be included in levels.`,
+            );
+          }
+          if (m['reasoning'] !== true && levels.some((level) => level !== 'off')) {
+            throw new Error(
+              `Models JSON field "providers.${name}.models[${index}].effort.levels" requires reasoning=true for non-'off' values.`,
+            );
+          }
+        }
         ensureOptionalStringArray(
           m['input'],
           `Models JSON field "providers.${name}.models[${index}].input"`,

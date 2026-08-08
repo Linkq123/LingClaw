@@ -82,8 +82,9 @@ Selecting a tool step opens the Tool Inspector. It docks on wide desktops, float
 - Press `Enter` to send and `Shift+Enter` for a new line.
 - Type `/` as the first character to open commands; use arrows to move and `Tab` to complete.
 - Type `@` in a group to open member completion; the stored protocol value is the session ID.
-- The composer directly exposes Execute and Plan modes. The choice stays in memory per session, so switching sessions cannot leak the mode. Plan Mode is disabled in groups.
-- The `+` menu is used for image attachments. Unavailable capabilities are hidden or disabled.
+- Execute is the implicit default and has no extra label. A regular session can select Plan Mode from the `+` menu, after which a compact Plan chip appears. The choice stays in memory per session, so switching sessions cannot leak the mode. In groups the Plan entry remains visible but disabled with an explanation.
+- The `+` menu always opens. Add image remains visible for text-only models, missing S3, uploads in progress, and protected storage, but is disabled with the exact reason.
+- The lower toolbar shows the current session model and, for reasoning models, its Effort. Open it to search models by Provider and select one of that model's configured Effort levels. Model and Effort are saved atomically and restored after reload or restart. Groups hide this single-model control because every member has its own route.
 - Normal text sent during an active run is queued and injected before the next Analyze phase. The stop button and `/stop` request immediate cancellation.
 - When no model is available, the composer explains why and blocks regular messages. Status, help, and configuration commands remain usable.
 

@@ -60,6 +60,8 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
         history,
         view_state,
         todos_state,
+        effective_model,
+        effort,
         supports_image,
         model_override_present,
         model_override_configured,
@@ -71,12 +73,15 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
             let (model, model_override_configured, effective_model_configured) =
                 session.model_configuration(&config);
             let supports_image = config.model_supports_image(&model);
+            let effort = config.normalize_model_effort(&model, &session.think_level);
             let usage = build_session_usage_payload(session);
             (
                 session.name.clone(),
                 build_history_payload_with_s3(session, config.s3.as_ref()),
                 build_view_state_payload(session),
                 crate::todos::build_todos_state_event(&session.todos),
+                model,
+                effort,
                 supports_image,
                 session.model_override.is_some(),
                 model_override_configured,
@@ -89,6 +94,8 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
                 default_history_payload(),
                 default_view_state_payload(),
                 default_todos_state_payload(),
+                config.model.clone(),
+                config.normalize_model_effort(&config.model, "auto"),
                 false,
                 false,
                 false,
@@ -100,7 +107,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
 
     let s3_available = config.s3.is_some();
     let s3_config_id = config.s3.as_ref().map(crate::image_uploads::s3_config_id);
-    let session_payload = json!({"type":"session","id":session_id,"name":name,"explicitPrimaryModelConfigured":config.explicit_primary_model_configured,"modelOverridePresent":model_override_present,"modelOverrideConfigured":model_override_configured,"effectiveModelConfigured":effective_model_configured,"configRevision":config_revision,"capabilities":{"image":supports_image,"s3":s3_available,"s3_config_id":s3_config_id},"usage":usage});
+    let session_payload = json!({"type":"session","id":session_id,"name":name,"model":effective_model,"effort":effort,"explicitPrimaryModelConfigured":config.explicit_primary_model_configured,"modelOverridePresent":model_override_present,"modelOverrideConfigured":model_override_configured,"effectiveModelConfigured":effective_model_configured,"configRevision":config_revision,"capabilities":{"image":supports_image,"s3":s3_available,"s3_config_id":s3_config_id},"usage":usage});
     drop(model_status_guard);
     let history = attach_plan_history(tx, state, session_id, history).await;
 
@@ -123,6 +130,7 @@ pub(crate) fn build_session_info_payload(
     name: &str,
     config: &Config,
     effective_model: &str,
+    effort: &str,
     model_override_present: bool,
     model_override_configured: bool,
     effective_model_configured: bool,
@@ -132,28 +140,35 @@ pub(crate) fn build_session_info_payload(
     let supports_image = config.model_supports_image(effective_model);
     let s3_available = config.s3.is_some();
     let s3_config_id = config.s3.as_ref().map(crate::image_uploads::s3_config_id);
-    json!({"type":"session","id":session_id,"name":name,"explicitPrimaryModelConfigured":config.explicit_primary_model_configured,"modelOverridePresent":model_override_present,"modelOverrideConfigured":model_override_configured,"effectiveModelConfigured":effective_model_configured,"configRevision":config_revision,"capabilities":{"image":supports_image,"s3":s3_available,"s3_config_id":s3_config_id},"usage":usage})
+    json!({"type":"session","id":session_id,"name":name,"model":effective_model,"effort":effort,"explicitPrimaryModelConfigured":config.explicit_primary_model_configured,"modelOverridePresent":model_override_present,"modelOverrideConfigured":model_override_configured,"effectiveModelConfigured":effective_model_configured,"configRevision":config_revision,"capabilities":{"image":supports_image,"s3":s3_available,"s3_config_id":s3_config_id},"usage":usage})
+}
+
+struct SessionModelConfigurationSnapshot<'a> {
+    model: &'a str,
+    effort: &'a str,
+    model_override_present: bool,
+    model_override_configured: bool,
+    effective_model_configured: bool,
 }
 
 fn build_session_model_configuration_payload(
     session_id: &str,
     config: &Config,
-    effective_model: &str,
-    model_override_present: bool,
-    model_override_configured: bool,
-    effective_model_configured: bool,
+    snapshot: SessionModelConfigurationSnapshot<'_>,
     config_revision: u64,
 ) -> serde_json::Value {
     json!({
         "type": "session_model_configuration",
         "id": session_id,
+        "model": snapshot.model,
+        "effort": snapshot.effort,
         "explicitPrimaryModelConfigured": config.explicit_primary_model_configured,
-        "modelOverridePresent": model_override_present,
-        "modelOverrideConfigured": model_override_configured,
-        "effectiveModelConfigured": effective_model_configured,
+        "modelOverridePresent": snapshot.model_override_present,
+        "modelOverrideConfigured": snapshot.model_override_configured,
+        "effectiveModelConfigured": snapshot.effective_model_configured,
         "configRevision": config_revision,
         "capabilities": {
-            "image": config.model_supports_image(effective_model),
+            "image": config.model_supports_image(snapshot.model),
             "s3": config.s3.is_some(),
             "s3_config_id": config.s3.as_ref().map(crate::image_uploads::s3_config_id),
         },
@@ -176,6 +191,7 @@ pub(crate) async fn collect_model_configuration_payloads(
             .map(|session_id| {
                 let (
                     model,
+                    effort,
                     model_override_present,
                     model_override_configured,
                     effective_model_configured,
@@ -184,8 +200,10 @@ pub(crate) async fn collect_model_configuration_payloads(
                     .map(|session| {
                         let (model, model_override_configured, effective_model_configured) =
                             session.model_configuration(config);
+                        let effort = config.normalize_model_effort(&model, &session.think_level);
                         (
                             model,
+                            effort,
                             session.model_override.is_some(),
                             model_override_configured,
                             effective_model_configured,
@@ -194,6 +212,7 @@ pub(crate) async fn collect_model_configuration_payloads(
                     .unwrap_or_else(|| {
                         (
                             config.model.clone(),
+                            config.normalize_model_effort(&config.model, "auto"),
                             false,
                             false,
                             config.explicit_primary_model_configured,
@@ -202,10 +221,13 @@ pub(crate) async fn collect_model_configuration_payloads(
                 let payload = build_session_model_configuration_payload(
                     &session_id,
                     config,
-                    &model,
-                    model_override_present,
-                    model_override_configured,
-                    effective_model_configured,
+                    SessionModelConfigurationSnapshot {
+                        model: &model,
+                        effort: &effort,
+                        model_override_present,
+                        model_override_configured,
+                        effective_model_configured,
+                    },
                     config_revision,
                 );
                 (session_id, payload)

@@ -118,6 +118,7 @@ Settings → Models → Test sends a small real request to validate an endpoint 
 | `id` | Required upstream model ID |
 | `name` | Display label; falls back to ID |
 | `reasoning` | Whether reasoning effort is supported |
+| `effort` | Optional selectable effort levels and default for this model |
 | `input` | `text` and optional `image` capabilities |
 | `contextWindow` | Context window in tokens |
 | `maxTokens` | Maximum output tokens |
@@ -125,6 +126,25 @@ Settings → Models → Test sends a small real request to validate an endpoint 
 | `compat` | Provider/model compatibility overrides |
 
 `input: ["text", "image"]` is required before LingClaw exposes attachments or tool images, but it cannot guarantee every upstream combination is accepted. OpenAI-compatible Chat removes tool images and retries once only when the endpoint clearly rejects image/tool content. Authentication, rate-limit, and ordinary schema errors never trigger that fallback.
+
+### Thinking Effort
+
+A reasoning model can explicitly limit the Effort choices exposed by the composer and `/think`, and define the default used when switching to that model:
+
+```json
+{
+  "id": "reasoning-model",
+  "reasoning": true,
+  "effort": {
+    "levels": ["auto", "low", "medium", "high"],
+    "default": "medium"
+  }
+}
+```
+
+The fixed configuration order is `auto`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. `levels` must be nonempty and unique, and `default` must be included in it. Every value except `off` requires `reasoning: true`; turning Reasoning off removes non-`off` Effort configuration.
+
+Legacy reasoning models without `effort` retain the complete set with `auto` as the default. Non-reasoning models behave as `levels: ["off"]`. The composer persists model and Effort as one atomic per-session choice. If the previous Effort is unsupported after a model switch—or removed by a Settings hot reload—LingClaw applies and persists the target model's `default`.
 
 ### Thinking compatibility
 
@@ -150,7 +170,7 @@ Leaving it unset uses protocol defaults; custom legacy values remain preserved. 
 }
 ```
 
-Support for `off`, `minimal`, `xhigh`, and `max` differs by model. LingClaw maps requested levels to the configured dialect; `/status` shows the resolved model and think state.
+The model entry defines the user-selectable range, while `compat.thinkingFormat` maps the chosen Effort to the upstream dialect. Support for `off`, `minimal`, `xhigh`, and `max` differs by model; `/status` shows the resolved model and think state.
 
 ## Agent model routing
 

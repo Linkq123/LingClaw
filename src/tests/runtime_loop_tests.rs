@@ -43,6 +43,25 @@ fn test_config() -> Config {
     }
 }
 
+fn test_reasoning_config() -> Config {
+    let mut config = test_config();
+    config.model = "openai/reasoning-model".to_string();
+    config.providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "reasoning-model".to_string(),
+                reasoning: Some(true),
+                ..Default::default()
+            }],
+        },
+    );
+    config
+}
+
 #[test]
 fn delegated_config_uses_the_validated_session_model_as_primary_fallback() {
     let config = test_config();
@@ -3046,7 +3065,7 @@ async fn handle_idle_socket_input_queues_new_prompt_while_reconnected_run_active
 
 #[tokio::test]
 async fn handle_idle_socket_input_allows_think_command_while_reconnected_run_active() {
-    let state = Arc::new(test_app_state());
+    let state = Arc::new(test_app_state_with_config(test_reasoning_config()));
     let session_id = MAIN_SESSION_ID.to_string();
     let mut current_session_id = session_id.clone();
     let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
@@ -3669,6 +3688,7 @@ fn install_openai_model(state: &Arc<AppState>, model_id: &str, reasoning: bool) 
                 id: model_id.to_string(),
                 name: None,
                 reasoning: Some(reasoning),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(8192),
@@ -7768,11 +7788,12 @@ fn drain_busy_socket_messages_collects_interventions_and_stops_run() {
 #[test]
 fn drain_busy_socket_messages_applies_think_command_without_queueing_it() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let state = std::sync::Arc::new(test_app_state());
+    let state = std::sync::Arc::new(test_app_state_with_config(test_reasoning_config()));
     let session_id = MAIN_SESSION_ID.to_string();
     let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
     let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let (configuration_tx, mut configuration_rx) = mpsc::channel::<String>(8);
     let run_cancel = CancellationToken::new();
     let mut pending = Vec::new();
 
@@ -7782,6 +7803,16 @@ fn drain_busy_socket_messages_applies_think_command_without_queueing_it() {
             .lock()
             .await
             .insert(session_id.clone(), test_session(&session_id, "Main", None));
+        state.session_clients.lock().await.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: 1,
+                tx: configuration_tx,
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
 
         inbound_tx
             .send("/think high".to_string())
@@ -7834,6 +7865,18 @@ fn drain_busy_socket_messages_applies_think_command_without_queueing_it() {
             .is_some_and(|value| value.contains("Intervention received"))
     );
     assert!(live_rx.try_recv().is_err());
+
+    let configuration_event: serde_json::Value = serde_json::from_str(
+        &configuration_rx
+            .try_recv()
+            .expect("busy think should broadcast model configuration"),
+    )
+    .expect("model configuration broadcast should be valid JSON");
+    assert_eq!(configuration_event["type"], "session_model_configuration");
+    assert_eq!(configuration_event["id"], MAIN_SESSION_ID);
+    assert_eq!(configuration_event["effort"], "high");
+    assert!(configuration_event["configRevision"].as_u64().is_some());
+    assert!(configuration_rx.try_recv().is_err());
 
     let updated_think = rt.block_on(async {
         let sessions = state.sessions.lock().await;
@@ -8156,6 +8199,7 @@ fn update_llm_response_usage_uses_configured_provider_name() {
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),

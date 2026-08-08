@@ -29,6 +29,7 @@ fn explicit_primary_model_validation_rejects_unknown_catalog_references() {
                 id: "good".to_string(),
                 name: None,
                 reasoning: None,
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: None,
@@ -69,6 +70,7 @@ fn explicit_primary_model_validation_rejects_an_ambiguous_plain_json_model() {
         id: "shared".to_string(),
         name: None,
         reasoning: None,
+        effort: None,
         input: None,
         cost: None,
         context_window: None,
@@ -181,6 +183,7 @@ fn align_runtime_provider_config_uses_primary_provider_entry() {
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -199,6 +202,7 @@ fn align_runtime_provider_config_uses_primary_provider_entry() {
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -236,6 +240,7 @@ fn align_runtime_provider_config_updates_provider_family_from_primary_model() {
                 id: "claude-haiku-4-5".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(200000),
@@ -273,6 +278,7 @@ fn resolve_provider_name_prefers_configured_provider_alias() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -291,6 +297,7 @@ fn resolve_provider_name_prefers_configured_provider_alias() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -324,6 +331,7 @@ fn model_supports_image_prefers_runtime_aligned_provider_for_plain_ids() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: Some(vec!["text".to_string()]),
                 cost: None,
                 context_window: Some(128000),
@@ -342,6 +350,7 @@ fn model_supports_image_prefers_runtime_aligned_provider_for_plain_ids() {
                 id: "shared-model".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: Some(vec!["text".to_string(), "image".to_string()]),
                 cost: None,
                 context_window: Some(128000),
@@ -437,6 +446,7 @@ fn resolve_model_reads_openai_responses_reasoning_summary_from_compat() {
                 id: "gpt-5.5".to_string(),
                 name: None,
                 reasoning: Some(true),
+                effort: None,
                 input: Some(vec!["text".to_string()]),
                 cost: None,
                 context_window: Some(400000),
@@ -550,6 +560,7 @@ fn validate_json_agent_model_refs_rejects_unknown_provider_alias() {
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -627,6 +638,7 @@ fn validate_json_agent_model_refs_rejects_unknown_model_for_configured_provider(
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -675,6 +687,7 @@ fn sanitize_loaded_json_config_drops_an_unknown_plain_primary_model() {
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: None,
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: None,
@@ -728,6 +741,7 @@ fn validate_json_agent_model_refs_checks_dynamic_sub_agent_overrides() {
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -823,6 +837,7 @@ fn validate_json_agent_model_refs_allows_null_dynamic_sub_agent_override() {
                 id: "gpt-4o-mini".to_string(),
                 name: None,
                 reasoning: Some(false),
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: Some(128000),
@@ -1171,6 +1186,7 @@ fn sanitize_loaded_json_config_drops_builtin_prefixed_primary_with_unavailable_d
                 id: "gpt-x".to_string(),
                 name: None,
                 reasoning: None,
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: None,
@@ -1298,6 +1314,7 @@ fn validate_json_provider_models_rejects_empty_model_id() {
                 id: " ".to_string(),
                 name: None,
                 reasoning: None,
+                effort: None,
                 input: None,
                 cost: None,
                 context_window: None,
@@ -1319,6 +1336,190 @@ fn validate_json_provider_models_rejects_empty_model_id() {
     .expect_err("empty model ids should be rejected");
 
     assert!(err.contains("model id cannot be empty"));
+}
+
+fn config_with_model_effort(reasoning: bool, levels: Vec<&str>, default: &str) -> JsonConfig {
+    JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(HashMap::from([(
+                "custom".to_string(),
+                JsonProviderConfig {
+                    base_url: "https://gateway.example/v1".to_string(),
+                    api_key: "secret-key".to_string(),
+                    api: "openai-completions".to_string(),
+                    models: vec![JsonModelEntry {
+                        id: "reasoner".to_string(),
+                        name: Some("Reasoner".to_string()),
+                        reasoning: Some(reasoning),
+                        effort: Some(JsonModelEffortConfig {
+                            levels: levels.into_iter().map(str::to_string).collect(),
+                            default: default.to_string(),
+                        }),
+                        input: Some(vec!["text".to_string(), "image".to_string()]),
+                        cost: None,
+                        context_window: None,
+                        max_tokens: None,
+                        compat: None,
+                    }],
+                },
+            )])),
+        }),
+        agents: None,
+        mcp_servers: None,
+        s3: None,
+    }
+}
+
+#[test]
+fn validate_json_provider_models_accepts_configured_efforts() {
+    let config = config_with_model_effort(true, vec!["auto", "medium", "high"], "medium");
+    assert!(validate_json_provider_models(&config).is_ok());
+}
+
+#[test]
+fn validate_json_provider_models_rejects_invalid_effort_contracts() {
+    let duplicate = config_with_model_effort(true, vec!["medium", "medium"], "medium");
+    assert!(
+        validate_json_provider_models(&duplicate)
+            .expect_err("duplicate efforts must fail")
+            .contains("duplicate")
+    );
+
+    let missing_default = config_with_model_effort(true, vec!["low", "high"], "medium");
+    assert!(
+        validate_json_provider_models(&missing_default)
+            .expect_err("default must be selected")
+            .contains("must be included")
+    );
+
+    let non_reasoning = config_with_model_effort(false, vec!["off", "high"], "off");
+    assert!(
+        validate_json_provider_models(&non_reasoning)
+            .expect_err("non-reasoning models may only expose off")
+            .contains("reasoning=true")
+    );
+}
+
+#[test]
+fn model_effort_options_preserve_legacy_reasoning_defaults_and_explicit_constraints() {
+    let providers = HashMap::from([(
+        "custom".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "secret".to_string(),
+            api: "openai-responses".to_string(),
+            models: vec![
+                JsonModelEntry {
+                    id: "legacy-reasoner".to_string(),
+                    name: None,
+                    reasoning: Some(true),
+                    effort: None,
+                    input: Some(vec!["text".to_string()]),
+                    cost: None,
+                    context_window: None,
+                    max_tokens: None,
+                    compat: None,
+                },
+                JsonModelEntry {
+                    id: "constrained".to_string(),
+                    name: None,
+                    reasoning: Some(true),
+                    effort: Some(JsonModelEffortConfig {
+                        levels: vec!["high".to_string(), "low".to_string()],
+                        default: "high".to_string(),
+                    }),
+                    input: Some(vec!["text".to_string()]),
+                    cost: None,
+                    context_window: None,
+                    max_tokens: None,
+                    compat: None,
+                },
+                JsonModelEntry {
+                    id: "plain".to_string(),
+                    name: None,
+                    reasoning: Some(false),
+                    effort: None,
+                    input: Some(vec!["text".to_string()]),
+                    cost: None,
+                    context_window: None,
+                    max_tokens: None,
+                    compat: None,
+                },
+            ],
+        },
+    )]);
+    let config = runtime_alignment_config(
+        Provider::OpenAI,
+        "https://gateway.example/v1",
+        "secret",
+        "custom/legacy-reasoner",
+        providers,
+    );
+
+    let legacy = config.model_effort_options("custom/legacy-reasoner");
+    assert_eq!(legacy.default, "auto");
+    assert_eq!(
+        legacy.levels,
+        THINKING_EFFORT_LEVELS
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect::<Vec<_>>()
+    );
+    let constrained = config.model_effort_options("custom/constrained");
+    // Raw JSON order is intentionally not part of the runtime contract. The
+    // public catalog always follows the canonical effort order.
+    assert_eq!(constrained.levels, vec!["low", "high"]);
+    assert_eq!(constrained.default, "high");
+    assert_eq!(
+        config.normalize_model_effort("custom/constrained", "medium"),
+        "high"
+    );
+    assert_eq!(
+        config.model_effort_options("custom/plain").levels,
+        vec!["off"]
+    );
+}
+
+#[test]
+fn normalize_json_model_effort_order_preserves_unknown_metadata() {
+    let mut config = serde_json::json!({
+        "models": {
+            "providers": {
+                "custom": {
+                    "vendorFlag": { "keep": true },
+                    "models": [{
+                        "id": "reasoner",
+                        "modelFlag": 42,
+                        "effort": {
+                            "levels": ["max", "low", "auto", "off"],
+                            "default": "low",
+                            "futureField": "keep"
+                        }
+                    }]
+                }
+            }
+        }
+    });
+
+    normalize_json_model_effort_order(&mut config);
+
+    assert_eq!(
+        config["models"]["providers"]["custom"]["models"][0]["effort"]["levels"],
+        serde_json::json!(["auto", "off", "low", "max"])
+    );
+    assert_eq!(
+        config["models"]["providers"]["custom"]["vendorFlag"]["keep"],
+        true
+    );
+    assert_eq!(
+        config["models"]["providers"]["custom"]["models"][0]["modelFlag"],
+        42
+    );
+    assert_eq!(
+        config["models"]["providers"]["custom"]["models"][0]["effort"]["futureField"],
+        "keep"
+    );
 }
 
 #[test]

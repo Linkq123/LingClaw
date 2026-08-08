@@ -903,9 +903,9 @@ pub(crate) async fn run_subagent(
         // Let provider/model capabilities decide whether delegated runs should
         // send reasoning controls. This avoids 400s on OpenAI-compatible
         // models that reject `reasoning_effort` or similar fields.
-        let think_level = "auto";
+        let think_level = config.normalize_model_effort(&model_id, "auto");
         let budget =
-            context::message_budget_for_tool_defs(config, &model_id, think_level, &tool_defs);
+            context::message_budget_for_tool_defs(config, &model_id, &think_level, &tool_defs);
         context::prune_messages_for_provider(&mut messages, resolved.provider, budget);
         if tool_images_disabled {
             providers::strip_tool_images_for_compatibility(&mut messages);
@@ -954,7 +954,7 @@ pub(crate) async fn run_subagent(
                         workspace,
                         config.s3.as_ref(),
                         &sub_tx,
-                        think_level,
+                        &think_level,
                         &tool_defs,
                         false,
                         config.max_llm_retries,

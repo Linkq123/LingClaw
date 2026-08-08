@@ -1172,6 +1172,7 @@ pub(crate) async fn handle_idle_socket_input(
                         let (
                             name,
                             model,
+                            effort,
                             model_override_present,
                             model_override_configured,
                             effective_model_configured,
@@ -1180,9 +1181,11 @@ pub(crate) async fn handle_idle_socket_input(
                             .map(|s| {
                                 let (model, model_override_configured, effective_model_configured) =
                                     s.model_configuration(&config);
+                                let effort = config.normalize_model_effort(&model, &s.think_level);
                                 (
                                     s.name.clone(),
                                     model,
+                                    effort,
                                     s.model_override.is_some(),
                                     model_override_configured,
                                     effective_model_configured,
@@ -1192,6 +1195,7 @@ pub(crate) async fn handle_idle_socket_input(
                                 (
                                     "Main".to_string(),
                                     config.model.clone(),
+                                    config.normalize_model_effort(&config.model, "auto"),
                                     false,
                                     false,
                                     config.explicit_primary_model_configured,
@@ -1206,6 +1210,7 @@ pub(crate) async fn handle_idle_socket_input(
                             &name,
                             &config,
                             &model,
+                            &effort,
                             model_override_present,
                             model_override_configured,
                             effective_model_configured,
@@ -1850,10 +1855,17 @@ async fn build_busy_command_events(
     state: &Arc<AppState>,
 ) -> Option<Vec<serde_json::Value>> {
     let (cmd, arg) = parse_busy_allowlisted_command(trimmed)?;
-    let result = match cmd {
+    let mut result = match cmd {
         "/think" => crate::commands::handle_think_command(arg, current_session_id, state).await,
         _ => return None,
     };
+
+    if let Some(payloads) = result.model_configuration_payloads.take() {
+        // Busy `/think` is persisted immediately and must publish the same
+        // revision to every bound Session/Group client as the idle command
+        // path. The origin-only `session` event below remains for compatibility.
+        crate::socket_sync::send_model_configuration_payloads(state, payloads).await;
+    }
 
     let hook_input = CommandHookInput {
         command: cmd.to_string(),
@@ -1887,6 +1899,7 @@ async fn build_busy_command_events(
                 let (
                     name,
                     model,
+                    effort,
                     model_override_present,
                     model_override_configured,
                     effective_model_configured,
@@ -1895,9 +1908,11 @@ async fn build_busy_command_events(
                     .map(|s| {
                         let (model, model_override_configured, effective_model_configured) =
                             s.model_configuration(&config);
+                        let effort = config.normalize_model_effort(&model, &s.think_level);
                         (
                             s.name.clone(),
                             model,
+                            effort,
                             s.model_override.is_some(),
                             model_override_configured,
                             effective_model_configured,
@@ -1907,6 +1922,7 @@ async fn build_busy_command_events(
                         (
                             "Main".to_string(),
                             config.model.clone(),
+                            config.normalize_model_effort(&config.model, "auto"),
                             false,
                             false,
                             config.explicit_primary_model_configured,
@@ -1921,6 +1937,7 @@ async fn build_busy_command_events(
                     &name,
                     &config,
                     &model,
+                    &effort,
                     model_override_present,
                     model_override_configured,
                     effective_model_configured,

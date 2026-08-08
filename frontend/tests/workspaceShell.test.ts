@@ -490,6 +490,12 @@ describe('workspace shell', () => {
     expect(indexHtml).toMatch(
       /<textarea[\s\S]*?id="input"[\s\S]*?role="combobox"[\s\S]*?aria-autocomplete="list"[\s\S]*?aria-controls="slash-command-menu"[\s\S]*?aria-expanded="false"[\s\S]*?aria-haspopup="listbox"/,
     );
+    expect(indexHtml).toMatch(
+      /id="attach-btn"[\s\S]*?aria-expanded="false"[\s\S]*?aria-haspopup="menu"[\s\S]*?aria-controls="attach-popup"/,
+    );
+    expect(indexHtml).toMatch(
+      /id="composer-model-btn"[\s\S]*?aria-expanded="false"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-controls="composer-model-popup"/,
+    );
   });
 
   it('lets a top-level action dialog own the keyboard above mobile navigation', () => {
