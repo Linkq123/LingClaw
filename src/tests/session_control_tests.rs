@@ -1613,7 +1613,10 @@ fn cleanup_created_session_for_test(session_id: &str) {
     let _ = std::fs::remove_file(session_store::sessions_dir().join(format!("{session_id}.json")));
     let _ =
         std::fs::remove_file(session_store::sessions_dir().join(format!("{session_id}.json.tmp")));
-    let _ = std::fs::remove_dir_all(crate::session_workspace_path(session_id));
+    let workspace = crate::session_workspace_path(session_id);
+    if let Some(session_root) = workspace.parent() {
+        let _ = std::fs::remove_dir_all(session_root);
+    }
 }
 
 #[tokio::test]

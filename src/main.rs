@@ -3986,7 +3986,10 @@ async fn api_sessions_with_filter(
     );
 
     sort_session_json_values(&mut list);
-    Ok(Json(json!({"sessions": list})))
+    Ok(Json(json!({
+        "sessions": list,
+        "session_ids_case_sensitive": !cfg!(windows),
+    })))
 }
 
 fn browse_root_paths() -> Vec<PathBuf> {

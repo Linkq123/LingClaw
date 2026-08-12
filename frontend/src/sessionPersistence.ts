@@ -22,6 +22,42 @@ export function persistActiveSessionId(sessionId: string): void {
   }
 }
 
+export function resolveRestoredActiveSessionId(
+  persistedSessionId: string,
+  sessions: ReadonlyArray<{ readonly id: string }> | null,
+  sessionIdsCaseSensitive: boolean,
+): string {
+  const requestedSessionId = persistedSessionId.trim();
+  if (!requestedSessionId || sessions === null) {
+    return 'main';
+  }
+
+  const exactMatch = sessions.find((session) => session.id === requestedSessionId);
+  if (exactMatch) {
+    return exactMatch.id;
+  }
+  if (sessionIdsCaseSensitive) {
+    return 'main';
+  }
+
+  const asciiCaseInsensitiveMatch = sessions.find((session) =>
+    asciiEqualsIgnoreCase(session.id, requestedSessionId),
+  );
+  return asciiCaseInsensitiveMatch?.id ?? 'main';
+}
+
+function asciiEqualsIgnoreCase(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const leftCode = left.charCodeAt(index);
+    const rightCode = right.charCodeAt(index);
+    const foldedLeft = leftCode >= 65 && leftCode <= 90 ? leftCode + 32 : leftCode;
+    const foldedRight = rightCode >= 65 && rightCode <= 90 ? rightCode + 32 : rightCode;
+    if (foldedLeft !== foldedRight) return false;
+  }
+  return true;
+}
+
 export interface GroupControlSessionState {
   activeSessionId: string;
   groupReturnSessionId: string;

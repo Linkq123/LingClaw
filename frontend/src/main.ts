@@ -283,6 +283,7 @@ import {
   normalizeGroupRunUpdatedAt,
   persistActiveGroupId,
   persistActiveSessionId,
+  resolveRestoredActiveSessionId,
   sessionIdAfterLeavingGroup,
   shouldApplyGroupRunStatusUpdate,
 } from './sessionPersistence.js';
@@ -290,7 +291,8 @@ import {
 // ── Initialize DOM ──
 initDomRefs();
 initI18n();
-state.activeSessionId = loadActiveSessionId();
+const persistedActiveSessionId = loadActiveSessionId();
+state.activeSessionId = 'main';
 const persistedActiveGroupId = loadActiveGroupId();
 state.activeGroupId = '';
 const switchToSession = createMobileNavigationSelectionHandler(
@@ -1178,15 +1180,23 @@ function renderGroupMemberDrawer() {
   }
 }
 
-async function refreshSessionsList() {
+interface SessionListRefreshResult {
+  sessionIdsCaseSensitive: boolean;
+}
+
+async function refreshSessionsList(): Promise<SessionListRefreshResult | null> {
   try {
     const response = await fetch('/api/sessions', { cache: 'no-store' });
-    if (!response.ok) return;
+    if (!response.ok) return null;
     const payload = await response.json();
     state.sessions = normalizeSessionListPayload(payload);
     renderSessionDrawer();
+    return {
+      sessionIdsCaseSensitive: payload?.session_ids_case_sensitive !== false,
+    };
   } catch {
-    // ignore session list refresh failures; live socket state still works
+    // Startup falls back to main; later refreshes retain the last known list.
+    return null;
   }
 }
 
@@ -3396,8 +3406,14 @@ if (dom.sessionDrawerNewBtn) {
   dom.sessionDrawerNewBtn.addEventListener('click', handleSessionDrawerNewClick);
 }
 async function bootstrapWorkspace(): Promise<void> {
+  const sessionList = await refreshSessionsList();
+  state.activeSessionId = resolveRestoredActiveSessionId(
+    persistedActiveSessionId,
+    sessionList ? state.sessions : null,
+    sessionList?.sessionIdsCaseSensitive ?? true,
+  );
+  persistActiveSessionId(state.activeSessionId);
   await discoverClientFeatures();
-  await refreshSessionsList();
   connect(handleMessage);
 }
 

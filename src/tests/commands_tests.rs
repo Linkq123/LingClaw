@@ -25,6 +25,43 @@ fn unique_session_id(prefix: &str) -> String {
     format!("{prefix}-{unique}")
 }
 
+struct ManagedSessionCleanup {
+    session_id: String,
+    session_root: PathBuf,
+}
+
+impl ManagedSessionCleanup {
+    fn new(session_id: &str) -> Self {
+        let workspace = crate::session_workspace_path(session_id);
+        let session_root = workspace
+            .parent()
+            .map(PathBuf::from)
+            .expect("managed Session workspace should have a root");
+        Self {
+            session_id: session_id.to_string(),
+            session_root,
+        }
+    }
+
+    fn cleanup_now(&self) {
+        for suffix in ["json", "json.tmp"] {
+            let _ = std::fs::remove_file(
+                sessions_dir().join(format!("{}.{}", self.session_id, suffix)),
+            );
+        }
+        // The filesystem-failure test intentionally replaces the Session root
+        // directory with a file, so handle either shape without widening scope.
+        let _ = std::fs::remove_file(&self.session_root);
+        let _ = std::fs::remove_dir_all(&self.session_root);
+    }
+}
+
+impl Drop for ManagedSessionCleanup {
+    fn drop(&mut self) {
+        self.cleanup_now();
+    }
+}
+
 fn test_config() -> crate::Config {
     crate::Config {
         explicit_primary_model_configured: true,
@@ -2229,14 +2266,8 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
 
 #[tokio::test]
 async fn delete_command_rejects_active_session() {
-    let workspace = unique_temp_workspace("lingclaw-command-delete-active");
-    let _ = tokio::fs::remove_dir_all(&workspace).await;
-    tokio::fs::create_dir_all(&workspace)
-        .await
-        .expect("workspace should be created");
-    prompts::init_session_prompt_files(&workspace);
-
     let active_session_id = unique_session_id("delete-active");
+    let cleanup = ManagedSessionCleanup::new(&active_session_id);
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(test_config())),
         http: reqwest::Client::new(),
@@ -2295,19 +2326,14 @@ async fn delete_command_rejects_active_session() {
     );
     assert!(state.sessions.lock().await.contains_key(&active_session_id));
 
-    let _ = tokio::fs::remove_dir_all(workspace.parent().unwrap_or(&workspace)).await;
+    cleanup.cleanup_now();
+    assert!(!cleanup.session_root.exists());
 }
 
 #[tokio::test]
 async fn delete_command_rejects_running_session_without_active_connection() {
-    let workspace = unique_temp_workspace("lingclaw-command-delete-running");
-    let _ = tokio::fs::remove_dir_all(&workspace).await;
-    tokio::fs::create_dir_all(&workspace)
-        .await
-        .expect("workspace should be created");
-    prompts::init_session_prompt_files(&workspace);
-
     let running_session_id = unique_session_id("delete-running");
+    let cleanup = ManagedSessionCleanup::new(&running_session_id);
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(test_config())),
         http: reqwest::Client::new(),
@@ -2376,12 +2402,14 @@ async fn delete_command_rejects_running_session_without_active_connection() {
             .contains_key(&running_session_id)
     );
 
-    let _ = tokio::fs::remove_dir_all(workspace.parent().unwrap_or(&workspace)).await;
+    cleanup.cleanup_now();
+    assert!(!cleanup.session_root.exists());
 }
 
 #[tokio::test]
 async fn delete_command_succeeds_with_a_warning_when_workspace_removal_fails() {
     let session_id = unique_session_id("delete-fs-failure");
+    let cleanup = ManagedSessionCleanup::new(&session_id);
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(test_config())),
         http: reqwest::Client::new(),
@@ -2415,6 +2443,7 @@ async fn delete_command_succeeds_with_a_warning_when_workspace_removal_fails() {
         .parent()
         .map(PathBuf::from)
         .expect("session dir should exist");
+    assert_eq!(session_dir, cleanup.session_root);
     let sentinel_path = session_dir.join("sentinel.txt");
     tokio::fs::write(&sentinel_path, b"keep")
         .await
@@ -2472,9 +2501,9 @@ async fn delete_command_succeeds_with_a_warning_when_workspace_removal_fails() {
             .expect("workspace check should succeed")
     );
 
-    let _ = tokio::fs::remove_file(&session_dir).await;
-    let _ = tokio::fs::remove_dir_all(session_dir).await;
-    let _ = tokio::fs::remove_file(&session_file).await;
+    cleanup.cleanup_now();
+    assert!(!cleanup.session_root.exists());
+    assert!(!session_file.exists());
 }
 
 #[tokio::test]

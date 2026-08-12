@@ -6311,6 +6311,11 @@ async fn api_sessions_lists_loaded_non_main_sessions() {
         .as_array()
         .expect("sessions array should be present");
 
+    assert_eq!(
+        payload["session_ids_case_sensitive"],
+        serde_json::Value::Bool(!cfg!(windows))
+    );
+
     assert!(
         sessions
             .iter()

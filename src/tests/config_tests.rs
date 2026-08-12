@@ -3,6 +3,37 @@ use serde_json::json;
 use std::{collections::HashMap, time::Duration};
 
 #[test]
+fn unit_tests_use_a_process_isolated_lingclaw_home() {
+    let config_dir = config_dir_path().expect("unit test config directory should resolve");
+    let test_home = config_dir
+        .parent()
+        .expect("unit test config directory should have a home");
+
+    assert_eq!(
+        config_dir.file_name().and_then(|name| name.to_str()),
+        Some(".lingclaw")
+    );
+    assert!(
+        test_home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("lingclaw-unit-test-home-")),
+        "unit tests must use the process-isolated home, got {}",
+        test_home.display()
+    );
+
+    if let Ok(environment_home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))
+        && !environment_home.is_empty()
+    {
+        assert_ne!(
+            config_dir,
+            Path::new(&environment_home).join(".lingclaw"),
+            "unit tests must never use the environment user's LingClaw home"
+        );
+    }
+}
+
+#[test]
 fn group_chat_is_opt_in_and_parses_the_explicit_setting() {
     let omitted: JsonConfig = serde_json::from_str(r#"{"settings":{}}"#)
         .expect("settings without enableGroups should parse");

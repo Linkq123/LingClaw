@@ -138,6 +138,7 @@
 
 ```json
 {
+  "session_ids_case_sensitive": false,
   "sessions": [
     {
       "id": "main",
@@ -170,6 +171,7 @@
 ### 说明
 
 - `main` 固定排在第一；其他 session 按 `updated_at` 倒序排列
+- `session_ids_case_sensitive` 由服务端给出 Session ID 匹配策略：Linux 为 `true`，Windows 为 `false`。客户端应始终优先精确匹配；仅当该字段为 `false` 时再按 ASCII 大小写无关匹配，并使用列表项中的 `id` 作为规范 ID
 - `messages` 为会话消息条数
 - `tool_calls` 为累计工具调用次数
 - 列表同时覆盖默认 `main` 和其他已创建 session

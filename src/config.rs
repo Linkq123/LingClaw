@@ -2050,14 +2050,36 @@ pub(crate) struct JsonDefaultModel {
     pub(crate) extra: HashMap<String, serde_json::Value>,
 }
 
+#[cfg(test)]
+fn test_home_path() -> PathBuf {
+    static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    TEST_HOME
+        .get_or_init(|| {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "lingclaw-unit-test-home-{}-{unique}",
+                std::process::id()
+            ))
+        })
+        .clone()
+}
+
 pub(crate) fn config_dir_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    if home.is_empty() {
+    #[cfg(test)]
+    let home = test_home_path();
+    #[cfg(not(test))]
+    let home = PathBuf::from(
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()?,
+    );
+    if home.as_os_str().is_empty() {
         return None;
     }
-    Some(Path::new(&home).join(".lingclaw"))
+    Some(home.join(".lingclaw"))
 }
 
 pub(crate) fn config_file_path() -> Option<PathBuf> {
