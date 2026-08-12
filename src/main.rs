@@ -6602,6 +6602,10 @@ pub(crate) fn replace_file_from_temp(path: &Path, tmp_path: &Path) -> std::io::R
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+fn should_run_setup_wizard(force_wizard: bool, serve_mode: bool) -> bool {
+    force_wizard || !serve_mode
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -6639,18 +6643,16 @@ async fn main() {
     }
 
     // CLI subcommands: lingclaw start|stop|restart|health|status|update
-    if args.len() > 1
-        && !args[1].starts_with('-')
-        && cli::handle_cli_command(&args[1], port_override)
-    {
+    if args.len() > 1 && cli::handle_cli_command(&args[1], port_override) {
         return;
     }
 
     let force_wizard = args.iter().any(|a| a == "--install-daemon");
     let serve_mode = args.iter().any(|a| a == "--serve");
 
-    // First-run setup wizard (before loading config)
-    if !cli::run_setup_wizard(force_wizard) {
+    // Detached `start` processes use `--serve` with null stdio and must skip the
+    // first-run wizard. An explicit `--install-daemon` still takes precedence.
+    if should_run_setup_wizard(force_wizard, serve_mode) && !cli::run_setup_wizard(force_wizard) {
         return;
     }
 

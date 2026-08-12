@@ -16190,3 +16190,10 @@ fn replace_file_from_temp_replaces_existing_file_without_losing_data() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn explicit_install_daemon_overrides_serve_mode_wizard_skip() {
+    assert!(should_run_setup_wizard(true, true));
+    assert!(!should_run_setup_wizard(false, true));
+    assert!(should_run_setup_wizard(false, false));
+}

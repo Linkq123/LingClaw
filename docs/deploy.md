@@ -191,7 +191,7 @@ lingclaw
 
 必须显式添加 Provider/Model，并为主 Agent 指定 `primary` 或使用 Session `/model`，普通对话才会启用。详见[配置指南](configuration.md)。
 
-如果用户目录仍包含旧版 `sessions/` 或 `groups/`，首次启动会在监听端口前迁移到 `lingclaw.db`。任何损坏、非法 ID 或引用错误都会中止启动并指出文件路径；成功后原目录保存在 `backups/sqlite-migration-<timestamp>/`，不会自动删除。
+如果用户目录仍包含旧版 `sessions/` 或 `groups/`，首次启动会在开始提供 HTTP 请求前迁移到 `lingclaw.db`。任何损坏、非法 ID 或引用错误都会中止启动并指出文件路径；成功后原目录保存在 `backups/sqlite-migration-<timestamp>/`，不会自动删除。
 
 管理命令：
 

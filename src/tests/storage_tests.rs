@@ -497,6 +497,68 @@ fn create_v5_database(path: &Path, session_id: &str) {
         .expect("schema version should initialize");
 }
 
+#[test]
+fn schema_signature_accepts_columns_appended_to_a_real_v5_sessions_table() {
+    let migrated = rusqlite::Connection::open_in_memory().unwrap();
+    migrated
+        .execute_batch(
+            r#"
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY COLLATE BINARY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                tool_calls_count INTEGER NOT NULL,
+                model_override TEXT,
+                think_level TEXT NOT NULL,
+                show_react INTEGER NOT NULL,
+                show_tools INTEGER NOT NULL,
+                show_reasoning INTEGER NOT NULL,
+                visible_message_count INTEGER NOT NULL,
+                version INTEGER NOT NULL
+            );
+            CREATE INDEX idx_sessions_updated_at ON sessions(updated_at DESC, id);
+            "#,
+        )
+        .unwrap();
+    migrated
+        .execute_batch(schema::SESSION_WORKSPACE_SCHEMA)
+        .unwrap();
+
+    let fresh = rusqlite::Connection::open_in_memory().unwrap();
+    fresh
+        .execute_batch(
+            r#"
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY COLLATE BINARY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                tool_calls_count INTEGER NOT NULL,
+                model_override TEXT,
+                think_level TEXT NOT NULL,
+                show_react INTEGER NOT NULL,
+                show_tools INTEGER NOT NULL,
+                show_reasoning INTEGER NOT NULL,
+                visible_message_count INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                workspace_kind TEXT NOT NULL DEFAULT 'managed',
+                working_directory TEXT NOT NULL DEFAULT '',
+                working_directory_key TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX idx_sessions_updated_at ON sessions(updated_at DESC, id);
+            CREATE INDEX idx_sessions_working_directory
+                ON sessions(working_directory_key, updated_at DESC, id);
+            "#,
+        )
+        .unwrap();
+
+    assert_eq!(
+        schema_signature(&fresh).unwrap(),
+        schema_signature(&migrated).unwrap()
+    );
+}
+
 fn migration_journal_fixture(
     home: &Path,
     suffix: &str,

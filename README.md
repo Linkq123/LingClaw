@@ -107,7 +107,7 @@ lingclaw db status
 lingclaw db backup
 ```
 
-Session、Group、消息、Todos、Usage、工作目录绑定和 Sub-agent 快照存放在 `~/.lingclaw/lingclaw.db`。从旧版升级时，LingClaw 会在监听端口前严格校验并迁移原有 `sessions/`、`groups/` JSON；原文件会永久保留在 `~/.lingclaw/backups/sqlite-migration-*/`，不会继续双写。
+Session、Group、消息、Todos、Usage、工作目录绑定和 Sub-agent 快照存放在 `~/.lingclaw/lingclaw.db`。从旧版升级时，LingClaw 会在开始提供 HTTP 请求前严格校验并迁移原有 `sessions/`、`groups/` JSON；原文件会永久保留在 `~/.lingclaw/backups/sqlite-migration-*/`，不会继续双写。
 
 安装细节、systemd、Docker 和反向代理说明见[部署指南](docs/deploy.md)。
 

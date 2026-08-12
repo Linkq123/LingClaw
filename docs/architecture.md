@@ -171,7 +171,7 @@ Orchestrator 验证 DAG，按拓扑层并行运行，传播依赖结果并发送
 
 `lingclaw.db` 是 Session、消息、Todos、Usage、Sub-agent 快照、Group 数据和工作目录绑定的唯一持久化来源。Schema v6 在 `sessions` 中保存 `workspace_kind`、规范化 `working_directory` 及平台匹配 key，并建立目录索引。复杂 Provider 字段使用 JSON 列，身份、顺序、时间、Tool ID 等常用查询字段独立存储。消息保存通过指纹比较公共前缀，只替换发生变化的尾部；Session/Group 多表更新在一个事务中提交。数据库使用 WAL、`foreign_keys=ON`、`synchronous=NORMAL` 和 5 秒 busy timeout，并通过 `application_id`、`schema_migrations` 与 `user_version` 管理归属和版本。
 
-首次发现旧 `sessions/` 或 `groups/` 时，Runtime 在监听端口前完成严格迁移：读取 primary/`.tmp`、校验 ID/引用和哈希，把目录原子移动到 `backups/sqlite-migration-<timestamp>/`，再在一个 SQLite 事务中导入、校验并记录完成标记。两阶段 journal 支持崩溃续跑；成功后不再读取或写入旧 JSON，备份不会自动删除。Schema 升级前先创建一致性数据库备份。
+首次发现旧 `sessions/` 或 `groups/` 时，Runtime 在开始提供 HTTP 请求前完成严格迁移：读取 primary/`.tmp`、校验 ID/引用和哈希，把目录原子移动到 `backups/sqlite-migration-<timestamp>/`，再在一个 SQLite 事务中导入、校验并记录完成标记。两阶段 journal 支持崩溃续跑；成功后不再读取或写入旧 JSON，备份不会自动删除。Schema 升级前先创建一致性数据库备份。
 
 运行期 SQLite I/O、损坏或约束错误会把进程置为粘性的 `protected` 状态。Runtime 取消活动 Agent/Group run 并拒绝核心数据库写入，读取和独立 `.lingclaw.json` 保存仍可用。HTTP 返回稳定的 `503 storage_protected`，WebSocket 广播 `storage_status`；修复外部问题后需要重启进程。
 

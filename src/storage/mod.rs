@@ -273,6 +273,7 @@ fn normalized_schema_sql(sql: &str) -> String {
     sql.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+        .replace(" ,", ",")
         .replace(" )", ")")
 }
 

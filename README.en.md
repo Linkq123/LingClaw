@@ -107,7 +107,7 @@ lingclaw db status
 lingclaw db backup
 ```
 
-Sessions, groups, messages, todos, usage, working-directory bindings, and sub-agent snapshots live in `~/.lingclaw/lingclaw.db`. On upgrade from the JSON store, LingClaw validates and migrates the old `sessions/` and `groups/` directories before opening its listener. The originals remain permanently under `~/.lingclaw/backups/sqlite-migration-*/`; LingClaw does not dual-write them.
+Sessions, groups, messages, todos, usage, working-directory bindings, and sub-agent snapshots live in `~/.lingclaw/lingclaw.db`. On upgrade from the JSON store, LingClaw validates and migrates the old `sessions/` and `groups/` directories before serving HTTP requests. The originals remain permanently under `~/.lingclaw/backups/sqlite-migration-*/`; LingClaw does not dual-write them.
 
 See the [deployment guide](docs/deploy.en.md) for installation details, systemd, Docker, and reverse proxies.
 

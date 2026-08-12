@@ -191,7 +191,7 @@ The first run opens the Setup Wizard. Configuration is stored at:
 
 Normal chat remains disabled until a provider/model and main-agent `primary` (or session `/model`) are explicit. See [Configuration](configuration.en.md).
 
-If the user directory still contains legacy `sessions/` or `groups/`, the first launch migrates them into `lingclaw.db` before binding the listener. Corruption, an invalid ID, or a broken reference stops startup and identifies the file. On success, the original directories stay permanently under `backups/sqlite-migration-<timestamp>/`.
+If the user directory still contains legacy `sessions/` or `groups/`, the first launch migrates them into `lingclaw.db` before serving HTTP requests. Corruption, an invalid ID, or a broken reference stops startup and identifies the file. On success, the original directories stay permanently under `backups/sqlite-migration-<timestamp>/`.
 
 Management commands:
 
