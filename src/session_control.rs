@@ -50,6 +50,67 @@ fn storage_protected_control_error() -> String {
         .to_string()
 }
 
+const GROUP_FEATURE_DISABLED_MESSAGE: &str = "Group chat is disabled by configuration.";
+
+fn group_feature_disabled_control_error() -> String {
+    "group_feature_disabled: Group chat is disabled by configuration.".to_string()
+}
+
+pub(crate) fn group_feature_disabled_api_error() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "code": "group_feature_disabled",
+            "error": GROUP_FEATURE_DISABLED_MESSAGE,
+        })),
+    )
+}
+
+async fn groups_enabled_api_guard(
+    state: &AppState,
+) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, (StatusCode, Json<serde_json::Value>)> {
+    let guard = session_group::group_feature_gate().read().await;
+    if state.config().enable_groups {
+        Ok(guard)
+    } else {
+        Err(group_feature_disabled_api_error())
+    }
+}
+
+async fn groups_enabled_control_guard(
+    state: &AppState,
+) -> Result<tokio::sync::RwLockReadGuard<'static, ()>, String> {
+    let guard = session_group::group_feature_gate().read().await;
+    if state.config().enable_groups {
+        Ok(guard)
+    } else {
+        Err(group_feature_disabled_control_error())
+    }
+}
+
+fn action_uses_groups(action: &str, args: &Value) -> bool {
+    matches!(
+        action,
+        "list_groups"
+            | "create_group"
+            | "update_group"
+            | "delete_group"
+            | "promote_group_admin"
+            | "remove_group_member"
+            | "post_group_message"
+            | "collect"
+    ) || matches!(action, "dispatch" | "stop") && args.get("group_id").is_some()
+        || action == "describe_session"
+            && args
+                .get("sections")
+                .and_then(Value::as_array)
+                .is_some_and(|sections| {
+                    sections
+                        .iter()
+                        .any(|value| value.as_str() == Some("groups"))
+                })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirectRunStatus {
     Queued,
@@ -304,6 +365,42 @@ async fn ensure_explicit_target_models(state: &AppState, targets: &[String]) -> 
     Ok(())
 }
 
+async fn ensure_target_workspaces_available(
+    state: &AppState,
+    targets: &[String],
+) -> Result<(), String> {
+    let results = futures::future::join_all(targets.iter().map(|target| async move {
+        (
+            target.as_str(),
+            runtime_loop::agent_run_workspace_available(state, target).await,
+        )
+    }))
+    .await;
+
+    let missing_sessions = results
+        .iter()
+        .filter_map(|(target, available)| available.is_none().then_some(*target))
+        .collect::<Vec<_>>();
+    if !missing_sessions.is_empty() {
+        return Err(format!(
+            "Session target(s) disappeared before dispatch: {}.",
+            missing_sessions.join(", ")
+        ));
+    }
+
+    let unavailable = results
+        .iter()
+        .filter_map(|(target, available)| (*available == Some(false)).then_some(*target))
+        .collect::<Vec<_>>();
+    if !unavailable.is_empty() {
+        return Err(format!(
+            "workspace_unavailable: The working directory is unavailable for target session(s): {}. Rebind before starting an Agent run.",
+            unavailable.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn target_sessions_missing_explicit_models(
     config: &Config,
     sessions: &HashMap<String, Session>,
@@ -464,6 +561,18 @@ fn stop_group_run_controls(group_id: &str, run_ids: &[String]) -> usize {
     })
 }
 
+fn stop_all_group_run_controls() -> usize {
+    with_group_run_controls(|runs| {
+        let stopped = runs.len();
+        for run in runs.values() {
+            run.stop_requested.store(true, Ordering::Relaxed);
+            run.cancel.cancel();
+        }
+        runs.clear();
+        stopped
+    })
+}
+
 fn update_direct_run_status(run_id: &str, status: DirectRunStatus) -> bool {
     with_direct_runs(|runs| {
         if let Some(run) = runs.get_mut(run_id) {
@@ -541,6 +650,46 @@ pub(crate) fn cancel_all_active_runs_for_storage() -> usize {
         stopped
     });
     group_runs + direct_runs
+}
+
+/// Stop every persisted and in-memory Group run, notify attached Group clients,
+/// then disconnect them. Existing Group records remain untouched so re-enabling
+/// the feature restores the same history and roster.
+pub(crate) async fn disable_group_feature_locked(
+    state: &Arc<AppState>,
+    _feature_guard: &tokio::sync::RwLockWriteGuard<'_, ()>,
+) {
+    // Cancellation is deliberately independent of persistence. A protected or
+    // corrupt store must not leave member tasks running after the feature has
+    // been disabled, even when their stopped status cannot be recorded.
+    stop_all_group_run_controls();
+
+    let summaries = match session_group::list_saved_group_summaries_result() {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            eprintln!("WARNING: could not enumerate Groups while disabling them: {error}");
+            Vec::new()
+        }
+    };
+    for summary in summaries {
+        if let Err(error) = stop_group_runs(state, &summary.id, Vec::new()).await
+            && !error.contains("no running target sessions selected")
+        {
+            eprintln!(
+                "WARNING: could not stop Group '{}' while disabling Groups: {error}",
+                summary.id
+            );
+        }
+    }
+
+    crate::close_all_group_clients_with_event(
+        state,
+        json!({
+            "type": "feature_status",
+            "features": { "groups": false },
+        }),
+    )
+    .await;
 }
 
 fn direct_runs_for_session(session_id: &str) -> Vec<(String, DirectRunStatus, u64)> {
@@ -1288,15 +1437,8 @@ fn enabled_mcp_tools_for_session(
     config: &crate::Config,
     session: &Session,
 ) -> Vec<tools::mcp::McpToolDescriptor> {
-    enabled_mcp_tools_for_workspace(config, &session.workspace)
-}
-
-fn enabled_mcp_tools_for_workspace(
-    config: &crate::Config,
-    workspace: &Path,
-) -> Vec<tools::mcp::McpToolDescriptor> {
-    let policy = tools::mcp::load_session_policy(workspace);
-    tools::mcp::cached_list_tools_for_policy(config, workspace, &policy)
+    let policy = tools::mcp::load_session_policy(&session.workspace);
+    tools::mcp::cached_list_tools_for_policy(config, &session.working_directory, &policy)
 }
 
 fn session_summary_from_profile(profile: &SessionProfileSummary) -> (String, String) {
@@ -1528,7 +1670,10 @@ async fn update_run_status(
     Ok(updated)
 }
 
-async fn session_control_lock(state: &AppState, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) async fn session_control_lock(
+    state: &AppState,
+    session_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
     let mut locks = state.session_control_locks.lock().await;
     locks
         .entry(session_id.to_string())
@@ -1775,6 +1920,55 @@ fn group_run_status_records_result(status: &str) -> bool {
     status == "completed"
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn persist_group_run_completion_if_enabled(
+    state: &Arc<AppState>,
+    group_id: &str,
+    run_id: &str,
+    session_id: &str,
+    status: &str,
+    result_excerpt: String,
+    error: Option<String>,
+    failed_partial_output: Option<String>,
+) -> bool {
+    // Linearize the terminal status and its corresponding result message with
+    // enableGroups transitions. If hot-disable already owns or completed the
+    // write side, it persists the run as stopped and this task must not mutate
+    // hidden Group data afterwards.
+    let Ok(_group_feature_guard) = groups_enabled_control_guard(state).await else {
+        return false;
+    };
+    match update_run_status(
+        state,
+        group_id,
+        run_id,
+        status,
+        Some(result_excerpt.clone()),
+        error,
+    )
+    .await
+    {
+        Ok(Some(_)) if group_run_status_records_result(status) => {
+            record_group_session_result(state, group_id, run_id, session_id, result_excerpt).await
+        }
+        Ok(Some(_)) if status == "failed" => {
+            if let Some(output) = failed_partial_output {
+                // A failed run may still have produced a useful partial answer.
+                // Persist that genuine output as a group message (the generic
+                // failure error is surfaced separately) but do not trigger
+                // @mention follow-ups for a failed run.
+                record_group_session_result(state, group_id, run_id, session_id, output).await;
+            }
+            false
+        }
+        Ok(_) => false,
+        Err(error) => {
+            eprintln!("ERROR: failed to persist group run completion: {error}");
+            false
+        }
+    }
+}
+
 fn group_mention_followup_prompt(source_session_id: &str, content: &str) -> String {
     let redacted_content = redact_profile_summary_text(content);
     format!(
@@ -1791,7 +1985,7 @@ async fn dispatch_group_mentions_from_session_result(
     summary_budget: usize,
     mention_depth: u8,
 ) {
-    if mention_depth >= 1 || is_no_reply_result(content) {
+    if !state.config().enable_groups || mention_depth >= 1 || is_no_reply_result(content) {
         return;
     }
     let group = match session_group::load_group_from_storage_result(group_id) {
@@ -2403,6 +2597,19 @@ async fn run_target_run(
     if run.group_id.is_none() && !direct_run_is_active(&run.run_id) {
         return;
     }
+    // The session-control gate held by this task is also used by workspace
+    // rebinding. Validate while the binding is stable and before advertising a
+    // queued run as running or writing its prompt into Session history.
+    if runtime_loop::agent_run_workspace_available(&state, &run.session_id).await == Some(false) {
+        mark_started_run_failed(
+            state.as_ref(),
+            &run,
+            "workspace_unavailable: The Session working directory is unavailable. Rebind it before starting an Agent run."
+                .to_string(),
+        )
+        .await;
+        return;
+    }
     let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
     // Acquire the agent-run reservation BEFORE persisting/broadcasting the
     // queued->running transition. A group's "running" transition both writes to
@@ -2577,59 +2784,28 @@ async fn run_target_run(
         } else {
             ("completed", None)
         };
-        match update_run_status(
+        let dispatch_mentions = persist_group_run_completion_if_enabled(
             &state,
             group_id,
             &run.run_id,
+            &run.session_id,
             status,
-            Some(result_excerpt.clone()),
+            result_excerpt.clone(),
             error,
+            assistant_excerpt,
         )
-        .await
-        {
-            Ok(Some(_)) => {
-                if group_run_status_records_result(status) {
-                    let recorded = record_group_session_result(
-                        &state,
-                        group_id,
-                        &run.run_id,
-                        &run.session_id,
-                        result_excerpt.clone(),
-                    )
-                    .await;
-                    if recorded {
-                        dispatch_group_mentions_from_session_result(
-                            &state,
-                            group_id,
-                            &run.session_id,
-                            &result_excerpt,
-                            run_mode,
-                            summary_budget,
-                            run.mention_depth,
-                        )
-                        .await;
-                    }
-                } else if status == "failed"
-                    && let Some(output) = assistant_excerpt.as_deref()
-                {
-                    // A failed run may still have produced a useful partial answer.
-                    // Persist that genuine output as a group message (the generic
-                    // failure error is surfaced separately) but do not trigger
-                    // @mention follow-ups for a failed run.
-                    record_group_session_result(
-                        &state,
-                        group_id,
-                        &run.run_id,
-                        &run.session_id,
-                        output.to_string(),
-                    )
-                    .await;
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("ERROR: failed to persist group run completion: {error}");
-            }
+        .await;
+        if dispatch_mentions {
+            dispatch_group_mentions_from_session_result(
+                &state,
+                group_id,
+                &run.session_id,
+                &result_excerpt,
+                run_mode,
+                summary_budget,
+                run.mention_depth,
+            )
+            .await;
         }
         clear_group_run_control(&run.run_id);
     } else {
@@ -2648,10 +2824,22 @@ async fn dispatch_to_sessions(
     state: &Arc<AppState>,
     request: DispatchRequest,
 ) -> Result<Vec<StartedRun>, String> {
+    // Hold the feature read gate until every queued Group run is durable and
+    // spawned. Hot-disable takes the write side before changing configuration,
+    // so it either rejects this dispatch or observes and stops all of its runs.
+    let group_feature_guard = if request.group_id.is_some() {
+        Some(groups_enabled_control_guard(state).await?)
+    } else {
+        None
+    };
     let canonical_targets = request.targets;
     if canonical_targets.is_empty() {
         return Err("No target sessions were selected.".to_string());
     }
+    // Reject an already-missing directory before persisting a Group message or
+    // queued run. run_target_run repeats this check while holding the Session
+    // control gate to cover removal or rebinding after this preflight.
+    ensure_target_workspaces_available(state, &canonical_targets).await?;
 
     let stored_prompt = stored_group_run_prompt(&request.message);
     let mut runs = Vec::new();
@@ -2774,6 +2962,7 @@ async fn dispatch_to_sessions(
         );
     }
 
+    drop(group_feature_guard);
     if request.wait {
         wait_for_runs(state, &runs, request.summary_budget).await?;
     }
@@ -2839,6 +3028,9 @@ pub(crate) async fn handle_group_socket_message(
     group_id: &str,
     payload: GroupSocketDispatch,
 ) -> Result<(), String> {
+    if !state.config().enable_groups {
+        return Err(group_feature_disabled_control_error());
+    }
     let text = payload.text.trim().to_string();
     if text.is_empty() {
         return Err("Group message cannot be empty.".to_string());
@@ -2932,6 +3124,7 @@ pub(crate) async fn handle_group_socket_message(
         )
         .await?;
     } else {
+        let _group_feature_guard = groups_enabled_control_guard(state).await?;
         let message = mutate_group(group_id, |group| {
             append_group_message(
                 group,
@@ -2970,6 +3163,7 @@ pub(crate) async fn handle_group_socket_stop(
     group_id: &str,
     targets: Vec<String>,
 ) -> Result<String, String> {
+    let _feature_guard = groups_enabled_control_guard(state).await?;
     if targets.len() > SESSION_CONTROL_TARGETS_MAX_ITEMS {
         return Err(format!(
             "session_control error: targets exceeds {} item(s)",
@@ -3380,10 +3574,16 @@ async fn describe_session_from_tool(state: &AppState, args: &Value) -> Result<St
         ));
     }
 
+    let groups_enabled = state.config().enable_groups;
+    if !groups_enabled && sections.iter().any(|section| section == "groups") {
+        return Err(group_feature_disabled_control_error());
+    }
+
     let mut lines = vec![format!("Session {} ({})", session.id, session.name)];
-    let groups = if sections
-        .iter()
-        .any(|section| matches!(section.as_str(), "runtime" | "groups"))
+    let groups = if groups_enabled
+        && sections
+            .iter()
+            .any(|section| matches!(section.as_str(), "runtime" | "groups"))
     {
         all_groups_for_session(&session.id)?
     } else {
@@ -3918,6 +4118,44 @@ pub(crate) async fn delete_session_with_safety_checks(
     let persist_gate = session_store::session_persist_gate(&target_session_id);
     let session_persist_guard = persist_gate.lock().await;
 
+    let workspace_root = session_store::session_workspace_root_for_delete(&target_session_id)?;
+    let saved_sessions =
+        session_store::list_saved_session_summaries_result(&session_store::sessions_dir())
+            .map_err(|_| storage_protected_control_error())?;
+    let mut persisted_workspace_owner = None;
+    for summary in saved_sessions {
+        if summary.id != target_session_id
+            && !summary.corrupt
+            && summary.workspace_kind == crate::SessionWorkspaceKind::Directory
+            && crate::path_is_same_or_descendant(&summary.working_directory, &workspace_root)
+                .map_err(|_| storage_protected_control_error())?
+        {
+            persisted_workspace_owner = Some(summary.id);
+            break;
+        }
+    }
+    let loaded_workspace_owner = if persisted_workspace_owner.is_none() {
+        let sessions = state.sessions.lock().await;
+        let mut owner = None;
+        for session in sessions.values() {
+            if session.id != target_session_id
+                && session.workspace_kind == crate::SessionWorkspaceKind::Directory
+                && crate::path_is_same_or_descendant(&session.working_directory, &workspace_root)
+                    .map_err(|_| storage_protected_control_error())?
+            {
+                owner = Some(session.id.clone());
+                break;
+            }
+        }
+        owner
+    } else {
+        None
+    };
+    if let Some(owner) = persisted_workspace_owner.or(loaded_workspace_owner) {
+        return Err(format!(
+            "Cannot delete session {target_session_id}: its private home contains the working directory used by session {owner}. Rebind that session first."
+        ));
+    }
     let roster_gate = session_group::group_roster_gate();
     let roster_guard = roster_gate.lock().await;
     #[cfg(not(test))]
@@ -3953,7 +4191,6 @@ pub(crate) async fn delete_session_with_safety_checks(
         }
         affected_group_ids
     };
-    let workspace_root = session_store::session_workspace_root_for_delete(&target_session_id)?;
     #[cfg(not(test))]
     let group_guards = {
         let mut affected_group_ids = affected_group_ids.clone();
@@ -4046,7 +4283,7 @@ pub(crate) async fn delete_session_with_safety_checks(
 /// True when the session has active or queued delegated work that must be stopped before
 /// the session can be safely deleted: an active direct run, an in-flight group run, or a
 /// queued/running run recorded in a persisted group.
-fn session_has_active_delegated_work(session_id: &str) -> bool {
+pub(crate) fn session_has_active_delegated_work(session_id: &str) -> bool {
     direct_run_status_for_session(session_id).is_some_and(DirectRunStatus::is_active)
         || active_group_run_statuses_by_session()
             .get(session_id)
@@ -4793,35 +5030,47 @@ pub(crate) async fn execute_session_control_tool(
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let result = match action {
-        "list_sessions" => session_list_output(state).await,
-        "create_session" => create_session_from_tool(state, &args).await,
-        "delete_session" => delete_session_from_tool(state, &args).await,
-        "describe_session" => describe_session_from_tool(state, &args).await,
-        "list_groups" => group_list_output(),
-        "create_group" => create_group_from_tool(state, &args).await,
-        "update_group" => update_group_from_tool(state, &args).await,
-        "delete_group" => delete_group_from_tool(state, &args).await,
-        "promote_group_admin" => promote_group_admin_from_tool(state, &args).await,
-        "remove_group_member" => remove_group_member_from_tool(state, &args).await,
-        "post_group_message" => post_group_message_from_tool(state, &args).await,
-        "dispatch" => dispatch_from_tool(state, &args).await,
-        "collect" => {
-            let group_id = tool_args_string(&args, "group_id")
-                .ok_or_else(|| "session_control error: group_id is required".to_string());
-            match group_id {
-                Ok(group_id) => {
-                    session_group::load_group_from_storage_result(&group_id).and_then(|group| {
-                        group
-                            .map(|group| collect_group_summary(&group))
-                            .ok_or_else(|| format!("Group '{}' not found", group_id))
-                    })
+    let group_action = action_uses_groups(action, &args);
+    let group_feature_guard = if group_action && action != "dispatch" {
+        groups_enabled_control_guard(state).await.map(Some)
+    } else {
+        Ok(None)
+    };
+    let result = if group_action && !state.config().enable_groups {
+        Err(group_feature_disabled_control_error())
+    } else {
+        match group_feature_guard {
+            Err(error) => Err(error),
+            Ok(_group_feature_guard) => match action {
+                "list_sessions" => session_list_output(state).await,
+                "create_session" => create_session_from_tool(state, &args).await,
+                "delete_session" => delete_session_from_tool(state, &args).await,
+                "describe_session" => describe_session_from_tool(state, &args).await,
+                "list_groups" => group_list_output(),
+                "create_group" => create_group_from_tool(state, &args).await,
+                "update_group" => update_group_from_tool(state, &args).await,
+                "delete_group" => delete_group_from_tool(state, &args).await,
+                "promote_group_admin" => promote_group_admin_from_tool(state, &args).await,
+                "remove_group_member" => remove_group_member_from_tool(state, &args).await,
+                "post_group_message" => post_group_message_from_tool(state, &args).await,
+                "dispatch" => dispatch_from_tool(state, &args).await,
+                "collect" => {
+                    let group_id = tool_args_string(&args, "group_id")
+                        .ok_or_else(|| "session_control error: group_id is required".to_string());
+                    match group_id {
+                        Ok(group_id) => session_group::load_group_from_storage_result(&group_id)
+                            .and_then(|group| {
+                                group
+                                    .map(|group| collect_group_summary(&group))
+                                    .ok_or_else(|| format!("Group '{}' not found", group_id))
+                            }),
+                        Err(error) => Err(error),
+                    }
                 }
-                Err(error) => Err(error),
-            }
+                "stop" => stop_from_tool(state, &args).await,
+                _ => Err("session_control error: unknown action".to_string()),
+            },
         }
-        "stop" => stop_from_tool(state, &args).await,
-        _ => Err("session_control error: unknown action".to_string()),
     };
     crate::tools::ToolOutcome {
         output: match &result {
@@ -4862,8 +5111,9 @@ pub(crate) struct SessionGroupRequest {
 }
 
 pub(crate) async fn api_session_groups(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _feature_guard = groups_enabled_api_guard(&state).await?;
     let groups = session_group::list_saved_group_summaries_result()
         .map_err(|_| crate::storage_protected_api_error())?;
     Ok(Json(json!({
@@ -4968,6 +5218,7 @@ pub(crate) async fn api_post_session_group(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SessionGroupRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _feature_guard = groups_enabled_api_guard(&state).await?;
     crate::validate_local_request_headers(&headers)?;
 
     let roster_gate = session_group::group_roster_gate();
@@ -4997,6 +5248,7 @@ pub(crate) async fn api_get_session_group(
     Query(query): Query<GroupQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _feature_guard = groups_enabled_api_guard(&state).await?;
     let group_id = query.group.as_deref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -5022,6 +5274,7 @@ pub(crate) async fn api_put_session_group(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SessionGroupRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _feature_guard = groups_enabled_api_guard(&state).await?;
     crate::validate_local_request_headers(&headers)?;
 
     let roster_gate = session_group::group_roster_gate();
@@ -5076,6 +5329,7 @@ pub(crate) async fn api_delete_session_group(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _feature_guard = groups_enabled_api_guard(&state).await?;
     crate::validate_local_request_headers(&headers)?;
 
     let group_id = query.group.as_deref().ok_or_else(|| {
@@ -5126,6 +5380,7 @@ pub(crate) async fn api_promote_session_group_admin(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _feature_guard = groups_enabled_api_guard(&state).await?;
     crate::validate_local_request_headers(&headers)?;
     let group_id = query.group.as_deref().ok_or_else(|| {
         (
@@ -5152,6 +5407,7 @@ pub(crate) async fn api_delete_session_group_member(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _feature_guard = groups_enabled_api_guard(&state).await?;
     crate::validate_local_request_headers(&headers)?;
     let group_id = query.group.as_deref().ok_or_else(|| {
         (

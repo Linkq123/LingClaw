@@ -11,6 +11,7 @@ $ErrorActionPreference = 'Stop'
 
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $MinimumNodeVersion = [Version]'20.19.0'
+$MinimumRustVersion = [Version]'1.90.0'
 $RustWindowsSetupUrl = 'https://learn.microsoft.com/windows/dev-environment/rust/setup'
 $CargoBuildJobs = 2
 
@@ -54,18 +55,10 @@ function Add-ToSessionPath {
     }
 
     $trimmedDir = $Dir.TrimEnd('\')
-    $pathParts = $env:Path -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-    foreach ($part in $pathParts) {
-        if ($part.TrimEnd('\') -ieq $trimmedDir) {
-            return
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($env:Path)) {
-        $env:Path = $Dir
-    } else {
-        $env:Path = "$Dir;$($env:Path)"
-    }
+    $pathParts = @($env:Path -split ';' | ForEach-Object { $_.Trim() } | Where-Object {
+        $_ -and $_.TrimEnd('\') -ine $trimmedDir
+    })
+    $env:Path = (@($Dir) + $pathParts) -join ';'
 }
 
 function Invoke-Step {
@@ -107,11 +100,70 @@ function Copy-DirectoryContents {
     }
 }
 
+function Get-ActiveRustVersion {
+    if (-not (Test-Tool 'rustc')) {
+        return $null
+    }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $versionOutput = @(& rustc --version 2>$null)
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    foreach ($line in $versionOutput) {
+        if ($line.ToString() -match '^rustc\s+(\d+\.\d+\.\d+)') {
+            return [Version]$Matches[1]
+        }
+    }
+    return $null
+}
+
+function Update-RustStableToolchain {
+    Write-Info "Updating the Rust stable toolchain (LingClaw requires rustc >= $MinimumRustVersion)."
+    Invoke-Step -Program 'rustup' -Arguments @('toolchain', 'install', 'stable', '--profile', 'minimal') -WorkingDirectory $RootDir -Label 'rustup toolchain install stable'
+    Invoke-Step -Program 'rustup' -Arguments @('default', 'stable') -WorkingDirectory $RootDir -Label 'rustup default stable'
+    # A directory override may still select an older compiler. Keep this installer on the
+    # verified stable toolchain without mutating the repository's rustup override.
+    $env:RUSTUP_TOOLCHAIN = 'stable'
+    Add-ToSessionPath (Get-CargoBinDir)
+}
+
+function Assert-CompatibleRust {
+    if ((-not (Test-Tool 'cargo')) -or (-not (Test-Tool 'rustc'))) {
+        throw 'Rust installation did not finish correctly. Please check rustup output and retry.'
+    }
+
+    $activeVersion = Get-ActiveRustVersion
+    if ($null -eq $activeVersion) {
+        throw "Unable to determine the active rustc version. LingClaw requires rustc >= $MinimumRustVersion."
+    }
+    if ($activeVersion -lt $MinimumRustVersion) {
+        throw "The active Rust compiler is $activeVersion, but LingClaw requires rustc >= $MinimumRustVersion. Run 'rustup update stable' and retry."
+    }
+
+    Write-Info "Compatible Rust environment ready: $(& rustc --version)"
+}
+
 function Ensure-Rust {
+    Add-ToSessionPath (Get-CargoBinDir)
     if ((Test-Tool 'cargo') -and (Test-Tool 'rustc')) {
-        Write-Info "Rust environment already installed: $(& rustc --version)"
-        Write-Info 'No additional Rust environment installation is required.'
-        Add-ToSessionPath (Get-CargoBinDir)
+        $activeVersion = Get-ActiveRustVersion
+        if (($null -ne $activeVersion) -and ($activeVersion -ge $MinimumRustVersion)) {
+            Write-Info "Rust environment already installed: $(& rustc --version)"
+            Write-Info 'No additional Rust environment installation is required.'
+            return
+        }
+
+        if (-not (Test-Tool 'rustup')) {
+            $reportedVersion = if ($null -eq $activeVersion) { 'unknown' } else { $activeVersion.ToString() }
+            throw "The active Rust compiler is $reportedVersion, but LingClaw requires rustc >= $MinimumRustVersion. This Rust installation is not managed by rustup; update it manually or install rustup from https://rustup.rs, then retry."
+        }
+
+        Update-RustStableToolchain
+        Assert-CompatibleRust
         return
     }
 
@@ -126,11 +178,10 @@ function Ensure-Rust {
     }
 
     Add-ToSessionPath (Get-CargoBinDir)
-    if ((-not (Test-Tool 'cargo')) -or (-not (Test-Tool 'rustc'))) {
-        throw 'Rust installation did not finish correctly. Please check rustup output and retry.'
+    if (Test-Tool 'rustup') {
+        Update-RustStableToolchain
     }
-
-    Write-Info "Rust environment installed: $(& rustc --version)"
+    Assert-CompatibleRust
 }
 
 function Get-RustHostTriple {

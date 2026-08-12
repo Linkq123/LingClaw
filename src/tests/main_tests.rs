@@ -249,6 +249,7 @@ fn test_config() -> Config {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     }
 }
 
@@ -508,6 +509,8 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 0,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     }
 }
@@ -1803,6 +1806,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let resolved = config.resolve_model("gpt-4o-mini");
@@ -2102,6 +2106,8 @@ fn build_history_payload_preserves_raw_tool_result_content() {
             ..Default::default()
         }),
         version: 0,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -2204,6 +2210,8 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -2268,6 +2276,8 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -2329,6 +2339,8 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
     let s3_cfg = crate::config::S3Config {
@@ -2511,6 +2523,8 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -2585,6 +2599,8 @@ fn build_history_payload_redacts_exec_tool_call_arguments() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -2687,6 +2703,8 @@ fn build_history_payload_includes_subagent_snapshot_on_task_results() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -2798,6 +2816,8 @@ fn build_history_payload_redacts_exec_args_in_subagent_snapshot() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -2885,6 +2905,8 @@ fn build_history_payload_normalizes_legacy_subagent_snapshot_keys() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -3010,6 +3032,8 @@ fn build_history_payload_distinguishes_repeated_task_tool_call_ids() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -3151,6 +3175,8 @@ fn replace_session_messages_rekeys_subagent_snapshots_for_remaining_history() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -3333,6 +3359,8 @@ fn build_history_payload_omits_todos_tool_messages() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -3437,6 +3465,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let resolved = config.resolve_model("llama3.2");
@@ -3523,6 +3552,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     assert!(crate::cli::is_default_model_row(
@@ -3615,6 +3645,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -3699,6 +3730,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -3783,6 +3815,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -3867,6 +3900,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let resolved = config.resolve_model("qwen3");
@@ -3934,6 +3968,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let canonical = config
@@ -4017,6 +4052,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let err = config
@@ -4102,6 +4138,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let available = config.available_models();
@@ -4166,6 +4203,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let err = config
@@ -4230,6 +4268,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let canonical = config
@@ -4330,6 +4369,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let canonical = config
@@ -4384,6 +4424,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let resolved = config.resolve_model("anthropic/claude-opus-4-7");
@@ -4427,6 +4468,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let resolved = config.resolve_model("ollama/llama3.2");
@@ -4491,6 +4533,7 @@ fn build_session_status_reports_resolved_target() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
     let mut session = test_session("abc", "Test", Some("anthropic/claude-opus-4-7"));
     session.think_level = "medium".to_string();
@@ -5282,6 +5325,8 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 0,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
 
@@ -5434,6 +5479,8 @@ fn save_session_to_disk_redacts_exec_arguments_in_messages_and_snapshots() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 0,
+        working_directory: workspace.clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace,
     };
 
@@ -5629,6 +5676,8 @@ fn save_session_to_disk_overwrites_existing_file() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 1,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     runtime
@@ -5719,6 +5768,8 @@ fn save_session_to_disk_skips_identical_payload_rewrite() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: workspace.clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace,
     };
 
@@ -6001,6 +6052,24 @@ async fn api_client_config_returns_upload_token_and_s3_identity() {
 
     assert_eq!(payload["upload_token"], state.upload_token);
     assert_eq!(payload["s3_config_id"], expected_s3_config_id);
+    assert_eq!(payload["features"]["groups"], true);
+}
+
+#[tokio::test]
+async fn api_client_config_reports_groups_disabled_without_exposing_secrets() {
+    let mut config = test_config();
+    config.enable_groups = false;
+    config.api_key = "must-not-leak".to_string();
+    let state = Arc::new(test_app_state_with_config(config));
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_client_config(headers, State(state))
+        .await
+        .expect("local request should be accepted");
+
+    assert_eq!(payload["features"]["groups"], false);
+    assert!(!payload.to_string().contains("must-not-leak"));
 }
 
 #[tokio::test]
@@ -6371,6 +6440,728 @@ async fn api_post_session_creates_random_six_character_session_id() {
 }
 
 #[tokio::test]
+async fn api_delete_session_removes_private_state_but_preserves_external_workspace() {
+    let session_id = format!("delete-api-session-{}", now_epoch());
+    let private_workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: private_workspace.clone(),
+    };
+    let external = std::env::temp_dir().join(format!(
+        "lingclaw-delete-api-external-{}-{}",
+        std::process::id(),
+        now_epoch()
+    ));
+    std::fs::create_dir_all(&external).expect("external workspace should exist");
+    let marker = external.join("keep.txt");
+    std::fs::write(&marker, "keep").expect("external marker should be writable");
+
+    let mut session = test_session(&session_id, "Delete through API", None);
+    session.workspace_kind = SessionWorkspaceKind::Directory;
+    session.working_directory = normalize_working_directory(&external).unwrap();
+    save_session_to_disk(&session)
+        .await
+        .expect("session should be persisted before deletion");
+    let state = Arc::new(test_app_state());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_delete_session(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+    )
+    .await
+    .expect("session deletion should succeed");
+
+    assert_eq!(payload["ok"], true);
+    assert!(!state.sessions.lock().await.contains_key(&session_id));
+    assert!(load_session_from_disk(&session_id).is_none());
+    assert!(marker.exists(), "external workspace must never be deleted");
+    let _ = std::fs::remove_dir_all(external);
+}
+
+#[tokio::test]
+async fn api_post_session_binds_an_external_directory_without_writing_private_templates_there() {
+    let external = std::env::temp_dir().join(format!(
+        "lingclaw-external-workspace-{}-{}",
+        std::process::id(),
+        now_epoch()
+    ));
+    std::fs::create_dir_all(&external).expect("external workspace should exist");
+    let marker = external.join("project.txt");
+    std::fs::write(&marker, "project data").expect("project marker should exist");
+    let canonical = normalize_working_directory(&external).unwrap();
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_post_session_with_request(
+        headers,
+        State(state.clone()),
+        Some(Json(SessionMutationRequest {
+            name: Some("External Project".to_string()),
+            workspace: Some(SessionWorkspaceRequest::Directory {
+                path: external.to_string_lossy().to_string(),
+            }),
+        })),
+    )
+    .await
+    .expect("external workspace Session should be created");
+
+    let session_id = payload["session"]["id"].as_str().unwrap().to_string();
+    let private_home = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: private_home.clone(),
+    };
+    let session = state.sessions.lock().await[&session_id].clone();
+    assert_eq!(session.workspace_kind, SessionWorkspaceKind::Directory);
+    assert_eq!(session.working_directory, canonical);
+    assert_eq!(session.workspace, private_home);
+    assert_eq!(payload["session"]["workspace"]["kind"], "directory");
+    assert_eq!(payload["session"]["workspace"]["available"], true);
+    assert!(marker.exists());
+    assert!(!external.join("AGENTS.md").exists());
+    assert!(!external.join("MEMORY.md").exists());
+    assert!(session.workspace.join("AGENTS.md").exists());
+
+    std::fs::remove_dir_all(&external).expect("external fixture should be removable");
+}
+
+#[tokio::test]
+async fn api_post_session_rejects_a_directory_inside_lingclaw_private_data() {
+    let private_session_id = format!("reserved-workspace-{}-{}", std::process::id(), now_epoch());
+    let private_workspace = session_workspace_path(&private_session_id);
+    std::fs::create_dir_all(&private_workspace).expect("private fixture should exist");
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let (status, Json(error)) = api_post_session_with_request(
+        headers,
+        State(state),
+        Some(Json(SessionMutationRequest {
+            name: Some("Unsafe private binding".to_string()),
+            workspace: Some(SessionWorkspaceRequest::Directory {
+                path: private_workspace.to_string_lossy().to_string(),
+            }),
+        })),
+    )
+    .await
+    .expect_err("LingClaw private data must not be accepted as an external workspace");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error["error"],
+        "Working directory must be outside the LingClaw private data directory."
+    );
+    std::fs::remove_dir_all(
+        private_workspace
+            .parent()
+            .expect("private workspace should have a Session root"),
+    )
+    .expect("private fixture should be removable");
+}
+
+#[tokio::test]
+async fn api_session_workspace_rebind_is_durable_and_rejects_active_runs() {
+    let session_id = format!("workspace-rebind-{}-{}", std::process::id(), now_epoch());
+    let private_home = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: private_home.clone(),
+    };
+    let first = std::env::temp_dir().join(format!("{session_id}-first"));
+    let second = std::env::temp_dir().join(format!("{session_id}-second"));
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let state = Arc::new(test_app_state());
+    let session = Session::new_with_id(&session_id, "Rebind Workspace");
+    save_session_to_disk_locked(&session).await.unwrap();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_put_session_mutation(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers.clone(),
+        State(state.clone()),
+        Json(SessionMutationRequest {
+            name: None,
+            workspace: Some(SessionWorkspaceRequest::Directory {
+                path: first.to_string_lossy().to_string(),
+            }),
+        }),
+    )
+    .await
+    .expect("idle Session should rebind");
+    assert_eq!(payload["session"]["workspace"]["kind"], "directory");
+    let rebound = state.sessions.lock().await[&session_id].clone();
+    assert_eq!(
+        rebound.working_directory,
+        normalize_working_directory(&first).unwrap()
+    );
+    assert_eq!(rebound.workspace, private_home);
+    assert!(!first.join("AGENTS.md").exists());
+
+    state.active_runs.lock().await.insert(
+        session_id.clone(),
+        SessionRunBinding {
+            connection_id: 99,
+            cancel: CancellationToken::new(),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+        },
+    );
+    let (status, Json(error)) = api_put_session_mutation(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+        Json(SessionMutationRequest {
+            name: None,
+            workspace: Some(SessionWorkspaceRequest::Directory {
+                path: second.to_string_lossy().to_string(),
+            }),
+        }),
+    )
+    .await
+    .expect_err("active Session must not rebind");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "session_busy");
+    assert_eq!(
+        state.sessions.lock().await[&session_id].working_directory,
+        rebound.working_directory
+    );
+
+    state.active_runs.lock().await.remove(&session_id);
+    std::fs::remove_dir_all(first).unwrap();
+    std::fs::remove_dir_all(second).unwrap();
+}
+
+#[tokio::test]
+async fn api_session_workspace_rebind_rejects_resumable_terminal_plans() {
+    let session_id = format!(
+        "workspace-plan-rebind-{}-{}",
+        std::process::id(),
+        now_epoch()
+    );
+    let private_home = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: private_home,
+    };
+    let external = std::env::temp_dir().join(format!("{session_id}-external"));
+    std::fs::create_dir_all(&external).unwrap();
+    let state = Arc::new(test_app_state());
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        Session::new_with_id(&session_id, "Plan Rebind"),
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    for status in [plan::PlanStatus::Failed, plan::PlanStatus::Stopped] {
+        state
+            .sessions
+            .lock()
+            .await
+            .get_mut(&session_id)
+            .expect("test Session should remain loaded")
+            .pending_plan = Some(PendingPlan {
+            id: format!("plan-{}", status.label()),
+            revision: 1,
+            status,
+            approved_at: Some(now_epoch()),
+            execution_attempt: 1,
+            ..Default::default()
+        });
+        let (response_status, Json(error)) = api_put_session_mutation(
+            Query(SessionQuery {
+                session: Some(session_id.clone()),
+            }),
+            headers.clone(),
+            State(state.clone()),
+            Json(SessionMutationRequest {
+                name: None,
+                workspace: Some(SessionWorkspaceRequest::Directory {
+                    path: external.to_string_lossy().to_string(),
+                }),
+            }),
+        )
+        .await
+        .expect_err("a resumable plan must keep its approved working directory");
+        assert_eq!(response_status, StatusCode::CONFLICT);
+        assert_eq!(error["code"], "plan_active");
+    }
+
+    std::fs::remove_dir_all(external).unwrap();
+}
+
+#[tokio::test]
+async fn api_session_name_update_does_not_rebind_an_unchanged_missing_workspace() {
+    let session_id = format!("workspace-rename-{}-{}", std::process::id(), now_epoch());
+    let private_home = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: private_home,
+    };
+    let external = std::env::temp_dir().join(format!("{session_id}-external"));
+    std::fs::create_dir_all(&external).unwrap();
+    let canonical = normalize_working_directory(&external).unwrap();
+    let state = Arc::new(test_app_state());
+    let mut session = Session::new_with_id(&session_id, "Before");
+    session.workspace_kind = SessionWorkspaceKind::Directory;
+    session.working_directory = canonical.clone();
+    save_session_to_disk_locked(&session).await.unwrap();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    std::fs::remove_dir_all(&external).unwrap();
+
+    state.active_runs.lock().await.insert(
+        session_id.clone(),
+        SessionRunBinding {
+            connection_id: 101,
+            cancel: CancellationToken::new(),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+        },
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let Json(payload) = api_put_session_mutation(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+        Json(SessionMutationRequest {
+            name: Some("After".to_string()),
+            workspace: Some(SessionWorkspaceRequest::Directory {
+                path: canonical.to_string_lossy().to_string(),
+            }),
+        }),
+    )
+    .await
+    .expect("an unchanged workspace must not turn a name update into a rebind");
+
+    assert_eq!(payload["session"]["name"], "After");
+    assert_eq!(
+        state.sessions.lock().await[&session_id].working_directory,
+        canonical
+    );
+    state.active_runs.lock().await.remove(&session_id);
+}
+
+#[tokio::test]
+async fn api_session_workspace_update_is_idempotent() {
+    let session_id = format!(
+        "workspace-idempotent-{}-{}",
+        std::process::id(),
+        now_epoch()
+    );
+    let private_home = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: private_home,
+    };
+    let external = std::env::temp_dir().join(format!("{session_id}-external"));
+    std::fs::create_dir_all(&external).unwrap();
+    let canonical = normalize_working_directory(&external).unwrap();
+    let state = Arc::new(test_app_state());
+    let mut session = Session::new_with_id(&session_id, "Idempotent");
+    session.workspace_kind = SessionWorkspaceKind::Directory;
+    session.working_directory = canonical.clone();
+    save_session_to_disk_locked(&session).await.unwrap();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let Json(payload) = api_put_session_mutation(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+        Json(SessionMutationRequest {
+            name: None,
+            workspace: Some(SessionWorkspaceRequest::Directory {
+                path: canonical.to_string_lossy().to_string(),
+            }),
+        }),
+    )
+    .await
+    .expect("repeating the current workspace must be a successful no-op");
+
+    assert_eq!(payload["session"]["workspace"]["kind"], "directory");
+    assert_eq!(
+        state.sessions.lock().await[&session_id].working_directory,
+        canonical
+    );
+    std::fs::remove_dir_all(external).unwrap();
+}
+
+#[tokio::test]
+async fn api_session_workspace_alias_is_an_idempotent_update_while_busy() {
+    let session_id = format!(
+        "workspace-alias-idempotent-{}-{}",
+        std::process::id(),
+        now_epoch()
+    );
+    let private_home = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: private_home,
+    };
+    let external = std::env::temp_dir().join(format!("{session_id}-external"));
+    let child = external.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let canonical = normalize_working_directory(&external).unwrap();
+    let state = Arc::new(test_app_state());
+    let mut session = Session::new_with_id(&session_id, "Alias Idempotent");
+    session.workspace_kind = SessionWorkspaceKind::Directory;
+    session.working_directory = canonical.clone();
+    save_session_to_disk_locked(&session).await.unwrap();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    state.active_runs.lock().await.insert(
+        session_id.clone(),
+        SessionRunBinding {
+            connection_id: 103,
+            cancel: CancellationToken::new(),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+        },
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let alias = child.join("..");
+    let Json(payload) = api_put_session_mutation(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+        Json(SessionMutationRequest {
+            name: Some("Alias Updated".to_string()),
+            workspace: Some(SessionWorkspaceRequest::Directory {
+                path: alias.to_string_lossy().to_string(),
+            }),
+        }),
+    )
+    .await
+    .expect("a canonical alias of the current workspace must not be treated as a rebind");
+
+    assert_eq!(payload["session"]["name"], "Alias Updated");
+    assert_eq!(
+        state.sessions.lock().await[&session_id].working_directory,
+        canonical
+    );
+    state.active_runs.lock().await.remove(&session_id);
+    std::fs::remove_dir_all(external).unwrap();
+}
+
+#[tokio::test]
+async fn api_session_workspace_rebind_does_not_invert_config_and_run_locks() {
+    let session_id = format!(
+        "workspace-lock-order-{}-{}",
+        std::process::id(),
+        now_epoch()
+    );
+    let private_home = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: private_home,
+    };
+    let first = std::env::temp_dir().join(format!("{session_id}-first"));
+    let second = std::env::temp_dir().join(format!("{session_id}-second"));
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let state = Arc::new(test_app_state());
+    let mut session = Session::new_with_id(&session_id, "Workspace Lock Order");
+    session.workspace_kind = SessionWorkspaceKind::Directory;
+    session.working_directory = normalize_working_directory(&first).unwrap();
+    save_session_to_disk_locked(&session).await.unwrap();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    // Keep a reader alive so the preference update queues as a config writer.
+    // A rebind must already own its config read lock before it queues for
+    // active_runs; otherwise the queued writer and rebind form a deadlock.
+    let config_read_guard = CONFIG_FILE_LOCK.read().await;
+    let active_runs_guard = state.active_runs.lock().await;
+    let control_lock = session_control::session_control_lock(&state, &session_id).await;
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let rebind_task = tokio::spawn({
+        let state = state.clone();
+        let session_id = session_id.clone();
+        let second = second.clone();
+        async move {
+            api_put_session_mutation(
+                Query(SessionQuery {
+                    session: Some(session_id),
+                }),
+                headers,
+                State(state),
+                Json(SessionMutationRequest {
+                    name: None,
+                    workspace: Some(SessionWorkspaceRequest::Directory {
+                        path: second.to_string_lossy().to_string(),
+                    }),
+                }),
+            )
+            .await
+        }
+    });
+
+    let mut rebind_reached_control_gate = false;
+    for _ in 0..100 {
+        if control_lock.try_lock().is_err() {
+            rebind_reached_control_gate = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rebind_reached_control_gate,
+        "rebind should reach the Session control gate before the assertion"
+    );
+
+    let preference_task = tokio::spawn({
+        let state = state.clone();
+        let session_id = session_id.clone();
+        async move { update_session_model_preferences(&state, &session_id, None, None, true).await }
+    });
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    drop(active_runs_guard);
+
+    let rebind_result = tokio::time::timeout(Duration::from_secs(2), rebind_task)
+        .await
+        .expect("rebind must not wait behind a config writer that needs active_runs")
+        .expect("rebind task should join")
+        .expect("rebind should succeed");
+    assert_eq!(rebind_result.0["session"]["workspace"]["kind"], "directory");
+
+    drop(config_read_guard);
+    tokio::time::timeout(Duration::from_secs(2), preference_task)
+        .await
+        .expect("model preference update should finish after readers leave")
+        .expect("model preference task should join")
+        .ok();
+    std::fs::remove_dir_all(first).unwrap();
+    std::fs::remove_dir_all(second).unwrap();
+}
+
+#[tokio::test]
+async fn api_sessions_filters_exact_workspaces_and_reports_missing_directories() {
+    let state = Arc::new(test_app_state());
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-workspace-filter-{}-{}",
+        std::process::id(),
+        now_epoch()
+    ));
+    let first_directory = root.join("first");
+    let second_directory = root.join("second");
+    std::fs::create_dir_all(&first_directory).unwrap();
+    std::fs::create_dir_all(&second_directory).unwrap();
+    let first_id = format!("filter-a-{}", now_epoch());
+    let second_id = format!("filter-b-{}", now_epoch());
+    let first_home = session_workspace_path(&first_id);
+    let second_home = session_workspace_path(&second_id);
+    let _first_guard = SavedSessionGuard {
+        session_id: first_id.clone(),
+        workspace: first_home.clone(),
+    };
+    let _second_guard = SavedSessionGuard {
+        session_id: second_id.clone(),
+        workspace: second_home.clone(),
+    };
+    let mut first = Session::new_with_id(&first_id, "First");
+    first.workspace_kind = SessionWorkspaceKind::Directory;
+    first.working_directory = normalize_working_directory(&first_directory).unwrap();
+    let mut second = Session::new_with_id(&second_id, "Second");
+    second.workspace_kind = SessionWorkspaceKind::Directory;
+    second.working_directory = normalize_working_directory(&second_directory).unwrap();
+    save_session_to_disk_locked(&first).await.unwrap();
+    save_session_to_disk_locked(&second).await.unwrap();
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(first_id.clone(), first);
+        sessions.insert(second_id.clone(), second);
+    }
+
+    let Json(filtered) = api_sessions_with_filter(
+        Query(SessionListQuery {
+            workspace: Some(first_directory.to_string_lossy().to_string()),
+        }),
+        State(state.clone()),
+    )
+    .await
+    .unwrap();
+    let ids = filtered["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|session| session["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![first_id.as_str()]);
+
+    std::fs::remove_dir_all(&first_directory).unwrap();
+    let Json(all) = api_sessions(State(state)).await.unwrap();
+    let missing = all["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"].as_str() == Some(first_id.as_str()))
+        .unwrap();
+    assert_eq!(missing["workspace"]["available"], false);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn working_directory_keys_match_extended_and_display_windows_paths() {
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-workspace-key-{}-{}",
+        std::process::id(),
+        now_epoch()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let canonical = normalize_working_directory(&root).unwrap();
+    let display = PathBuf::from(display_working_directory(&canonical));
+
+    assert_eq!(
+        working_directory_key(&canonical).unwrap(),
+        working_directory_key(&display).unwrap()
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn resolve_path_checked_accepts_new_absolute_child_of_extended_windows_workspace() {
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-workspace-new-child-{}-{}",
+        std::process::id(),
+        now_epoch()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let canonical = normalize_working_directory(&root).unwrap();
+    let display = PathBuf::from(display_working_directory(&canonical));
+    let requested = display.join("new-directory").join("new-file.txt");
+
+    let resolved = resolve_path_checked(&requested.to_string_lossy(), &canonical)
+        .expect("ordinary Windows path should match the extended workspace root");
+
+    assert_eq!(resolved, canonical.join("new-directory/new-file.txt"));
+    assert!(
+        !requested.exists(),
+        "the resolver must not create the target"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn resolve_path_checked_matches_windows_workspace_case_insensitively() {
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-workspace-case-{}-{}",
+        std::process::id(),
+        now_epoch()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let canonical = normalize_working_directory(&root).unwrap();
+    let display = display_working_directory(&canonical).to_uppercase();
+    let requested = PathBuf::from(display).join("new-file.txt");
+
+    let resolved = resolve_path_checked(&requested.to_string_lossy(), &canonical)
+        .expect("Windows workspace matching should ignore path casing");
+
+    assert_eq!(resolved, canonical.join("new-file.txt"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn api_workspaces_browse_returns_only_directories_and_home_metadata() {
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-workspace-browser-{}-{}",
+        std::process::id(),
+        now_epoch()
+    ));
+    std::fs::create_dir_all(root.join("child")).unwrap();
+    std::fs::write(root.join("secret.txt"), "not listed").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_workspaces_browse(
+        Query(WorkspaceBrowseQuery {
+            path: Some(root.to_string_lossy().to_string()),
+        }),
+        headers,
+    )
+    .await
+    .expect("local directory browsing should succeed");
+
+    let directories = payload["directories"].as_array().unwrap();
+    assert_eq!(directories.len(), 1);
+    assert_eq!(directories[0]["name"], "child");
+    assert!(payload.get("home").is_some());
+    assert!(!payload.to_string().contains("secret.txt"));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn workspace_filesystem_operations_return_after_their_deadline() {
+    let error = bounded_workspace_filesystem_with_timeout(
+        "workspace probe".to_string(),
+        Duration::from_millis(5),
+        || {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok::<_, String>(())
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.contains("timed out after 5 milliseconds"));
+}
+
+#[tokio::test]
 async fn api_session_group_crud_round_trip() {
     let state = Arc::new(test_app_state());
     let mut headers = HeaderMap::new();
@@ -6463,6 +7254,30 @@ async fn api_session_group_crud_round_trip() {
     .expect("group should delete");
     assert_eq!(delete_payload["ok"].as_bool(), Some(true));
     assert!(crate::session_group::load_group_from_disk(&group_id).is_none());
+}
+
+#[tokio::test]
+async fn api_session_group_is_forbidden_when_the_feature_is_disabled() {
+    let mut config = test_config();
+    config.enable_groups = false;
+    let state = Arc::new(test_app_state_with_config(config));
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let (status, Json(payload)) = api_post_session_group(
+        headers,
+        State(state),
+        Json(SessionGroupRequest {
+            name: Some("Hidden Group".to_string()),
+            members: Some(vec!["worker-a".to_string()]),
+        }),
+    )
+    .await
+    .expect_err("disabled Group endpoints must reject writes before validation");
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(payload["code"], "group_feature_disabled");
+    assert_eq!(payload["error"], "Group chat is disabled by configuration.");
 }
 
 #[tokio::test]
@@ -6630,6 +7445,7 @@ async fn api_delete_session_group_rejects_active_runs() {
 async fn close_group_client_removes_binding_and_cancels_socket() {
     let state = test_app_state();
     let (tx, _rx) = mpsc::channel::<String>(1);
+    let (terminal_tx, _terminal_rx) = watch::channel(None);
     let cancel = CancellationToken::new();
     {
         let mut clients = state.group_clients.lock().await;
@@ -6638,6 +7454,7 @@ async fn close_group_client_removes_binding_and_cancels_socket() {
             GroupClientBinding {
                 connection_id: 7,
                 tx,
+                terminal_tx,
                 cancel: cancel.clone(),
             },
         );
@@ -6659,6 +7476,7 @@ async fn close_group_client_removes_binding_and_cancels_socket() {
 async fn full_group_client_channel_drops_live_event_and_keeps_socket_alive() {
     let state = test_app_state();
     let (tx, mut rx) = mpsc::channel::<String>(1);
+    let (terminal_tx, _terminal_rx) = watch::channel(None);
     tx.try_send("queued".to_string())
         .expect("test channel should accept first event");
     let cancel = CancellationToken::new();
@@ -6669,6 +7487,7 @@ async fn full_group_client_channel_drops_live_event_and_keeps_socket_alive() {
             GroupClientBinding {
                 connection_id: 8,
                 tx,
+                terminal_tx,
                 cancel: cancel.clone(),
             },
         );
@@ -6696,6 +7515,7 @@ async fn full_group_client_channel_drops_live_event_and_keeps_socket_alive() {
 async fn full_group_client_channel_cancels_socket_for_durable_event() {
     let state = test_app_state();
     let (tx, mut rx) = mpsc::channel::<String>(1);
+    let (terminal_tx, _terminal_rx) = watch::channel(None);
     tx.try_send("queued".to_string())
         .expect("test channel should accept first event");
     let cancel = CancellationToken::new();
@@ -6706,6 +7526,7 @@ async fn full_group_client_channel_cancels_socket_for_durable_event() {
             GroupClientBinding {
                 connection_id: 10,
                 tx,
+                terminal_tx,
                 cancel: cancel.clone(),
             },
         );
@@ -6733,6 +7554,7 @@ async fn full_group_client_channel_cancels_socket_for_durable_event() {
 async fn closed_group_client_channel_removes_binding_and_cancels_socket() {
     let state = test_app_state();
     let (tx, rx) = mpsc::channel::<String>(1);
+    let (terminal_tx, _terminal_rx) = watch::channel(None);
     drop(rx);
     let cancel = CancellationToken::new();
     {
@@ -6742,6 +7564,7 @@ async fn closed_group_client_channel_removes_binding_and_cancels_socket() {
             GroupClientBinding {
                 connection_id: 9,
                 tx,
+                terminal_tx,
                 cancel: cancel.clone(),
             },
         );
@@ -6761,6 +7584,55 @@ async fn closed_group_client_channel_removes_binding_and_cancels_socket() {
             .lock()
             .await
             .contains_key("closed-client-test")
+    );
+}
+
+#[tokio::test]
+async fn terminal_group_event_bypasses_full_outbound_channel() {
+    let state = test_app_state();
+    let (tx, _rx) = mpsc::channel::<String>(1);
+    tx.try_send("queued".to_string())
+        .expect("test channel should accept first event");
+    let (terminal_tx, mut terminal_rx) = watch::channel(None);
+    let cancel = CancellationToken::new();
+    {
+        let mut clients = state.group_clients.lock().await;
+        clients.insert(
+            "terminal-client-test".to_string(),
+            GroupClientBinding {
+                connection_id: 11,
+                tx,
+                terminal_tx,
+                cancel: cancel.clone(),
+            },
+        );
+    }
+
+    close_all_group_clients_with_event(
+        &state,
+        json!({"type":"feature_status","features":{"groups":false}}),
+    )
+    .await;
+
+    assert!(cancel.is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(1), terminal_rx.changed())
+        .await
+        .expect("terminal notification should not wait for outbound queue capacity")
+        .expect("terminal notification sender should remain alive for delivery");
+    let payload = terminal_rx
+        .borrow_and_update()
+        .clone()
+        .expect("terminal payload should be present");
+    let payload: serde_json::Value =
+        serde_json::from_str(&payload).expect("terminal payload should be JSON");
+    assert_eq!(payload["type"], "feature_status");
+    assert_eq!(payload["features"]["groups"], false);
+    assert!(
+        !state
+            .group_clients
+            .lock()
+            .await
+            .contains_key("terminal-client-test")
     );
 }
 
@@ -7170,6 +8042,7 @@ async fn api_put_mcp_session_policy_preserves_previously_enabled_missing_tools()
             enabled_tools: HashSet::from([tool_id.clone()]),
             confirm_mutating_tools: false,
             client_capabilities: Default::default(),
+            cache_namespace: None,
         },
     )
     .expect("previous policy should save");
@@ -7292,6 +8165,7 @@ async fn api_put_mcp_session_policy_rejects_previously_enabled_tool_missing_afte
             enabled_tools: HashSet::from([stale_tool.clone()]),
             confirm_mutating_tools: false,
             client_capabilities: Default::default(),
+            cache_namespace: None,
         },
     )
     .expect("previous policy should save");
@@ -7538,7 +8412,8 @@ async fn api_test_mcp_resolves_cwd_against_requested_session_workspace() {
         workspace: workspace.clone(),
     };
     let mut session = test_session(&session_id, "MCP Test Workspace", None);
-    session.workspace = workspace;
+    session.workspace = workspace.clone();
+    session.working_directory = workspace;
     session.version = SESSION_VERSION;
     state
         .sessions
@@ -7920,6 +8795,58 @@ async fn api_test_model_rejects_placeholder_requests_without_saved_provider_cont
         body.0["error"].as_str(),
         Some("Save config before testing providers that use ${ENV} placeholders.")
     );
+}
+
+#[tokio::test]
+async fn config_save_validation_uses_the_selected_sessions_working_directory() {
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-config-workspace-{}-{}",
+        std::process::id(),
+        now_epoch()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    let mcp_directory = project.join("mcp-server");
+    std::fs::create_dir_all(&mcp_directory).unwrap();
+    let project = std::fs::canonicalize(project).unwrap();
+    let mcp_directory = std::fs::canonicalize(mcp_directory).unwrap();
+
+    let state = test_app_state();
+    let mut session = test_session("project-session", "Project", None);
+    session.workspace_kind = SessionWorkspaceKind::Directory;
+    session.working_directory = project.clone();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
+
+    let request = json!({ "session": "project-session" });
+    let validation_directory = config_validation_working_directory(&state, &request)
+        .await
+        .expect("selected Session should resolve from memory");
+    assert_eq!(validation_directory, project);
+
+    let config: crate::config::JsonConfig = serde_json::from_value(json!({
+        "mcpServers": {
+            "project-server": {
+                "command": "uvx",
+                "cwd": mcp_directory.to_string_lossy()
+            }
+        }
+    }))
+    .unwrap();
+    Config::validate_json_mcp_servers_for_workspace(&config, &validation_directory)
+        .expect("an MCP cwd inside the selected project should be accepted");
+    assert!(
+        Config::validate_json_mcp_servers_for_workspace(
+            &config,
+            &session_workspace_path(MAIN_SESSION_ID)
+        )
+        .is_err(),
+        "the previous Main-home validation would reject the same project cwd"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -8625,6 +9552,8 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 0,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 
@@ -8935,6 +9864,7 @@ fn health_payload_does_not_advertise_the_implicit_fallback_model() {
 
     let payload = api_health_payload(&state, 1);
 
+    assert_eq!(payload["service"], "lingclaw");
     assert_eq!(payload["model"], serde_json::Value::Null);
     assert_eq!(payload["model_configured"], false);
     assert_eq!(payload["sessions"], 1);
@@ -9532,6 +10462,8 @@ fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
             created_at: 0,
             updated_at: 0,
             corrupt: false,
+            workspace_kind: crate::SessionWorkspaceKind::Managed,
+            working_directory: PathBuf::new(),
         },
         crate::session_store::SessionSummary {
             id: "corrupt-session".to_string(),
@@ -9542,6 +10474,8 @@ fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
             created_at: 0,
             updated_at: 0,
             corrupt: true,
+            workspace_kind: crate::SessionWorkspaceKind::Managed,
+            working_directory: PathBuf::new(),
         },
         crate::session_store::SessionSummary {
             id: "real-session".to_string(),
@@ -9552,6 +10486,8 @@ fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
             created_at: 0,
             updated_at: 0,
             corrupt: false,
+            workspace_kind: crate::SessionWorkspaceKind::Managed,
+            working_directory: PathBuf::new(),
         },
     ];
 
@@ -9601,6 +10537,8 @@ fn resolve_session_target_for_command_accepts_persisted_empty_session_prefix() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (session_workspace_path(&session_id)).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: session_workspace_path(&session_id),
     };
     rt.block_on(save_session_to_disk(&persisted_session))
@@ -14504,6 +15442,7 @@ fn context_input_budget_reserves_headroom() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let budget = context_input_budget_for_model(&config, "anthropic/claude-opus-4-7");
@@ -15149,6 +16088,8 @@ fn trim_incomplete_tool_calls_in_session_drops_orphaned_subagent_snapshots() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     };
 

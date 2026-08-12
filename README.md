@@ -77,6 +77,15 @@ $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.c
 
 LingClaw 不会在缺少配置时静默调用内置默认模型。配置完成并启动服务后，访问 [http://127.0.0.1:18989](http://127.0.0.1:18989)。
 
+也可以直接在项目目录打开终端工作台：
+
+```bash
+cd /path/to/project
+lingclaw tui
+```
+
+`lingclaw tui [PATH]` 会复用已运行的本地服务，或自动启动 daemon。它按规范化目录恢复匹配的 Session；没有匹配项时会用当前文件夹名称预填一个目录工作空间，多项匹配时提供选择。首次没有可用模型时，TUI 会在终端内引导配置 Provider、模型和主 Agent，API Key 全程遮蔽。daemon 在退出 TUI 后继续运行。
+
 输入区会区分不同的恢复路径：
 
 - Provider 或 Model 尚未配置时，直接打开 Settings → Models。
@@ -98,7 +107,7 @@ lingclaw db status
 lingclaw db backup
 ```
 
-Session、Group、消息、Todos、Usage 和 Sub-agent 快照存放在 `~/.lingclaw/lingclaw.db`。从旧版升级时，LingClaw 会在监听端口前严格校验并迁移原有 `sessions/`、`groups/` JSON；原文件会永久保留在 `~/.lingclaw/backups/sqlite-migration-*/`，不会继续双写。
+Session、Group、消息、Todos、Usage、工作目录绑定和 Sub-agent 快照存放在 `~/.lingclaw/lingclaw.db`。从旧版升级时，LingClaw 会在监听端口前严格校验并迁移原有 `sessions/`、`groups/` JSON；原文件会永久保留在 `~/.lingclaw/backups/sqlite-migration-*/`，不会继续双写。
 
 安装细节、systemd、Docker 和反向代理说明见[部署指南](docs/deploy.md)。
 
@@ -122,9 +131,11 @@ LingClaw 使用 `Analyze → Act → Observe → Finish` 的 ReAct 状态机组�
 
 模型按 `provider/model` 路由。Primary、Fast、Sub-agent、Memory、Reflection 和 Context 可以分别配置。普通 Session 可直接在输入区搜索并原子切换模型与其允许的 Thinking Effort，选择会持久化；`/model` 与 `/think` 保持兼容。
 
-### 用 Session 隔离上下文，用 Group 组织协作
+### 用 Session 绑定项目，用 Group 组织协作
 
-每个 Session 拥有独立工作区、提示文件、消息历史、Todos、记忆和能力配置。Group 可以把多个 Session 组织成群聊，支持广播、已选目标和 `@session-id` 精确提及；界面展示名称，协议始终使用稳定 ID。
+每个 Session 都有 LingClaw 私有的 `session_home`，用于提示、记忆、Skills、Agents 与策略；文件、Shell、Git、图片和 Plan evidence 则运行在可重绑的 `working_directory`。默认托管目录仍位于 `~/.lingclaw/<session-id>/workspace/`，也可以把 Session 绑定到已有项目目录。删除 Session 只删除数据库记录和私有 Home，绝不删除外部项目。
+
+Group 可以把多个 Session 组织成群聊，支持广播、已选目标和 `@session-id` 精确提及；界面展示名称，协议始终使用稳定 ID。Group 默认关闭，需在 General 设置中显式开启；关闭和重新开启不会删除已有数据。
 
 ### 在内置工具、MCP 与 Skills 之间扩展能力
 
@@ -160,6 +171,14 @@ Group 上下文栏提供“全部 / 已选 / @提及”三种派发模式。Main
 
 会话导航在手机上使用全屏抽屉，工具详情改为底部面板。双层输入区把多行正文与附件、模型/Effort、规划、停止和发送操作分开；图片不可用时 `+` 菜单仍会解释原因。关键触控目标不小于 44px，并保留键盘、焦点返回和减少动效支持。
 
+### 同一套 Runtime 的终端工作台
+
+`lingclaw tui [PATH]` 通过现有 HTTP/WebSocket 协议提供 Session/工作目录导航、流式对话、Plan、执行过程、模型、Skills、MCP、Usage、Settings、Todos 与可选 Group 页面。宽终端使用三栏，中等宽度使用双栏，窄终端切为单页。Settings 以原生字段展示常规开关、Agent 路由、Provider 连接和 S3；使用 `↑/↓` 选择、`Space` 切换、`Enter` 编辑。`Ctrl+P` 打开命令面板，`Ctrl+S` 进入高级 Raw JSON：配置了 `$VISUAL`/`$EDITOR` 时调用外部编辑器，否则使用内置多行编辑器。默认构建会检测 Kitty、Sixel 或 iTerm2 图形协议并原生预览图片；终端不支持时保留图片名称、链接和系统查看器操作。
+
+<p align="center">
+  <img src="docs/assets/readme/zh/tui.webp" alt="LingClaw 中文终端工作台，展示工作目录会话、对话、执行栈和模型 Effort" width="100%">
+</p>
+
 ### 全屏 Console 与可视化 Usage
 
 Settings 与 Usage 位于独立的全屏 LingClaw Console，与工作区平级切换。桌面端使用侧栏导航，窄屏改用紧凑的分类选择器；切换分类会保留已访问页面的表单草稿，返回工作区时恢复焦点，并尊重系统的减少动效偏好。
@@ -170,21 +189,23 @@ Models 以可搜索、可按 Provider 和能力筛选的卡片展示，响应式
 
 ```mermaid
 flowchart LR
-    UI["Browser UI"] <-->|"WebSocket / HTTP"| Runtime["LingClaw Runtime"]
+    UI["Browser UI / TUI"] <-->|"WebSocket / HTTP"| Runtime["LingClaw Runtime"]
     Runtime --> Loop["ReAct Agent Loop"]
     Loop --> Providers["Configured Model Providers"]
     Loop --> Tools["Built-in Tools"]
     Tools --> MCP["MCP Servers"]
     Runtime <--> DB["SQLite Core Storage"]
-    Runtime <--> Store["Local Session Workspaces"]
+    Runtime <--> Home["Private Session Homes"]
+    Loop <--> Project["Selected Working Directories"]
     Tools --> S3["Optional S3-compatible Storage"]
 ```
 
-- **Browser UI**：响应式工作台，负责会话导航、流式消息和执行栈，并通过全屏 Console 管理 Settings 与 Usage。
+- **Browser UI / TUI**：共享同一协议和 Runtime 状态；浏览器提供响应式工作台，终端可从当前项目目录直接进入。
 - **Runtime**：单个 Rust 进程，管理 WebSocket、配置快照、并发 Session、Group 派发和持久化。
 - **SQLite**：`~/.lingclaw/lingclaw.db` 是 Session、消息、Todos、Usage、Sub-agent 快照和 Group 数据的唯一持久化来源；工作区文件和配置仍保留在文件系统中。
 - **Agent Loop**：在明确的阶段与上限内选择模型、调用工具、吸收观察并完成回复。
-- **Workspace**：默认位于 `~/.lingclaw/<session-id>/workspace/`，包含提示、Skills、Agents 和记忆。
+- **Session Home**：始终位于 `~/.lingclaw/<session-id>/workspace/`，保存提示、Skills、Agents、记忆和策略，不会写入外部项目。
+- **Working Directory**：文件、Shell、Git、图片、Plan evidence 与 MCP roots 的实际项目根；可以使用托管目录或绑定已有绝对目录。
 
 更完整的模块、Provider 转换和持久化说明见[架构文档](docs/architecture.md)。
 
@@ -194,17 +215,18 @@ flowchart LR
 |---|---|---|
 | 配置与凭据 | `~/.lingclaw/` | 不会整份自动同步；连接 Provider、MCP 或 S3 时，相应凭据会发送给该服务用于鉴权 |
 | Session、Group、消息、Todos 与 Usage | `~/.lingclaw/lingclaw.db` | 数据库不自动同步；相关内容进入模型上下文时会发送给你选择的 Provider |
-| Workspace 提示、Skills、Agents 与记忆文件 | `~/.lingclaw/<session-id>/workspace/` | 被注入模型上下文时会发送给你选择的 Provider |
+| Session Home 提示、Skills、Agents 与记忆文件 | `~/.lingclaw/<session-id>/workspace/` | 被注入模型上下文时会发送给你选择的 Provider |
+| 项目工作目录 | 用户选择的现有绝对目录，或托管 Session Home | 文件内容只有在工具读取或注入规则时才进入模型请求；删除 Session 不会删除外部目录 |
 | 提示、对话和工具观察 | 当前 Session 与 Runtime | 作为模型请求内容发送给你选择的 Provider |
 | 用户附件与工具图片 | 可选 S3-compatible 存储 | 仅在启用 S3 和图片能力后上传 |
 | MCP 数据 | 对应 MCP server | 由你启用的 server 与 tool 决定 |
 
 - Web 服务默认绑定 `127.0.0.1`，不会直接监听局域网或公网地址。
-- 配置、SQLite 核心数据和 Session Workspace 保存在本机 `~/.lingclaw/`，LingClaw 不会自动同步整份存档。
-- 运行中可用 `lingclaw db backup [PATH]` 创建一致的 SQLite 快照；完整灾备仍应同时备份配置、MCP 认证和 Workspace 文件。
+- 配置、SQLite 核心数据和私有 Session Home 保存在本机 `~/.lingclaw/`；绑定的项目目录仍在用户选择的位置，LingClaw 不会自动同步整份存档。
+- 运行中可用 `lingclaw db backup [PATH]` 创建一致的 SQLite 快照；完整灾备仍应同时备份配置、MCP 认证、私有 Session Home 和需要保留的项目目录。
 - 模型请求可能包含系统提示、对话历史、工具观察，以及被注入上下文的 Todos 和记忆内容；这些内容会发送给你配置的模型 Provider，请以对应 Provider 的数据政策为准。
 - 本地图片上传与工具图片闭环依赖可选 S3-compatible 存储。OpenAI/Anthropic 需要可被远端访问的签名 URL；Gemini/Ollama 由 LingClaw 本地预取图片。
-- 文件工具限制在当前 Session 工作区；网络工具执行 SSRF 检查并禁止重定向；命令工具包含危险命令检测与超时。
+- 文件、Shell、Git、图片和 Plan 工具限制在当前 Session 的 `working_directory`。外部目录只读取根目录 `AGENTS.md`（缺失时 `AGENT.md`），不扫描父目录，也不写入 LingClaw 模板；网络工具执行 SSRF 检查并禁止重定向，命令工具包含危险命令检测与超时。
 - MCP tool 是否可用由当前 Session policy 决定；可变更外部状态的 MCP tool 可以要求确认。
 
 LingClaw 能执行命令并修改工作区文件。请像使用其他本地开发 Agent 一样，审查工具权限并保护 `.lingclaw.json` 中的凭据。
@@ -225,6 +247,8 @@ LingClaw 能执行命令并修改工作区文件。请像使用其他本地开�
 ## 开发
 
 ### 后端
+
+需要 Rust 1.90 或更高版本。
 
 ```bash
 cargo fmt --check

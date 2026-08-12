@@ -609,17 +609,29 @@ pub(crate) fn is_mcp_tool_read_only(descriptor: &crate::tools::mcp::McpToolDescr
 /// - `Some(McpPolicy::ReadOnly)` — only MCP tools classified as non-mutating
 ///   by `is_mcp_tool_read_only()` (deny list still applies).
 /// - `None` — fall back to the generic allow/deny list (`is_allowed()`).
+#[cfg(test)]
 pub(crate) fn filter_tools_for_agent_with_mcp(
     spec: &SubAgentSpec,
     config: &crate::Config,
     workspace: &std::path::Path,
 ) -> Vec<String> {
-    let mut allowed = filter_tools_for_agent(spec);
     let session_policy = crate::tools::mcp::load_session_policy(workspace);
+    filter_tools_for_agent_with_mcp_policy(spec, config, workspace, &session_policy)
+}
+
+/// Filter tools using the Session-private MCP policy while resolving MCP
+/// roots and cached descriptors against the Agent's real working directory.
+pub(crate) fn filter_tools_for_agent_with_mcp_policy(
+    spec: &SubAgentSpec,
+    config: &crate::Config,
+    working_directory: &std::path::Path,
+    session_policy: &crate::tools::mcp::McpSessionPolicy,
+) -> Vec<String> {
+    let mut allowed = filter_tools_for_agent(spec);
 
     // Add MCP tools from cache, filtered according to policy.
     for descriptor in
-        crate::tools::mcp::cached_list_tools_for_policy(config, workspace, &session_policy)
+        crate::tools::mcp::cached_list_tools_for_policy(config, working_directory, session_policy)
     {
         let mcp_ok = match spec.mcp_policy {
             Some(McpPolicy::All) => true,

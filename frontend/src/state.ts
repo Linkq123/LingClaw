@@ -100,6 +100,7 @@ export interface AppState {
   composerCurrentEffort: string;
   composerModelSwitchInFlight: boolean;
   groupModelConfiguredMembers: Set<string>;
+  groupsEnabled: boolean;
   activeSessionId: string;
   activeGroupId: string;
   activeGroupMembers: string[];
@@ -225,6 +226,7 @@ export const state: AppState = {
   composerCurrentEffort: 'off',
   composerModelSwitchInFlight: false,
   groupModelConfiguredMembers: new Set(),
+  groupsEnabled: false,
   activeSessionId: '',
   activeGroupId: '',
   activeGroupMembers: [],

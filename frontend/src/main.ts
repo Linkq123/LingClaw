@@ -269,6 +269,8 @@ import {
   promoteSessionGroupAdmin as requestPromoteSessionGroupAdmin,
   removeSessionGroupMember as requestRemoveSessionGroupMember,
   updateSessionGroup as requestUpdateSessionGroup,
+  updateSession as requestUpdateSession,
+  browseWorkspaces as requestBrowseWorkspaces,
   normalizeGroupVotes,
 } from './sessionApi.js';
 import {
@@ -289,12 +291,8 @@ import {
 initDomRefs();
 initI18n();
 state.activeSessionId = loadActiveSessionId();
-state.activeGroupId = loadActiveGroupId();
-if (state.activeGroupId) {
-  const groupSessionState = mainSessionStateForGroupControl(state.activeSessionId);
-  state.groupReturnSessionId = groupSessionState.groupReturnSessionId;
-  state.activeSessionId = groupSessionState.activeSessionId;
-}
+const persistedActiveGroupId = loadActiveGroupId();
+state.activeGroupId = '';
 const switchToSession = createMobileNavigationSelectionHandler(
   (sessionId) => !state.activeGroupId && sessionId === state.activeSessionId,
   performSwitchToSession,
@@ -471,6 +469,15 @@ function normalizeSessionListPayload(payload): SessionSummary[] {
             ? session.updated_at
             : Number(session.updated_at ?? 0),
         corrupt: session.corrupt === true,
+        workspace:
+          session.workspace && typeof session.workspace === 'object'
+            ? {
+                kind: session.workspace.kind === 'directory' ? 'directory' : 'managed',
+                path: String(session.workspace.path ?? ''),
+                display_name: String(session.workspace.display_name ?? ''),
+                available: session.workspace.available !== false,
+              }
+            : undefined,
       }))
     : [];
   sessions.sort((a, b) => {
@@ -1183,15 +1190,68 @@ async function refreshSessionsList() {
   }
 }
 
-async function refreshGroupsList() {
+let groupFeatureGeneration = 0;
+
+async function refreshGroupsList(expectedGeneration = groupFeatureGeneration) {
+  if (!state.groupsEnabled) return;
   try {
     const response = await fetch('/api/session-groups', { cache: 'no-store' });
     if (!response.ok) return;
     const payload = await response.json();
+    if (!state.groupsEnabled || expectedGeneration !== groupFeatureGeneration) return;
     state.sessionGroups = normalizeSessionGroupListPayload(payload);
     renderSessionDrawer();
   } catch {
     // ignore group list refresh failures; live socket state still works
+  }
+}
+
+async function applyGroupFeatureStatus(enabled: boolean, initial = false): Promise<void> {
+  if (state.groupsEnabled !== enabled || initial) groupFeatureGeneration += 1;
+  const featureGeneration = groupFeatureGeneration;
+  const changed = state.groupsEnabled !== enabled;
+  state.groupsEnabled = enabled;
+  if (enabled) {
+    if (initial && persistedActiveGroupId) {
+      state.activeGroupId = persistedActiveGroupId;
+      const groupSessionState = mainSessionStateForGroupControl(state.activeSessionId);
+      state.groupReturnSessionId = groupSessionState.groupReturnSessionId;
+      state.activeSessionId = groupSessionState.activeSessionId;
+    }
+    renderSessionDrawer();
+    if (changed || initial) await refreshGroupsList(featureGeneration);
+    return;
+  }
+
+  state.sessionGroups = [];
+  const wasInGroup = Boolean(state.activeGroupId);
+  if (wasInGroup) {
+    leaveActiveGroupForSession();
+  } else {
+    state.activeGroupId = '';
+    state.groupReturnSessionId = '';
+    persistActiveGroupId('');
+    clearGroupRunState();
+    resetGroupTargetControls();
+  }
+  renderSessionDrawer();
+  if (wasInGroup && !initial) {
+    beginComposerSessionTransition(false, state.activeSessionId);
+    state.sessionSwitchInFlight = true;
+    reconnectToActiveSession(handleMessage);
+  }
+}
+
+async function discoverClientFeatures(): Promise<void> {
+  try {
+    const response = await fetch('/api/client-config', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    await applyGroupFeatureStatus(payload?.features?.groups === true, true);
+  } catch {
+    // Feature flags are fail-closed. In particular this guarantees that an
+    // older or unreachable daemon never receives speculative Group requests.
+    await applyGroupFeatureStatus(false, true);
   }
 }
 
@@ -1238,7 +1298,7 @@ function performSwitchToSession(nextSessionId: string) {
 }
 
 function performSwitchToGroup(nextGroupId: string) {
-  if (sessionIdentityActionBlocked()) return;
+  if (!state.groupsEnabled || sessionIdentityActionBlocked()) return;
   beginComposerSessionTransition();
   enterGroupControlSession();
   state.activeGroupId = nextGroupId;
@@ -1269,43 +1329,52 @@ function openWorkspaceActionDialog(request: ActionDialogRequest) {
 
 async function createSession() {
   if (storageWriteBlocked() || sessionCreateInFlight || sessionIdentityActionBlocked()) return;
-  sessionCreateInFlight = true;
-  state.sessionIdentityMutationInFlight = true;
-  renderSessionDrawer();
-  syncComposerAvailability();
-  updateAttachButton();
-  try {
-    const created = await requestCreateSession();
-    upsertSessionSummary(created);
-    state.pendingDeleteSessionId =
-      state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
-    state.activeGroupId = '';
-    state.groupReturnSessionId = '';
-    persistActiveGroupId('');
-    clearGroupRunState();
-    resetGroupTargetControls();
-    beginComposerSessionTransition(false, created.id);
-    state.sessionSwitchInFlight = true;
-    state.activeSessionId = created.id;
-    persistActiveSessionId(created.id);
-    renderSessionDrawer();
-    reconnectToActiveSession(handleMessage);
-  } catch (error) {
-    addError(
-      tr('session.errorCreate', { error: error instanceof Error ? error.message : String(error) }),
-    );
-    renderSessionDrawer();
-  } finally {
-    sessionCreateInFlight = false;
-    state.sessionIdentityMutationInFlight = false;
-    renderSessionDrawer();
-    syncComposerAvailability();
-    updateAttachButton();
-  }
+  await openWorkspaceActionDialog({
+    kind: 'create-session',
+    initialName: tr('session.newSessionShort'),
+    initialWorkspace: { kind: 'managed' },
+    browse: requestBrowseWorkspaces,
+    submit: async ({ name, workspace }) => {
+      sessionCreateInFlight = true;
+      state.sessionIdentityMutationInFlight = true;
+      renderSessionDrawer();
+      syncComposerAvailability();
+      updateAttachButton();
+      try {
+        const created = await requestCreateSession({ name, workspace });
+        upsertSessionSummary(created);
+        state.pendingDeleteSessionId =
+          state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
+        state.activeGroupId = '';
+        state.groupReturnSessionId = '';
+        persistActiveGroupId('');
+        clearGroupRunState();
+        resetGroupTargetControls();
+        beginComposerSessionTransition(false, created.id);
+        state.sessionSwitchInFlight = true;
+        state.activeSessionId = created.id;
+        persistActiveSessionId(created.id);
+        renderSessionDrawer();
+        reconnectToActiveSession(handleMessage);
+      } finally {
+        sessionCreateInFlight = false;
+        state.sessionIdentityMutationInFlight = false;
+        renderSessionDrawer();
+        syncComposerAvailability();
+        updateAttachButton();
+      }
+    },
+  });
 }
 
 async function createGroup() {
-  if (storageWriteBlocked() || sessionCreateInFlight || sessionIdentityActionBlocked()) return;
+  if (
+    !state.groupsEnabled ||
+    storageWriteBlocked() ||
+    sessionCreateInFlight ||
+    sessionIdentityActionBlocked()
+  )
+    return;
   const sessions = editableGroupSessions();
   const selectedMembers = sessions.some((session) => session.id === state.activeSessionId)
     ? [state.activeSessionId]
@@ -1376,38 +1445,39 @@ async function renameSession(sessionId: string) {
   const current = state.sessions.find((session) => session.id === targetSessionId);
   if (current?.corrupt) return;
   await openWorkspaceActionDialog({
-    kind: 'rename-session',
-    entityId: targetSessionId,
-    entityName: current?.name || targetSessionId,
-    submit: async (nextName) => {
-      if (nextName === (current?.name || targetSessionId)) return;
-      const response = await fetch(`/api/session?session=${encodeURIComponent(targetSessionId)}`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name: nextName }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(String(payload?.error || `HTTP ${response.status}`));
-      }
+    kind: 'edit-session',
+    sessionId: targetSessionId,
+    initialName: current?.name || targetSessionId,
+    initialWorkspace:
+      current?.workspace?.kind === 'directory'
+        ? { kind: 'directory', path: current.workspace.path }
+        : { kind: 'managed' },
+    browse: requestBrowseWorkspaces,
+    submit: async ({ name, workspace }) => {
+      const currentName = current?.name || targetSessionId;
+      const currentWorkspace =
+        current?.workspace?.kind === 'directory'
+          ? { kind: 'directory' as const, path: current.workspace.path }
+          : { kind: 'managed' as const };
+      const workspaceChanged =
+        workspace.kind !== currentWorkspace.kind ||
+        (workspace.kind === 'directory' &&
+          currentWorkspace.kind === 'directory' &&
+          workspace.path !== currentWorkspace.path);
+      const update: {
+        name?: string;
+        workspace?: typeof workspace;
+      } = {};
+      if (name !== currentName) update.name = name;
+      if (workspaceChanged) update.workspace = workspace;
+      if (!update.name && !update.workspace) return;
 
-      const updated = payload?.session;
-      if (updated?.id) {
-        const updatedSession: SessionSummary = {
-          id: String(updated.id),
-          name: String(updated.name ?? updated.id),
-          updated_at:
-            typeof updated.updated_at === 'number'
-              ? updated.updated_at
-              : Number(updated.updated_at ?? 0),
-          corrupt: updated.corrupt === true,
-        };
-        upsertSessionSummary(updatedSession);
-        if (updatedSession.id === state.activeSessionId) {
-          dom.sessionNameEl.textContent = updatedSession.name || tr('common.main');
-        }
-        renderSessionDrawer();
+      const updatedSession = await requestUpdateSession(targetSessionId, update);
+      upsertSessionSummary(updatedSession);
+      if (updatedSession.id === state.activeSessionId) {
+        dom.sessionNameEl.textContent = updatedSession.name || tr('common.main');
       }
+      renderSessionDrawer();
       void refreshSessionsList();
     },
   });
@@ -1415,7 +1485,13 @@ async function renameSession(sessionId: string) {
 
 async function renameGroup(groupId: string) {
   const targetGroupId = String(groupId || '').trim();
-  if (storageWriteBlocked() || !targetGroupId || sessionIdentityActionBlocked()) return;
+  if (
+    !state.groupsEnabled ||
+    storageWriteBlocked() ||
+    !targetGroupId ||
+    sessionIdentityActionBlocked()
+  )
+    return;
   const current = state.sessionGroups.find((group) => group.id === targetGroupId);
   if (current?.corrupt) return;
   if (state.mobileNavigationOpen) closeMobileNavigation({ restoreFocus: true });
@@ -1451,7 +1527,13 @@ async function renameGroup(groupId: string) {
 
 async function deleteGroup(groupId: string) {
   const targetGroupId = String(groupId || '').trim();
-  if (storageWriteBlocked() || !targetGroupId || sessionIdentityActionBlocked()) return;
+  if (
+    !state.groupsEnabled ||
+    storageWriteBlocked() ||
+    !targetGroupId ||
+    sessionIdentityActionBlocked()
+  )
+    return;
   const current = state.sessionGroups.find((group) => group.id === targetGroupId);
   await openWorkspaceActionDialog({
     kind: 'delete-group',
@@ -2257,6 +2339,17 @@ function invalidatePendingHistoryRender(): number {
 }
 
 function handleMessage(data) {
+  if (data.type === 'feature_status') {
+    return applyGroupFeatureStatus(data?.features?.groups === true);
+  }
+  if (
+    !state.groupsEnabled &&
+    (data.type === 'session_group_list' ||
+      data.type === 'group' ||
+      String(data.type || '').startsWith('group_'))
+  ) {
+    return;
+  }
   switch (data.type) {
     case 'storage_status':
       applyStorageStatus(data);
@@ -3302,8 +3395,13 @@ if (dom.sessionDrawerToggleBtn) {
 if (dom.sessionDrawerNewBtn) {
   dom.sessionDrawerNewBtn.addEventListener('click', handleSessionDrawerNewClick);
 }
-void refreshSessionsList();
-void refreshGroupsList();
+async function bootstrapWorkspace(): Promise<void> {
+  await discoverClientFeatures();
+  await refreshSessionsList();
+  connect(handleMessage);
+}
+
+void bootstrapWorkspace();
 
 // Vite HMR: remove global listeners on module dispose so hot reloads don't
 // accumulate duplicate handlers in the dev build. No-op in production.
@@ -3346,5 +3444,4 @@ if (import.meta.hot) {
 }
 
 void loadAppVersion();
-connect(handleMessage);
 prefetchPageChunks();

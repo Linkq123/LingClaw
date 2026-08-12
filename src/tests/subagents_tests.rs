@@ -925,6 +925,7 @@ fn base_config() -> Config {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     }
 }
 
@@ -2569,6 +2570,7 @@ async fn execute_subagent_tool_with_live_output_returns_on_cancellation() {
             &base_config(),
             &Client::new(),
             &workspace,
+            &workspace,
             false,
             None,
             None,
@@ -2609,6 +2611,7 @@ async fn execute_subagent_tool_with_live_output_prefers_completed_result_over_ca
         &serde_json::to_string(&args).expect("args should serialize"),
         &base_config(),
         &Client::new(),
+        &workspace,
         &workspace,
         false,
         None,
@@ -2664,6 +2667,7 @@ async fn subagent_tool_timeout_pauses_while_waiting_for_ordered_image_budget() {
             r#"{"path":"sample.png"}"#,
             &config,
             &Client::new(),
+            &workspace,
             &workspace,
             false,
             None,
@@ -2838,6 +2842,7 @@ async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
             enabled_tools: std::collections::HashSet::from([tool_name.clone()]),
             confirm_mutating_tools: false,
             client_capabilities: Default::default(),
+            cache_namespace: None,
         },
     )
     .expect("MCP session policy should save");

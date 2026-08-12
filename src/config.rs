@@ -173,6 +173,8 @@ pub(crate) struct Config {
     pub(crate) enable_state_digest: bool,
     /// Enable rule-based runtime TaskPlan prompt guidance and live events (default: false).
     pub(crate) enable_task_plan: bool,
+    /// Enable Group chat and Group control-plane operations (default: false).
+    pub(crate) enable_groups: bool,
     /// Optional S3-compatible storage for image uploads.
     pub(crate) s3: Option<S3Config>,
 }
@@ -798,6 +800,7 @@ impl Config {
                 .unwrap_or(false),
             enable_state_digest: settings.enable_state_digest.unwrap_or(true),
             enable_task_plan: settings.enable_task_plan.unwrap_or(false),
+            enable_groups: settings.enable_groups.unwrap_or(false),
             s3,
         };
         align_runtime_provider_config(
@@ -1610,6 +1613,9 @@ pub(crate) struct JsonSettings {
     /// Enable rule-based runtime TaskPlan prompt guidance and live events (default: false).
     #[serde(rename = "enableTaskPlan")]
     pub(crate) enable_task_plan: Option<bool>,
+    /// Enable Group chat and Group control-plane operations (default: false).
+    #[serde(rename = "enableGroups")]
+    pub(crate) enable_groups: Option<bool>,
     /// Enable S3-compatible image upload (default: true when s3 section is configured).
     #[serde(rename = "enableS3")]
     pub(crate) enable_s3: Option<bool>,

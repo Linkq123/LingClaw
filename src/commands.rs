@@ -5,7 +5,12 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::prompts::{build_system_prompt, build_system_prompt_with_query_cached};
+#[cfg(test)]
+use crate::prompts::build_system_prompt;
+use crate::prompts::{
+    build_system_prompt_for_working_directory_async,
+    build_system_prompt_with_query_cached_for_working_directory_async,
+};
 use crate::{
     AppState, MAIN_SESSION_ID, Session, WsTx, agent, default_show_react, default_show_reasoning,
     default_show_tools,
@@ -425,42 +430,47 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
     let mut cached_mcp_tools = match resolved.provider {
         crate::Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic_for_policy(
             &config,
-            &session.workspace,
+            &session.working_directory,
             &mcp_policy,
         ),
         crate::Provider::OpenAI | crate::Provider::OpenAIResponses => {
             tools::mcp::cached_tool_definitions_openai_for_policy(
                 &config,
-                &session.workspace,
+                &session.working_directory,
                 &mcp_policy,
             )
         }
         crate::Provider::Ollama => tools::mcp::cached_tool_definitions_ollama_for_policy(
             &config,
-            &session.workspace,
+            &session.working_directory,
             &mcp_policy,
         ),
         crate::Provider::Gemini => tools::mcp::cached_tool_definitions_gemini_for_policy(
             &config,
-            &session.workspace,
+            &session.working_directory,
             &mcp_policy,
         ),
     };
     extra_tools.append(&mut cached_mcp_tools);
-    let (cached_mcp_servers, enabled_mcp_servers) =
-        tools::mcp::cached_server_counts_for_policy(&config, &session.workspace, &mcp_policy);
+    let (cached_mcp_servers, enabled_mcp_servers) = tools::mcp::cached_server_counts_for_policy(
+        &config,
+        &session.working_directory,
+        &mcp_policy,
+    );
     let request_budget =
         crate::context::context_input_budget_for_runtime(&config, &active_model, &effective_think);
     let tool_estimate =
         crate::context::estimate_tool_schema_tokens_for_provider(resolved.provider, &extra_tools);
 
     let mut request_messages = session.messages.clone();
-    let fresh_system = build_system_prompt(
+    let fresh_system = build_system_prompt_for_working_directory_async(
         &config,
         &session.workspace,
+        &session.working_directory,
         &active_model,
         &session.enabled_system_skills,
-    );
+    )
+    .await;
     if let Some(first) = request_messages.first_mut()
         && first.role == "system"
     {
@@ -558,6 +568,22 @@ async fn reset_session_context_and_persist(
     let config = state.config();
     let persist_gate = session_persist_gate(current_session_id);
     let _persist_guard = persist_gate.lock().await;
+    let session_snapshot = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(current_session_id)
+            .cloned()
+            .ok_or_else(|| "Session not found".to_string())?
+    };
+    let model = session_snapshot.effective_model(&config.model).to_string();
+    let sys = build_system_prompt_for_working_directory_async(
+        &config,
+        &session_snapshot.workspace,
+        &session_snapshot.working_directory,
+        &model,
+        &session_snapshot.enabled_system_skills,
+    )
+    .await;
     let (previous, session_to_save) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
@@ -565,13 +591,6 @@ async fn reset_session_context_and_persist(
             .ok_or_else(|| "Session not found".to_string())?;
         let previous = session.clone();
         {
-            let model = session.effective_model(&config.model).to_string();
-            let sys = build_system_prompt(
-                &config,
-                &session.workspace,
-                &model,
-                &session.enabled_system_skills,
-            );
             replace_session_messages(session, vec![sys]);
             session.tool_calls_count = 0;
             session.todos =
@@ -945,13 +964,15 @@ async fn handle_system_prompt_command(current_session_id: &str, state: &AppState
                 .rev()
                 .find(|message| message.role == "user")
                 .and_then(|message| message.content.as_deref());
-            let system_prompt = build_system_prompt_with_query_cached(
+            let system_prompt = build_system_prompt_with_query_cached_for_working_directory_async(
                 &config,
                 &session.workspace,
+                &session.working_directory,
                 &model,
                 &session.enabled_system_skills,
                 latest_query,
-            );
+            )
+            .await;
             let prompt_tokens =
                 crate::context::message_token_len_for_provider(resolved.provider, &system_prompt);
             let prompt_text = system_prompt.content.unwrap_or_default();
@@ -1283,39 +1304,56 @@ async fn toggle_system_skill(
 
     let pattern_for_msg = pattern.clone();
     let config = state.config();
-    match persist_session_update(
-        state,
-        current_session_id,
-        |session| {
-            (
-                session.enabled_system_skills.clone(),
-                session.messages.clone(),
-                session.updated_at,
-            )
-        },
-        |session| {
-            session.enabled_system_skills = compute_new_enabled(&session.enabled_system_skills);
-            let model = session.effective_model(&config.model).to_string();
-            let sys = build_system_prompt(
-                &config,
-                &session.workspace,
-                &model,
-                &session.enabled_system_skills,
-            );
+    let update_result = async {
+        let persist_gate = session_persist_gate(current_session_id);
+        let _persist_guard = persist_gate.lock().await;
+        let mut prompt_session = {
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get(current_session_id)
+                .ok_or_else(|| "Session not found".to_string())?;
+            session.clone()
+        };
+        prompt_session.enabled_system_skills =
+            compute_new_enabled(&prompt_session.enabled_system_skills);
+        let model = prompt_session.effective_model(&config.model).to_string();
+        let sys = build_system_prompt_for_working_directory_async(
+            &config,
+            &prompt_session.workspace,
+            &prompt_session.working_directory,
+            &model,
+            &prompt_session.enabled_system_skills,
+        )
+        .await;
+
+        let (previous, session_to_save) = {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions
+                .get_mut(current_session_id)
+                .ok_or_else(|| "Session not found".to_string())?;
+            let previous = session.clone();
+            session.enabled_system_skills = prompt_session.enabled_system_skills;
             if let Some(first) = session.messages.first_mut()
                 && first.role == "system"
             {
                 *first = sys;
             }
-        },
-        |session, (enabled_system_skills, messages, updated_at)| {
-            session.enabled_system_skills = enabled_system_skills;
-            session.messages = messages;
-            session.updated_at = updated_at;
-        },
-    )
-    .await
-    {
+            session.updated_at = now_epoch();
+            (previous, session.clone())
+        };
+
+        if let Err(error) = save_session_to_disk_locked(&session_to_save).await {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(current_session_id) {
+                *session = previous;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+    .await;
+
+    match update_result {
         Ok(()) => {
             crate::prompts::invalidate_skills_cache();
             let verb = if disable { "Disabled" } else { "Enabled" };
@@ -1394,10 +1432,10 @@ async fn handle_mcp_command_with_arg(
     state: &AppState,
 ) -> CommandResult {
     let config = state.config();
-    let workspace = {
+    let (session_home, working_directory) = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
-            Some(session) => session.workspace.clone(),
+            Some(session) => (session.workspace.clone(), session.working_directory.clone()),
             None => return command_result("No active session", "system", false),
         }
     };
@@ -1410,31 +1448,32 @@ async fn handle_mcp_command_with_arg(
     if enabled_servers == 0 {
         return command_result("No MCP servers enabled.", "system", false);
     }
+    let policy = tools::mcp::load_session_policy(&session_home);
 
     match arg {
         "" => {
-            let reports = tools::mcp::inspect_servers(&config, &workspace).await;
-            let policy = tools::mcp::load_session_policy(&workspace);
+            let reports =
+                tools::mcp::inspect_servers_for_policy(&config, &working_directory, &policy).await;
             command_result(format_mcp_reports(&reports, &policy), "system", false)
         }
-        "refresh" => match tools::mcp::refresh_servers(&config, &workspace).await {
-            Ok(reports) => {
-                let policy = tools::mcp::load_session_policy(&workspace);
-                command_result(
+        "refresh" => {
+            match tools::mcp::refresh_servers_for_policy(&config, &working_directory, &policy).await
+            {
+                Ok(reports) => command_result(
                     format!(
                         "Refreshed MCP cache.\n\n{}",
                         format_mcp_reports(&reports, &policy)
                     ),
                     "system",
                     false,
-                )
+                ),
+                Err(error) => command_result(
+                    format!("Failed to refresh MCP cache: {error}"),
+                    "error",
+                    false,
+                ),
             }
-            Err(error) => command_result(
-                format!("Failed to refresh MCP cache: {error}"),
-                "error",
-                false,
-            ),
-        },
+        }
         _ => command_result("Usage: /mcp [refresh]", "system", false),
     }
 }
@@ -2004,11 +2043,12 @@ async fn list_daily_memory_files(memory_dir: &Path) -> String {
 
 async fn handle_agents_command(current_session_id: &str, state: &AppState) -> CommandResult {
     let config = state.config();
-    let (workspace, run_model) = {
+    let (session_home, working_directory, run_model) = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
             Some(session) => (
                 session.workspace.clone(),
+                session.working_directory.clone(),
                 session.effective_model(&config.model).to_string(),
             ),
             None => return command_result("Session not found", "error", false),
@@ -2019,9 +2059,15 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
 
     // Warm only the MCP tools enabled for this session so `/agents` does not
     // contact disabled MCP servers while building the tool listing.
-    crate::tools::mcp::ensure_policy_tools_cached(&delegated_config, &workspace).await;
+    let mcp_policy = crate::tools::mcp::load_session_policy(&session_home);
+    crate::tools::mcp::ensure_tools_cached_for_policy(
+        &delegated_config,
+        &working_directory,
+        &mcp_policy,
+    )
+    .await;
 
-    let agents = crate::subagents::discovery::discover_all_agents(&workspace);
+    let agents = crate::subagents::discovery::discover_all_agents(&session_home);
     if agents.is_empty() {
         return command_result(
             "No sub-agents found.\n\n\
@@ -2038,8 +2084,12 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
     lines.push(format!("**{} sub-agent(s) available:**\n", agents.len()));
     for agent in &agents {
         let model_info = delegated_config.sub_agent_model_for(&agent.name);
-        let mut available_tools =
-            crate::subagents::filter_tools_for_agent_with_mcp(agent, &delegated_config, &workspace);
+        let mut available_tools = crate::subagents::filter_tools_for_agent_with_mcp_policy(
+            agent,
+            &delegated_config,
+            &working_directory,
+            &mcp_policy,
+        );
         if !tools::view_image_available(&delegated_config, model_info) {
             available_tools.retain(|tool| tool != tools::TOOL_NAME_VIEW_IMAGE);
         }

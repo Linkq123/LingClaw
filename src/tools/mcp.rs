@@ -285,6 +285,11 @@ pub(crate) struct McpSessionPolicy {
     pub(crate) confirm_mutating_tools: bool,
     #[serde(default)]
     pub(crate) client_capabilities: McpClientCapabilityPolicy,
+    /// Runtime-only namespace for descriptor caches and persistent MCP
+    /// connections. Session policy files live in the private Session Home, so
+    /// this keeps two Sessions that share one project directory isolated.
+    #[serde(skip)]
+    pub(crate) cache_namespace: Option<PathBuf>,
 }
 
 impl McpSessionPolicy {
@@ -295,6 +300,18 @@ impl McpSessionPolicy {
     pub(crate) fn allows_tool(&self, descriptor: &McpToolDescriptor) -> bool {
         self.allows_server(&descriptor.server_name)
             && self.enabled_tools.contains(&descriptor.exposed_name)
+    }
+
+    fn cache_namespace<'a>(&'a self, fallback: &'a Path) -> &'a Path {
+        self.cache_namespace.as_deref().unwrap_or(fallback)
+    }
+
+    fn client_capabilities_for_server(&self, server_name: &str) -> McpClientCapabilityPolicy {
+        if self.allows_server(server_name) {
+            effective_client_capabilities(&self.client_capabilities)
+        } else {
+            McpClientCapabilityPolicy::default()
+        }
     }
 }
 
@@ -368,6 +385,7 @@ enum TemporaryMcpSession {
         server: JsonMcpServerConfig,
         cache_key: String,
         session_id: Option<String>,
+        client_capabilities: McpClientCapabilityPolicy,
         timeout_secs: u64,
     },
     Stdio(McpServerSession),
@@ -463,10 +481,12 @@ fn session_policy_path(workspace: &Path) -> PathBuf {
 
 pub(crate) fn load_session_policy(workspace: &Path) -> McpSessionPolicy {
     let path = session_policy_path(workspace);
-    let Ok(text) = fs::read_to_string(&path) else {
-        return McpSessionPolicy::default();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
+    let mut policy: McpSessionPolicy = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    policy.cache_namespace = Some(workspace.to_path_buf());
+    policy
 }
 
 pub(crate) fn save_session_policy(
@@ -503,16 +523,6 @@ pub(crate) fn set_auth_file_path_for_test(path: PathBuf) {
         .lock()
     {
         *guard = Some(path);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn reset_auth_file_path_for_test() {
-    if let Ok(mut guard) = MCP_AUTH_FILE_OVERRIDE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-    {
-        *guard = None;
     }
 }
 
@@ -1182,6 +1192,14 @@ pub(crate) async fn ensure_policy_tools_cached(config: &Config, workspace: &Path
     let _ = list_tools_for_policy(config, workspace, &policy).await;
 }
 
+pub(crate) async fn ensure_tools_cached_for_policy(
+    config: &Config,
+    working_directory: &Path,
+    policy: &McpSessionPolicy,
+) {
+    let _ = list_tools_for_policy(config, working_directory, policy).await;
+}
+
 #[allow(dead_code)]
 pub(crate) async fn tool_definitions_openai(config: &Config, workspace: &Path) -> Vec<Value> {
     list_tools(config, workspace)
@@ -1481,7 +1499,7 @@ pub(crate) fn cached_server_counts_for_policy(
             continue;
         };
         enabled_servers += 1;
-        let Ok(key) = cache_key(server_name, server, workspace, config) else {
+        let Ok(key) = cache_key_for_policy(server_name, server, workspace, config, policy) else {
             continue;
         };
         let required_tools = policy
@@ -1689,30 +1707,53 @@ async fn execute_tool_with_session_mode(
         });
     }
 
-    let call_result = if isolated_session {
-        call_server_once(
-            &descriptor.server_name,
-            config,
-            workspace,
-            "tools/call",
-            json!({
-                "name": descriptor.raw_name,
-                "arguments": args,
-            }),
-        )
-        .await
-    } else {
-        call_server(
-            &descriptor.server_name,
-            config,
-            workspace,
-            "tools/call",
-            json!({
-                "name": descriptor.raw_name,
-                "arguments": args,
-            }),
-        )
-        .await
+    let params = json!({
+        "name": descriptor.raw_name,
+        "arguments": args,
+    });
+    let call_result = match (isolated_session, policy) {
+        (true, Some(policy)) => {
+            call_server_once_for_policy(
+                &descriptor.server_name,
+                config,
+                workspace,
+                policy,
+                "tools/call",
+                params,
+            )
+            .await
+        }
+        (true, None) => {
+            call_server_once(
+                &descriptor.server_name,
+                config,
+                workspace,
+                "tools/call",
+                params,
+            )
+            .await
+        }
+        (false, Some(policy)) => {
+            call_server_for_policy(
+                &descriptor.server_name,
+                config,
+                workspace,
+                policy,
+                "tools/call",
+                params,
+            )
+            .await
+        }
+        (false, None) => {
+            call_server(
+                &descriptor.server_name,
+                config,
+                workspace,
+                "tools/call",
+                params,
+            )
+            .await
+        }
     };
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -1749,11 +1790,29 @@ async fn list_server_catalog_uncached(
     config: &Config,
     workspace: &Path,
 ) -> McpServerCatalogLoad {
+    list_server_catalog_uncached_for_scope(server_name, config, workspace, None).await
+}
+
+async fn list_server_catalog_uncached_for_policy(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+) -> McpServerCatalogLoad {
+    list_server_catalog_uncached_for_scope(server_name, config, workspace, Some(policy)).await
+}
+
+async fn list_server_catalog_uncached_for_scope(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
+) -> McpServerCatalogLoad {
     let mut successful_lists = 0;
     let mut errors = Vec::new();
 
     let (tools, tools_loaded) =
-        match list_server_tools_uncached(server_name, config, workspace).await {
+        match list_server_tools_uncached_for_scope(server_name, config, workspace, policy).await {
             Ok(tools) => {
                 successful_lists += 1;
                 (tools, true)
@@ -1763,28 +1822,40 @@ async fn list_server_catalog_uncached(
                 (Vec::new(), false)
             }
         };
-    let (resources, resources_loaded) =
-        match list_server_resources_uncached(server_name, config, workspace).await {
-            Ok(resources) => {
-                successful_lists += 1;
-                (resources, true)
-            }
-            Err(error) => {
-                errors.push(format!("resources/list: {error}"));
-                (Vec::new(), false)
-            }
-        };
-    let (prompts, prompts_loaded) =
-        match list_server_prompts_uncached(server_name, config, workspace).await {
-            Ok(prompts) => {
-                successful_lists += 1;
-                (prompts, true)
-            }
-            Err(error) => {
-                errors.push(format!("prompts/list: {error}"));
-                (Vec::new(), false)
-            }
-        };
+    let (resources, resources_loaded) = match list_server_resources_uncached_for_scope(
+        server_name,
+        config,
+        workspace,
+        policy,
+    )
+    .await
+    {
+        Ok(resources) => {
+            successful_lists += 1;
+            (resources, true)
+        }
+        Err(error) => {
+            errors.push(format!("resources/list: {error}"));
+            (Vec::new(), false)
+        }
+    };
+    let (prompts, prompts_loaded) = match list_server_prompts_uncached_for_scope(
+        server_name,
+        config,
+        workspace,
+        policy,
+    )
+    .await
+    {
+        Ok(prompts) => {
+            successful_lists += 1;
+            (prompts, true)
+        }
+        Err(error) => {
+            errors.push(format!("prompts/list: {error}"));
+            (Vec::new(), false)
+        }
+    };
 
     let error = if successful_lists == 0 && !errors.is_empty() {
         Some(errors.join("; "))
@@ -1803,6 +1874,22 @@ async fn list_server_catalog_uncached(
 }
 
 pub(crate) async fn inspect_servers(config: &Config, workspace: &Path) -> Vec<McpServerLoadReport> {
+    inspect_servers_for_scope(config, workspace, None).await
+}
+
+pub(crate) async fn inspect_servers_for_policy(
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+) -> Vec<McpServerLoadReport> {
+    inspect_servers_for_scope(config, workspace, Some(policy)).await
+}
+
+async fn inspect_servers_for_scope(
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
+) -> Vec<McpServerLoadReport> {
     let mut server_names: Vec<&str> = config
         .mcp_servers
         .iter()
@@ -1812,7 +1899,13 @@ pub(crate) async fn inspect_servers(config: &Config, workspace: &Path) -> Vec<Mc
     server_names.sort_unstable();
 
     join_all(server_names.into_iter().map(|server_name| async move {
-        let catalog = list_server_catalog_uncached(server_name, config, workspace).await;
+        let catalog = match policy {
+            Some(policy) => {
+                list_server_catalog_uncached_for_policy(server_name, config, workspace, policy)
+                    .await
+            }
+            None => list_server_catalog_uncached(server_name, config, workspace).await,
+        };
         McpServerLoadReport {
             server_name: server_name.to_string(),
             transport: config
@@ -1833,7 +1926,24 @@ pub(crate) async fn inspect_servers(config: &Config, workspace: &Path) -> Vec<Mc
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn catalog_snapshot(config: &Config, workspace: &Path) -> McpCatalogSnapshot {
+    catalog_snapshot_for_scope(config, workspace, None).await
+}
+
+pub(crate) async fn catalog_snapshot_for_policy(
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+) -> McpCatalogSnapshot {
+    catalog_snapshot_for_scope(config, workspace, Some(policy)).await
+}
+
+async fn catalog_snapshot_for_scope(
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
+) -> McpCatalogSnapshot {
     let mut server_names: Vec<&str> = config
         .mcp_servers
         .iter()
@@ -1849,7 +1959,13 @@ pub(crate) async fn catalog_snapshot(config: &Config, workspace: &Path) -> McpCa
             .map(JsonMcpServerConfig::effective_transport)
             .unwrap_or_else(|| "stdio".to_string());
 
-        let catalog = list_server_catalog_uncached(server_name, config, workspace).await;
+        let catalog = match policy {
+            Some(policy) => {
+                list_server_catalog_uncached_for_policy(server_name, config, workspace, policy)
+                    .await
+            }
+            None => list_server_catalog_uncached(server_name, config, workspace).await,
+        };
         let report = McpServerLoadReport {
             server_name: server_name.to_string(),
             transport,
@@ -1878,11 +1994,39 @@ pub(crate) async fn catalog_snapshot(config: &Config, workspace: &Path) -> McpCa
 
 /// Test a single MCP server by spawning it, running tools/list, and returning the tool count.
 /// Uses a temporary Config with just the one server so it does not require a pre-existing config.
+#[cfg(test)]
 pub(crate) async fn test_mcp_server(
     server_name: &str,
     mcp_cfg: &JsonMcpServerConfig,
     workspace: &Path,
     default_tool_timeout: Duration,
+) -> Result<usize, String> {
+    test_mcp_server_for_scope(server_name, mcp_cfg, workspace, default_tool_timeout, None).await
+}
+
+pub(crate) async fn test_mcp_server_for_policy(
+    server_name: &str,
+    mcp_cfg: &JsonMcpServerConfig,
+    workspace: &Path,
+    default_tool_timeout: Duration,
+    policy: &McpSessionPolicy,
+) -> Result<usize, String> {
+    test_mcp_server_for_scope(
+        server_name,
+        mcp_cfg,
+        workspace,
+        default_tool_timeout,
+        Some(policy),
+    )
+    .await
+}
+
+async fn test_mcp_server_for_scope(
+    server_name: &str,
+    mcp_cfg: &JsonMcpServerConfig,
+    workspace: &Path,
+    default_tool_timeout: Duration,
+    policy: Option<&McpSessionPolicy>,
 ) -> Result<usize, String> {
     let server_name = server_name.trim();
     let server_name = if server_name.is_empty() {
@@ -1925,17 +2069,36 @@ pub(crate) async fn test_mcp_server(
         daily_reflection: false,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
         s3: None,
     };
-    let tools = list_server_tools_uncached(server_name, &temp_config, workspace).await?;
+    let tools =
+        list_server_tools_uncached_for_scope(server_name, &temp_config, workspace, policy).await?;
     Ok(tools.len())
 }
 
+#[cfg(test)]
 pub(crate) async fn refresh_servers(
     config: &Config,
     workspace: &Path,
 ) -> Result<Vec<McpServerLoadReport>, String> {
-    refresh_server_caches(config, workspace).await?;
+    refresh_servers_for_scope(config, workspace, None).await
+}
+
+pub(crate) async fn refresh_servers_for_policy(
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+) -> Result<Vec<McpServerLoadReport>, String> {
+    refresh_servers_for_scope(config, workspace, Some(policy)).await
+}
+
+async fn refresh_servers_for_scope(
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
+) -> Result<Vec<McpServerLoadReport>, String> {
+    refresh_server_caches_for_scope(config, workspace, policy).await?;
 
     let mut server_names: Vec<&str> = config
         .mcp_servers
@@ -1956,8 +2119,18 @@ pub(crate) async fn refresh_servers(
                 error: Some(format!("unknown MCP server '{server_name}'")),
             });
         };
-        let catalog = list_server_catalog_uncached(server_name, config, workspace).await;
-        match cache_key(server_name, server, workspace, config) {
+        let catalog = match policy {
+            Some(policy) => {
+                list_server_catalog_uncached_for_policy(server_name, config, workspace, policy)
+                    .await
+            }
+            None => list_server_catalog_uncached(server_name, config, workspace).await,
+        };
+        let cache_key = match policy {
+            Some(policy) => cache_key_for_policy(server_name, server, workspace, config, policy),
+            None => cache_key(server_name, server, workspace, config),
+        };
+        match cache_key {
             Ok(cache_key) => {
                 let now = Instant::now();
                 if catalog.tools_loaded {
@@ -2582,7 +2755,7 @@ async fn list_tools_for_policy(
     let results = join_all(server_names.into_iter().map(|server_name| async move {
         (
             server_name,
-            list_server_tools(server_name, config, workspace).await,
+            list_server_tools_for_policy(server_name, config, workspace, policy).await,
         )
     }))
     .await;
@@ -2617,21 +2790,24 @@ pub(crate) async fn list_tools_for_servers_with_status(
     workspace: &Path,
     server_names: &HashSet<String>,
 ) -> (Vec<McpToolDescriptor>, HashSet<String>) {
-    list_tools_for_servers_with_status_inner(config, workspace, server_names, false).await
+    list_tools_for_servers_with_status_inner(config, workspace, server_names, None, false).await
 }
 
-pub(crate) async fn list_tools_for_servers_uncached_with_status(
+pub(crate) async fn list_tools_for_servers_uncached_with_status_for_policy(
     config: &Config,
     workspace: &Path,
     server_names: &HashSet<String>,
+    policy: &McpSessionPolicy,
 ) -> (Vec<McpToolDescriptor>, HashSet<String>) {
-    list_tools_for_servers_with_status_inner(config, workspace, server_names, true).await
+    list_tools_for_servers_with_status_inner(config, workspace, server_names, Some(policy), true)
+        .await
 }
 
 async fn list_tools_for_servers_with_status_inner(
     config: &Config,
     workspace: &Path,
     server_names: &HashSet<String>,
+    policy: Option<&McpSessionPolicy>,
     uncached: bool,
 ) -> (Vec<McpToolDescriptor>, HashSet<String>) {
     if server_names.is_empty() {
@@ -2652,9 +2828,14 @@ async fn list_tools_for_servers_with_status_inner(
 
     let results = join_all(names.into_iter().map(|server_name| async move {
         let result = if uncached {
-            list_server_tools_uncached(server_name, config, workspace).await
+            list_server_tools_uncached_for_scope(server_name, config, workspace, policy).await
         } else {
-            list_server_tools(server_name, config, workspace).await
+            match policy {
+                Some(policy) => {
+                    list_server_tools_for_policy(server_name, config, workspace, policy).await
+                }
+                None => list_server_tools(server_name, config, workspace).await,
+            }
         };
         (server_name, result)
     }))
@@ -2725,10 +2906,49 @@ pub(crate) fn cached_list_tools_for_policy(
     if policy.enabled_servers.is_empty() || policy.enabled_tools.is_empty() {
         return Vec::new();
     }
-    cached_list_tools(config, workspace)
-        .into_iter()
-        .filter(|tool| policy.allows_tool(tool))
-        .collect()
+
+    let mut server_names = policy
+        .enabled_servers
+        .iter()
+        .filter_map(|server_name| {
+            config
+                .mcp_servers
+                .get(server_name)
+                .filter(|server| server.enabled)
+                .map(|_| server_name.as_str())
+        })
+        .collect::<Vec<_>>();
+    server_names.sort_unstable();
+
+    let now = Instant::now();
+    let mut tools = Vec::new();
+    for server_name in server_names {
+        let Some(server) = config.mcp_servers.get(server_name) else {
+            continue;
+        };
+        let Ok(key) = cache_key_for_policy(server_name, server, workspace, config, policy) else {
+            continue;
+        };
+        let cached = {
+            let Ok(mut cache) = tool_cache().lock() else {
+                continue;
+            };
+            match cache.get(&key) {
+                Some(entry) if now.duration_since(entry.loaded_at) < tool_cache_ttl() => {
+                    Some(entry.descriptors.clone())
+                }
+                Some(_) => {
+                    cache.remove(&key);
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(cached) = cached {
+            tools.extend(cached.into_iter().filter(|tool| policy.allows_tool(tool)));
+        }
+    }
+    tools
 }
 
 #[cfg(test)]
@@ -2752,11 +2972,71 @@ pub(crate) fn insert_cached_tool_descriptors_for_test(
     );
 }
 
+#[cfg(test)]
+pub(crate) fn insert_cached_tool_descriptors_for_policy_for_test(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+    descriptors: Vec<McpToolDescriptor>,
+) {
+    let server = config
+        .mcp_servers
+        .get(server_name)
+        .expect("test MCP server should exist");
+    let key = cache_key_for_policy(server_name, server, workspace, config, policy)
+        .expect("policy cache key should build");
+    tool_cache().lock().expect("tool cache lock").insert(
+        key,
+        CachedToolDescriptors {
+            descriptors,
+            loaded_at: Instant::now(),
+        },
+    );
+}
+
 fn cache_key(
     server_name: &str,
     server: &JsonMcpServerConfig,
     workspace: &Path,
     config: &Config,
+) -> Result<String, String> {
+    let client_capabilities = client_capabilities_for_server(server_name, workspace);
+    cache_key_for_scope(
+        server_name,
+        server,
+        workspace,
+        workspace,
+        config,
+        &client_capabilities,
+    )
+}
+
+fn cache_key_for_policy(
+    server_name: &str,
+    server: &JsonMcpServerConfig,
+    workspace: &Path,
+    config: &Config,
+    policy: &McpSessionPolicy,
+) -> Result<String, String> {
+    let client_capabilities = policy.client_capabilities_for_server(server_name);
+    cache_key_for_scope(
+        server_name,
+        server,
+        workspace,
+        policy.cache_namespace(workspace),
+        config,
+        &client_capabilities,
+    )
+}
+
+fn cache_key_for_scope(
+    server_name: &str,
+    server: &JsonMcpServerConfig,
+    workspace: &Path,
+    cache_namespace: &Path,
+    config: &Config,
+    client_capabilities: &McpClientCapabilityPolicy,
 ) -> Result<String, String> {
     let resolved_cwd = resolve_server_cwd(server, workspace)?;
     let mut env_items: Vec<String> = server
@@ -2771,18 +3051,18 @@ fn cache_key(
         .map(|(key, value)| format!("{key}={value}"))
         .collect();
     header_items.sort_unstable();
-    let capabilities =
-        initialize_capabilities(&client_capabilities_for_server(server_name, workspace));
+    let capabilities = initialize_capabilities(client_capabilities);
     let capabilities_key =
         serde_json::to_string(&capabilities).unwrap_or_else(|_| "{}".to_string());
     Ok(format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         server_name,
         server.effective_transport(),
         server.command,
         server.url.as_deref().unwrap_or_default(),
         server.args.join("\u{1f}"),
         resolved_cwd.display(),
+        cache_namespace.display(),
         server_timeout_secs(server, config),
         env_items.join("\u{1f}"),
         header_items.join("\u{1f}"),
@@ -2833,7 +3113,12 @@ async fn find_tool_by_exposed_name_filtered(
     matching_servers.sort_unstable();
 
     for server_name in matching_servers {
-        let tools = list_server_tools(server_name, config, workspace).await?;
+        let tools = match policy {
+            Some(policy) => {
+                list_server_tools_for_policy(server_name, config, workspace, policy).await?
+            }
+            None => list_server_tools(server_name, config, workspace).await?,
+        };
         if let Some(tool) = tools.into_iter().find(|tool| tool.exposed_name == name) {
             return Ok(Some(tool));
         }
@@ -2847,11 +3132,32 @@ async fn list_server_tools(
     config: &Config,
     workspace: &Path,
 ) -> Result<Vec<McpToolDescriptor>, String> {
+    list_server_tools_for_scope(server_name, config, workspace, None).await
+}
+
+async fn list_server_tools_for_policy(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+) -> Result<Vec<McpToolDescriptor>, String> {
+    list_server_tools_for_scope(server_name, config, workspace, Some(policy)).await
+}
+
+async fn list_server_tools_for_scope(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
+) -> Result<Vec<McpToolDescriptor>, String> {
     let server = config
         .mcp_servers
         .get(server_name)
         .ok_or_else(|| format!("unknown MCP server '{server_name}'"))?;
-    let key = cache_key(server_name, server, workspace, config)?;
+    let key = match policy {
+        Some(policy) => cache_key_for_policy(server_name, server, workspace, config, policy)?,
+        None => cache_key(server_name, server, workspace, config)?,
+    };
     let now = Instant::now();
 
     let cached = {
@@ -2873,16 +3179,32 @@ async fn list_server_tools(
         return Ok(cached);
     }
 
-    let tools = list_server_items(
-        server_name,
-        config,
-        workspace,
-        "tools/list",
-        "tools",
-        json!({}),
-        false,
-    )
-    .await?;
+    let tools = match policy {
+        Some(policy) => {
+            list_server_items_for_policy(
+                server_name,
+                config,
+                workspace,
+                policy,
+                "tools/list",
+                "tools",
+                json!({}),
+            )
+            .await?
+        }
+        None => {
+            list_server_items(
+                server_name,
+                config,
+                workspace,
+                "tools/list",
+                "tools",
+                json!({}),
+                false,
+            )
+            .await?
+        }
+    };
     let descriptors = parse_tool_descriptors(server_name, &json!({ "tools": tools }))?;
 
     {
@@ -2901,15 +3223,26 @@ async fn list_server_tools(
     Ok(descriptors)
 }
 
+#[cfg(test)]
 async fn list_server_tools_uncached(
     server_name: &str,
     config: &Config,
     workspace: &Path,
 ) -> Result<Vec<McpToolDescriptor>, String> {
-    let tools = list_server_items(
+    list_server_tools_uncached_for_scope(server_name, config, workspace, None).await
+}
+
+async fn list_server_tools_uncached_for_scope(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
+) -> Result<Vec<McpToolDescriptor>, String> {
+    let tools = list_server_items_for_scope(
         server_name,
         config,
         workspace,
+        policy,
         "tools/list",
         "tools",
         json!({}),
@@ -2928,11 +3261,58 @@ async fn list_server_items(
     base_params: Value,
     uncached_session: bool,
 ) -> Result<Vec<Value>, String> {
+    list_server_items_for_scope(
+        server_name,
+        config,
+        workspace,
+        None,
+        method,
+        array_key,
+        base_params,
+        uncached_session,
+    )
+    .await
+}
+
+async fn list_server_items_for_policy(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+    method: &str,
+    array_key: &str,
+    base_params: Value,
+) -> Result<Vec<Value>, String> {
+    list_server_items_for_scope(
+        server_name,
+        config,
+        workspace,
+        Some(policy),
+        method,
+        array_key,
+        base_params,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_server_items_for_scope(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
+    method: &str,
+    array_key: &str,
+    base_params: Value,
+    uncached_session: bool,
+) -> Result<Vec<Value>, String> {
     if uncached_session {
         return list_server_items_with_temporary_session(
             server_name,
             config,
             workspace,
+            policy,
             method,
             array_key,
             base_params,
@@ -2956,7 +3336,13 @@ async fn list_server_items(
                 }
             }
         }
-        let response = call_server(server_name, config, workspace, method, params).await?;
+        let response = match policy {
+            Some(policy) => {
+                call_server_for_policy(server_name, config, workspace, policy, method, params)
+                    .await?
+            }
+            None => call_server(server_name, config, workspace, method, params).await?,
+        };
         let page = response
             .get(array_key)
             .and_then(Value::as_array)
@@ -2992,11 +3378,17 @@ async fn list_server_items_with_temporary_session(
     server_name: &str,
     config: &Config,
     workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
     method: &str,
     array_key: &str,
     base_params: Value,
 ) -> Result<Vec<Value>, String> {
-    let mut session = TemporaryMcpSession::new(server_name, config, workspace).await?;
+    let mut session = match policy {
+        Some(policy) => {
+            TemporaryMcpSession::new_for_policy(server_name, config, workspace, policy).await?
+        }
+        None => TemporaryMcpSession::new(server_name, config, workspace).await?,
+    };
     let result = async {
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
@@ -3208,15 +3600,17 @@ async fn list_server_resources(
     Ok(descriptors)
 }
 
-async fn list_server_resources_uncached(
+async fn list_server_resources_uncached_for_scope(
     server_name: &str,
     config: &Config,
     workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
 ) -> Result<Vec<McpResourceDescriptor>, String> {
-    let resources = list_server_items(
+    let resources = list_server_items_for_scope(
         server_name,
         config,
         workspace,
+        policy,
         "resources/list",
         "resources",
         json!({}),
@@ -3284,15 +3678,17 @@ async fn list_server_prompts(
     Ok(descriptors)
 }
 
-async fn list_server_prompts_uncached(
+async fn list_server_prompts_uncached_for_scope(
     server_name: &str,
     config: &Config,
     workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
 ) -> Result<Vec<McpPromptDescriptor>, String> {
-    let prompts = list_server_items(
+    let prompts = list_server_items_for_scope(
         server_name,
         config,
         workspace,
+        policy,
         "prompts/list",
         "prompts",
         json!({}),
@@ -3373,33 +3769,37 @@ fn parse_prompt_descriptors(
         .collect())
 }
 
-pub(crate) async fn read_resource(
+pub(crate) async fn read_resource_for_policy(
     server_name: &str,
     uri: &str,
     config: &Config,
     workspace: &Path,
+    policy: &McpSessionPolicy,
 ) -> Result<Value, String> {
-    call_server(
+    call_server_for_policy(
         server_name,
         config,
         workspace,
+        policy,
         "resources/read",
         json!({ "uri": uri }),
     )
     .await
 }
 
-pub(crate) async fn get_prompt(
+pub(crate) async fn get_prompt_for_policy(
     server_name: &str,
     name: &str,
     arguments: Value,
     config: &Config,
     workspace: &Path,
+    policy: &McpSessionPolicy,
 ) -> Result<Value, String> {
-    call_server(
+    call_server_for_policy(
         server_name,
         config,
         workspace,
+        policy,
         "prompts/get",
         json!({ "name": name, "arguments": arguments }),
     )
@@ -3593,14 +3993,21 @@ async fn remove_cached_sessions(cache_keys: &[String]) {
     }
 }
 
-async fn refresh_server_caches(config: &Config, workspace: &Path) -> Result<(), String> {
+async fn refresh_server_caches_for_scope(
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
+) -> Result<(), String> {
     let mut cache_keys = Vec::new();
     for (server_name, server) in config
         .mcp_servers
         .iter()
         .filter(|(_, server)| server.enabled)
     {
-        cache_keys.push(cache_key(server_name, server, workspace, config)?);
+        cache_keys.push(match policy {
+            Some(policy) => cache_key_for_policy(server_name, server, workspace, config, policy)?,
+            None => cache_key(server_name, server, workspace, config)?,
+        });
         clear_spawn_failure(server_name);
     }
 
@@ -3633,7 +4040,11 @@ async fn refresh_server_caches(config: &Config, workspace: &Path) -> Result<(), 
         .iter()
         .filter(|(_, server)| server.enabled && is_streamable_http_server(server))
     {
-        if let Ok(cache_key) = cache_key(server_name, server, workspace, config) {
+        let cache_key = match policy {
+            Some(policy) => cache_key_for_policy(server_name, server, workspace, config, policy),
+            None => cache_key(server_name, server, workspace, config),
+        };
+        if let Ok(cache_key) = cache_key {
             terminate_http_session(server_name, &cache_key, server).await;
         }
     }
@@ -3897,10 +4308,12 @@ fn apply_mcp_process_flags(command: &mut Command) {
     let _ = command;
 }
 
-async fn spawn_server_session(
+async fn spawn_server_session_for_scope(
     server_name: &str,
     config: &Config,
     workspace: &Path,
+    cache_namespace: &Path,
+    client_capabilities: &McpClientCapabilityPolicy,
 ) -> Result<McpServerSession, String> {
     // Backoff: reject spawn if server recently failed.
     if let Some(remaining_secs) = check_spawn_cooldown(server_name) {
@@ -3913,8 +4326,14 @@ async fn spawn_server_session(
         .mcp_servers
         .get(server_name)
         .ok_or_else(|| format!("unknown MCP server '{server_name}'"))?;
-    let tool_cache_key = cache_key(server_name, server, workspace, config)?;
-    let client_capabilities = client_capabilities_for_server(server_name, workspace);
+    let tool_cache_key = cache_key_for_scope(
+        server_name,
+        server,
+        workspace,
+        cache_namespace,
+        config,
+        client_capabilities,
+    )?;
     let server_cwd = resolve_server_cwd(server, workspace)?;
     let resolved_command = resolve_server_command(&server.command);
     let mut command = Command::new(&resolved_command);
@@ -3952,7 +4371,7 @@ async fn spawn_server_session(
         server_name: server_name.to_string(),
         workspace_root: workspace.to_path_buf(),
         tool_cache_key,
-        client_capabilities,
+        client_capabilities: client_capabilities.clone(),
         timeout_secs: server_timeout_secs(server, config),
         next_request_id: 2,
         child,
@@ -3977,11 +4396,53 @@ async fn get_or_create_server_session(
     config: &Config,
     workspace: &Path,
 ) -> Result<(String, Arc<AsyncMutex<McpServerSession>>), String> {
+    let client_capabilities = client_capabilities_for_server(server_name, workspace);
+    get_or_create_server_session_for_scope(
+        server_name,
+        config,
+        workspace,
+        workspace,
+        &client_capabilities,
+    )
+    .await
+}
+
+async fn get_or_create_server_session_for_policy(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+) -> Result<(String, Arc<AsyncMutex<McpServerSession>>), String> {
+    let client_capabilities = policy.client_capabilities_for_server(server_name);
+    get_or_create_server_session_for_scope(
+        server_name,
+        config,
+        workspace,
+        policy.cache_namespace(workspace),
+        &client_capabilities,
+    )
+    .await
+}
+
+async fn get_or_create_server_session_for_scope(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    cache_namespace: &Path,
+    client_capabilities: &McpClientCapabilityPolicy,
+) -> Result<(String, Arc<AsyncMutex<McpServerSession>>), String> {
     let server = config
         .mcp_servers
         .get(server_name)
         .ok_or_else(|| format!("unknown MCP server '{server_name}'"))?;
-    let key = cache_key(server_name, server, workspace, config)?;
+    let key = cache_key_for_scope(
+        server_name,
+        server,
+        workspace,
+        cache_namespace,
+        config,
+        client_capabilities,
+    )?;
     let now = Instant::now();
 
     reap_idle_server_sessions(now).await?;
@@ -4002,7 +4463,14 @@ async fn get_or_create_server_session(
     }
 
     let created = Arc::new(AsyncMutex::new(
-        spawn_server_session(server_name, config, workspace).await?,
+        spawn_server_session_for_scope(
+            server_name,
+            config,
+            workspace,
+            cache_namespace,
+            client_capabilities,
+        )
+        .await?,
     ));
     let existing = {
         let mut cache = session_cache()
@@ -4639,22 +5107,21 @@ async fn send_http_jsonrpc_message(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_http_server_message_async(
     message: &Value,
     cache_key: &str,
     server_name: &str,
     server: &JsonMcpServerConfig,
     workspace_root: &Path,
+    client_capabilities: &McpClientCapabilityPolicy,
     session_id: Option<&str>,
     timeout_secs: u64,
 ) {
     invalidate_http_server_caches(message, cache_key);
-    let Some(response) = http_server_request_response(
-        message,
-        server_name,
-        workspace_root,
-        &client_capabilities_for_server(server_name, workspace_root),
-    ) else {
+    let Some(response) =
+        http_server_request_response(message, server_name, workspace_root, client_capabilities)
+    else {
         return;
     };
     let _ =
@@ -4667,6 +5134,7 @@ async fn start_http_event_stream(
     cache_key: &str,
     session_id: &str,
     workspace_root: &Path,
+    client_capabilities: &McpClientCapabilityPolicy,
     timeout_secs: u64,
 ) {
     let mut tasks = match http_stream_tasks().lock() {
@@ -4683,6 +5151,7 @@ async fn start_http_event_stream(
     let task_cache_key = cache_key.clone();
     let session_id = session_id.to_string();
     let workspace_root = workspace_root.to_path_buf();
+    let client_capabilities = client_capabilities.clone();
     let task_id = next_http_stream_task_id();
     let handle = tokio::spawn(async move {
         tokio::task::yield_now().await;
@@ -4748,6 +5217,7 @@ async fn start_http_event_stream(
                         &server_name,
                         &server,
                         &workspace_root,
+                        &client_capabilities,
                         Some(&session_id),
                         timeout_secs,
                     )
@@ -4764,6 +5234,7 @@ async fn start_http_event_stream(
                     &server_name,
                     &server,
                     &workspace_root,
+                    &client_capabilities,
                     Some(&session_id),
                     timeout_secs,
                 )
@@ -4812,11 +5283,13 @@ async fn send_http_cancelled_notification(
     let _ = send_http_request_with_timeout(request, 2, "HTTP MCP cancellation").await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn http_post_json(
     server_name: &str,
     server: &JsonMcpServerConfig,
     cache_key: &str,
     workspace_root: &Path,
+    client_capabilities: &McpClientCapabilityPolicy,
     payload: Value,
     session_id: Option<String>,
     timeout_secs: u64,
@@ -4917,6 +5390,7 @@ async fn http_post_json(
             server_name,
             server,
             workspace_root,
+            client_capabilities,
             effective_session_id,
             timeout_secs,
         )
@@ -4984,6 +5458,7 @@ async fn parse_sse_json_response_stream(
     server_name: &str,
     server: &JsonMcpServerConfig,
     workspace_root: &Path,
+    client_capabilities: &McpClientCapabilityPolicy,
     session_id: Option<&str>,
     timeout_secs: u64,
 ) -> Result<Value, String> {
@@ -5043,6 +5518,7 @@ async fn parse_sse_json_response_stream(
                 server_name,
                 server,
                 workspace_root,
+                client_capabilities,
                 session_id,
                 timeout_secs,
             )
@@ -5069,6 +5545,7 @@ async fn parse_sse_json_response_stream(
                 server_name,
                 server,
                 workspace_root,
+                client_capabilities,
                 session_id,
                 timeout_secs,
             )
@@ -5093,16 +5570,17 @@ async fn initialize_http_session(
     server: &JsonMcpServerConfig,
     cache_key: &str,
     workspace: &Path,
+    client_capabilities: &McpClientCapabilityPolicy,
     start_event_stream: bool,
     timeout_secs: u64,
 ) -> Result<Option<String>, String> {
-    let capabilities =
-        initialize_capabilities(&client_capabilities_for_server(server_name, workspace));
+    let capabilities = initialize_capabilities(client_capabilities);
     let init = http_post_json(
         server_name,
         server,
         cache_key,
         workspace,
+        client_capabilities,
         json!({
             "jsonrpc": "2.0",
             "id": next_http_request_id(),
@@ -5132,6 +5610,7 @@ async fn initialize_http_session(
         server,
         cache_key,
         workspace,
+        client_capabilities,
         json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -5148,6 +5627,7 @@ async fn initialize_http_session(
             cache_key,
             session_id,
             workspace,
+            client_capabilities,
             timeout_secs,
         )
         .await;
@@ -5162,6 +5642,50 @@ async fn call_http_server(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
+    let client_capabilities = client_capabilities_for_server(server_name, workspace);
+    call_http_server_for_scope(
+        server_name,
+        config,
+        workspace,
+        workspace,
+        &client_capabilities,
+        method,
+        params,
+    )
+    .await
+}
+
+async fn call_http_server_for_policy(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let client_capabilities = policy.client_capabilities_for_server(server_name);
+    call_http_server_for_scope(
+        server_name,
+        config,
+        workspace,
+        policy.cache_namespace(workspace),
+        &client_capabilities,
+        method,
+        params,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_http_server_for_scope(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    cache_namespace: &Path,
+    client_capabilities: &McpClientCapabilityPolicy,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let server = config
         .mcp_servers
         .get(server_name)
@@ -5170,7 +5694,14 @@ async fn call_http_server(
         return Err(format!("MCP server '{server_name}' is disabled"));
     }
     let timeout_secs = server_timeout_secs(server, config);
-    let cache_key = cache_key(server_name, server, workspace, config)?;
+    let cache_key = cache_key_for_scope(
+        server_name,
+        server,
+        workspace,
+        cache_namespace,
+        config,
+        client_capabilities,
+    )?;
     let mut session_id = http_session_id(&cache_key);
     let session_was_cached;
     if session_id.is_none() {
@@ -5183,6 +5714,7 @@ async fn call_http_server(
                 server,
                 &cache_key,
                 workspace,
+                client_capabilities,
                 true,
                 timeout_secs,
             )
@@ -5201,6 +5733,7 @@ async fn call_http_server(
             &cache_key,
             session_id,
             workspace,
+            client_capabilities,
             timeout_secs,
         )
         .await;
@@ -5216,6 +5749,7 @@ async fn call_http_server(
         server,
         &cache_key,
         workspace,
+        client_capabilities,
         payload.clone(),
         session_id.clone(),
         timeout_secs,
@@ -5232,6 +5766,7 @@ async fn call_http_server(
                     server,
                     &cache_key,
                     workspace,
+                    client_capabilities,
                     true,
                     timeout_secs,
                 )
@@ -5242,6 +5777,7 @@ async fn call_http_server(
                 server,
                 &cache_key,
                 workspace,
+                client_capabilities,
                 payload,
                 session_id,
                 timeout_secs,
@@ -5286,6 +5822,41 @@ async fn terminate_http_session(server_name: &str, cache_key: &str, server: &Jso
 
 impl TemporaryMcpSession {
     async fn new(server_name: &str, config: &Config, workspace: &Path) -> Result<Self, String> {
+        let client_capabilities = client_capabilities_for_server(server_name, workspace);
+        Self::new_for_scope(
+            server_name,
+            config,
+            workspace,
+            workspace,
+            &client_capabilities,
+        )
+        .await
+    }
+
+    async fn new_for_policy(
+        server_name: &str,
+        config: &Config,
+        workspace: &Path,
+        policy: &McpSessionPolicy,
+    ) -> Result<Self, String> {
+        let client_capabilities = policy.client_capabilities_for_server(server_name);
+        Self::new_for_scope(
+            server_name,
+            config,
+            workspace,
+            policy.cache_namespace(workspace),
+            &client_capabilities,
+        )
+        .await
+    }
+
+    async fn new_for_scope(
+        server_name: &str,
+        config: &Config,
+        workspace: &Path,
+        cache_namespace: &Path,
+        client_capabilities: &McpClientCapabilityPolicy,
+    ) -> Result<Self, String> {
         let server = config
             .mcp_servers
             .get(server_name)
@@ -5295,13 +5866,21 @@ impl TemporaryMcpSession {
         }
         if is_streamable_http_server(server) {
             let timeout_secs = server_timeout_secs(server, config);
-            let base_key = cache_key(server_name, server, workspace, config)?;
+            let base_key = cache_key_for_scope(
+                server_name,
+                server,
+                workspace,
+                cache_namespace,
+                config,
+                client_capabilities,
+            )?;
             let cache_key = format!("{base_key}\none-shot\n{:?}", Instant::now());
             let session_id = initialize_http_session(
                 server_name,
                 server,
                 &cache_key,
                 workspace,
+                client_capabilities,
                 false,
                 timeout_secs,
             )
@@ -5311,13 +5890,20 @@ impl TemporaryMcpSession {
                 server: server.clone(),
                 cache_key,
                 session_id,
+                client_capabilities: client_capabilities.clone(),
                 timeout_secs,
             });
         }
 
-        spawn_server_session(server_name, config, workspace)
-            .await
-            .map(Self::Stdio)
+        spawn_server_session_for_scope(
+            server_name,
+            config,
+            workspace,
+            cache_namespace,
+            client_capabilities,
+        )
+        .await
+        .map(Self::Stdio)
     }
 
     async fn request(
@@ -5332,6 +5918,7 @@ impl TemporaryMcpSession {
                 server,
                 cache_key,
                 session_id,
+                client_capabilities,
                 timeout_secs,
             } => {
                 let payload = json!({
@@ -5345,6 +5932,7 @@ impl TemporaryMcpSession {
                     server,
                     cache_key,
                     workspace,
+                    client_capabilities,
                     payload,
                     session_id.clone(),
                     *timeout_secs,
@@ -5396,10 +5984,47 @@ async fn call_server_once(
     result
 }
 
+async fn call_server_once_for_policy(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let mut session =
+        TemporaryMcpSession::new_for_policy(server_name, config, workspace, policy).await?;
+    let result = session.request(workspace, method, params).await;
+    session.shutdown().await;
+    result
+}
+
 async fn call_server(
     server_name: &str,
     config: &Config,
     workspace: &Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    call_server_for_scope(server_name, config, workspace, None, method, params).await
+}
+
+async fn call_server_for_policy(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    call_server_for_scope(server_name, config, workspace, Some(policy), method, params).await
+}
+
+async fn call_server_for_scope(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: Option<&McpSessionPolicy>,
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
@@ -5411,11 +6036,21 @@ async fn call_server(
         return Err(format!("MCP server '{server_name}' is disabled"));
     }
     if is_streamable_http_server(server) {
-        return call_http_server(server_name, config, workspace, method, params).await;
+        return match policy {
+            Some(policy) => {
+                call_http_server_for_policy(server_name, config, workspace, policy, method, params)
+                    .await
+            }
+            None => call_http_server(server_name, config, workspace, method, params).await,
+        };
     }
 
-    let (cache_key, mut session) =
-        get_or_create_server_session(server_name, config, workspace).await?;
+    let (cache_key, mut session) = match policy {
+        Some(policy) => {
+            get_or_create_server_session_for_policy(server_name, config, workspace, policy).await?
+        }
+        None => get_or_create_server_session(server_name, config, workspace).await?,
+    };
 
     for attempt in 0..2 {
         let request_result = {
@@ -5446,9 +6081,18 @@ async fn call_server(
         }
 
         remove_cached_server_session(&cache_key, &session);
-        session = get_or_create_server_session(server_name, config, workspace)
-            .await?
-            .1;
+        session = match policy {
+            Some(policy) => {
+                get_or_create_server_session_for_policy(server_name, config, workspace, policy)
+                    .await?
+                    .1
+            }
+            None => {
+                get_or_create_server_session(server_name, config, workspace)
+                    .await?
+                    .1
+            }
+        };
     }
 
     Err(format!("MCP call failed for '{server_name}'"))

@@ -1,7 +1,8 @@
 // These tests serialize against the global control registries (DIRECT_RUNS /
-// GROUP_RUN_CONTROLS) via `control_registry_test_guard()`, a std Mutex held for
-// the whole async test body on purpose. Dropping it before each `.await` (what
-// the lint suggests) would break that serialization, so suppress it module-wide.
+// GROUP_RUN_CONTROLS) and Group feature-disable sweeps via
+// `control_registry_test_guard()`, a std Mutex held for the whole async test body
+// on purpose. Dropping it before each `.await` (what the lint suggests) would
+// break that serialization, so suppress it module-wide.
 #![allow(clippy::await_holding_lock)]
 
 use super::*;
@@ -107,6 +108,179 @@ async fn group_dispatch_rejects_plan_mode_before_loading_the_group() {
     assert_eq!(direct_tool_error, "group_plan_mode_unsupported");
 }
 
+#[tokio::test]
+async fn group_socket_operations_fail_closed_after_the_feature_is_disabled() {
+    let state = Arc::new(test_app_state());
+    let mut config = (*state.config()).clone();
+    config.enable_groups = false;
+    state.apply_runtime_config(config);
+
+    let error = handle_group_socket_message(
+        &state,
+        "hidden-group",
+        GroupSocketDispatch {
+            text: "must not persist".into(),
+            targets: Vec::new(),
+            target_mode: "all".into(),
+            start_runs: false,
+            run_mode: "execute".into(),
+        },
+    )
+    .await
+    .expect_err("a stale Group socket must not mutate hidden Group data");
+    assert!(error.starts_with("group_feature_disabled:"));
+
+    let stop_error = handle_group_socket_stop(&state, "hidden-group", Vec::new())
+        .await
+        .expect_err("a stale Group socket must not invoke Group operations");
+    assert!(stop_error.starts_with("group_feature_disabled:"));
+
+    let internal_dispatch_error = dispatch_to_sessions(
+        &state,
+        DispatchRequest {
+            group_id: Some("hidden-group".to_string()),
+            targets: vec!["worker-a".to_string()],
+            optional_targets: HashSet::new(),
+            message: "must not queue".to_string(),
+            group_message: None,
+            run_mode: AgentRunMode::Execute,
+            wait: false,
+            summary_budget: 4_000,
+            mention_depth: 1,
+        },
+    )
+    .await
+    .expect_err("internal mention follow-ups must fail closed after hot-disable");
+    assert!(internal_dispatch_error.starts_with("group_feature_disabled:"));
+}
+
+#[tokio::test]
+async fn group_dispatch_is_serialized_with_a_hot_disable_transition() {
+    let state = Arc::new(test_app_state());
+    let feature_guard = session_group::group_feature_gate().write().await;
+    let dispatch = tokio::spawn({
+        let state = state.clone();
+        async move {
+            dispatch_to_sessions(
+                &state,
+                DispatchRequest {
+                    group_id: Some("transition-group".to_string()),
+                    targets: vec!["worker-a".to_string()],
+                    optional_targets: HashSet::new(),
+                    message: "must not queue after disable".to_string(),
+                    group_message: None,
+                    run_mode: AgentRunMode::Execute,
+                    wait: false,
+                    summary_budget: 4_000,
+                    mention_depth: 0,
+                },
+            )
+            .await
+        }
+    });
+
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !dispatch.is_finished(),
+        "dispatch must wait behind the Group feature transition gate"
+    );
+
+    let mut config = (*state.config()).clone();
+    config.enable_groups = false;
+    state.apply_runtime_config(config);
+    drop(feature_guard);
+
+    let error = tokio::time::timeout(Duration::from_secs(2), dispatch)
+        .await
+        .expect("dispatch should resume after the transition")
+        .expect("dispatch task should join")
+        .expect_err("dispatch queued before hot-disable must fail closed");
+    assert!(error.starts_with("group_feature_disabled:"));
+}
+
+#[tokio::test]
+async fn group_run_completion_is_serialized_with_a_hot_disable_transition() {
+    let state = Arc::new(test_app_state());
+    let group_id = format!(
+        "completion-disable-transition-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let run_id = format!("{group_id}-run");
+    let session_id = "worker-a".to_string();
+    let mut group = SessionGroup::new(
+        &group_id,
+        "Completion Disable Transition",
+        vec![session_id.clone()],
+    );
+    group.runs.push(GroupRun {
+        id: run_id.clone(),
+        group_id: group_id.clone(),
+        session_id: session_id.clone(),
+        status: "stopped".to_string(),
+        prompt: "inspect".to_string(),
+        result_excerpt: Some("Stopped because Group chat was disabled.".to_string()),
+        error: None,
+        created_at: 1,
+        updated_at: 2,
+        completed_at: Some(2),
+    });
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+
+    let feature_guard = session_group::group_feature_gate().write().await;
+    let completion = tokio::spawn({
+        let state = state.clone();
+        let group_id = group_id.clone();
+        let run_id = run_id.clone();
+        let session_id = session_id.clone();
+        async move {
+            persist_group_run_completion_if_enabled(
+                &state,
+                &group_id,
+                &run_id,
+                &session_id,
+                "completed",
+                "late result".to_string(),
+                None,
+                None,
+            )
+            .await
+        }
+    });
+
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !completion.is_finished(),
+        "run completion must wait behind the Group feature transition gate"
+    );
+
+    let mut config = (*state.config()).clone();
+    config.enable_groups = false;
+    state.apply_runtime_config(config);
+    drop(feature_guard);
+
+    let recorded = tokio::time::timeout(Duration::from_secs(2), completion)
+        .await
+        .expect("completion should resume after the transition")
+        .expect("completion task should join");
+    assert!(!recorded, "a late completion must fail closed");
+
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert_eq!(loaded.runs[0].status, "stopped");
+    assert_eq!(
+        loaded.runs[0].result_excerpt.as_deref(),
+        Some("Stopped because Group chat was disabled.")
+    );
+    assert!(loaded.messages.is_empty());
+    group_cleanup.cleanup_now();
+}
+
 fn test_session_with_workspace(id: &str, name: &str, workspace: std::path::PathBuf) -> Session {
     Session {
         id: id.to_string(),
@@ -137,6 +311,8 @@ fn test_session_with_workspace(id: &str, name: &str, workspace: std::path::PathB
         todos: crate::todos::TodoSnapshot::empty(now_epoch()),
         pending_plan: None,
         version: crate::SESSION_VERSION,
+        working_directory: workspace.clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace,
     }
 }
@@ -1086,6 +1262,7 @@ fn test_config() -> crate::Config {
         daily_reflection: false,
         enable_state_digest: true,
         enable_task_plan: false,
+        enable_groups: true,
         s3: None,
     }
 }
@@ -1318,6 +1495,32 @@ async fn execute_session_control_describe_session_covers_sections_and_errors() {
     assert!(runtime.output.contains("[redacted]"));
     assert!(!runtime.output.contains("secret-value"));
     assert!(!runtime.output.contains("super-secret"));
+
+    let mut disabled_config = (*state.config()).clone();
+    disabled_config.enable_groups = false;
+    state.apply_runtime_config(disabled_config);
+    let hidden_runtime = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        r#"{"action":"describe_session","target":"describe-test-session","sections":["runtime"],"max_chars":4000}"#,
+    )
+    .await;
+    assert!(!hidden_runtime.is_error, "{}", hidden_runtime.output);
+    assert!(hidden_runtime.output.contains("last_group_run: none"));
+    assert!(!hidden_runtime.output.contains("run-secret"));
+
+    let hidden_groups = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        r#"{"action":"describe_session","target":"describe-test-session","sections":["groups"]}"#,
+    )
+    .await;
+    assert!(hidden_groups.is_error);
+    assert!(hidden_groups.output.starts_with("group_feature_disabled:"));
+
+    let mut enabled_config = (*state.config()).clone();
+    enabled_config.enable_groups = true;
+    state.apply_runtime_config(enabled_config);
 
     let invalid = execute_session_control_tool(
         &state,
@@ -1640,6 +1843,155 @@ async fn final_group_model_gate_records_a_visible_failed_run() {
 }
 
 #[tokio::test]
+async fn group_dispatch_rejects_an_unavailable_workspace_before_persisting() {
+    let _guard = control_registry_test_guard();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "dispatch-missing-workspace-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let private_home = unique_temp_workspace("dispatch-missing-workspace-home");
+    let mut session = test_session_with_workspace(
+        &session_id,
+        "Dispatch Missing Workspace",
+        private_home.clone(),
+    );
+    session.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    session.working_directory = private_home.join("removed-project");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let group_id = format!(
+        "dispatch-workspace-gate-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    session_group::save_group_to_disk_locked(&SessionGroup::new(
+        &group_id,
+        "Workspace Gate",
+        vec![session_id.clone()],
+    ))
+    .await
+    .expect("group should save");
+
+    let error = dispatch_to_sessions(
+        &state,
+        DispatchRequest {
+            group_id: Some(group_id.clone()),
+            targets: vec![session_id],
+            optional_targets: HashSet::new(),
+            message: "inspect the project".to_string(),
+            group_message: Some(DispatchGroupMessage {
+                role: "user".to_string(),
+                session_id: None,
+                turn_id: Some("workspace-preflight-turn".to_string()),
+            }),
+            run_mode: AgentRunMode::Execute,
+            wait: false,
+            summary_budget: 4_000,
+            mention_depth: 0,
+        },
+    )
+    .await
+    .expect_err("an unavailable workspace must fail before dispatch is accepted");
+
+    assert!(error.starts_with("workspace_unavailable:"));
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert!(loaded.messages.is_empty());
+    assert!(loaded.runs.is_empty());
+
+    group_cleanup.cleanup_now();
+    clear_group_run_controls_for_test();
+    let _ = std::fs::remove_dir_all(private_home);
+}
+
+#[tokio::test]
+async fn delegated_run_rejects_an_unavailable_workspace_before_running_or_writing_history() {
+    let _guard = control_registry_test_guard();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "worker-missing-workspace-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let private_home = unique_temp_workspace("worker-missing-workspace-home");
+    let missing_workspace = private_home.join("removed-project");
+    let mut session = test_session_with_workspace(
+        &session_id,
+        "Worker Missing Workspace",
+        private_home.clone(),
+    );
+    session.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    session.working_directory = missing_workspace;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let group_id = format!(
+        "workspace-gate-visible-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let run_id = "workspace-gate-visible-run".to_string();
+    let mut group = SessionGroup::new(&group_id, "Workspace Gate", vec![session_id.clone()]);
+    group.runs.push(GroupRun {
+        id: run_id.clone(),
+        group_id: group_id.clone(),
+        session_id: session_id.clone(),
+        status: "queued".to_string(),
+        prompt: "inspect the project".to_string(),
+        result_excerpt: None,
+        error: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    });
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+    let control = test_direct_control();
+    register_group_run_control(&run_id, &group_id, &session_id, &control);
+    let run = StartedRun {
+        run_id: run_id.clone(),
+        group_id: Some(group_id.clone()),
+        optional_reply: false,
+        mention_depth: 1,
+        session_id: session_id.clone(),
+        control,
+    };
+
+    run_target_run(
+        state.clone(),
+        run,
+        "inspect the project".to_string(),
+        AgentRunMode::Execute,
+        4_000,
+    )
+    .await;
+
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert_eq!(loaded.runs[0].status, "failed");
+    assert!(
+        loaded.runs[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("workspace_unavailable:"))
+    );
+    assert!(state.sessions.lock().await[&session_id].messages.is_empty());
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+
+    group_cleanup.cleanup_now();
+    clear_group_run_controls_for_test();
+    let _ = std::fs::remove_dir_all(private_home);
+}
+
+#[tokio::test]
 async fn active_group_run_statuses_reports_unknown_when_group_missing() {
     let _guard = control_registry_test_guard();
     clear_group_run_controls_for_test();
@@ -1659,6 +2011,27 @@ async fn active_group_run_statuses_reports_unknown_when_group_missing() {
         Some("unknown")
     );
     clear_group_run_control("missing-run");
+}
+
+#[tokio::test]
+async fn disabling_groups_cancels_unpersisted_controls_even_when_the_group_is_missing() {
+    let _guard = control_registry_test_guard();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let group_id = format!(
+        "missing-disable-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let control = test_direct_control();
+    register_group_run_control("missing-disable-run", &group_id, "worker-a", &control);
+
+    let feature_gate = session_group::group_feature_gate();
+    let feature_guard = feature_gate.write().await;
+    disable_group_feature_locked(&state, &feature_guard).await;
+
+    assert!(control.cancel.is_cancelled());
+    assert!(control.stop_requested.load(Ordering::Relaxed));
+    assert!(with_group_run_controls(|controls| controls.is_empty()));
 }
 
 #[tokio::test]
@@ -2528,6 +2901,124 @@ async fn delete_session_with_safety_checks_guards_current_and_delegated_work() {
 }
 
 #[tokio::test]
+async fn deleting_directory_session_removes_only_lingclaw_private_home() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "delete-external-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let private_home = crate::session_workspace_path(&session_id);
+    let external = std::env::temp_dir().join(format!(
+        "lingclaw-delete-external-{}-{}",
+        std::process::id(),
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&private_home).expect("private Session home should exist");
+    std::fs::create_dir_all(&external).expect("external project should exist");
+    let marker = external.join("keep.txt");
+    std::fs::write(&marker, "user project data").unwrap();
+
+    let mut session =
+        test_session_with_workspace(&session_id, "External Delete", private_home.clone());
+    session.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    session.working_directory = external.clone();
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("directory Session should save");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    delete_session_with_safety_checks(&state, &session_id, Some(MAIN_SESSION_ID))
+        .await
+        .expect("directory Session deletion should succeed");
+
+    assert!(
+        !private_home.exists(),
+        "private Session home should be deleted"
+    );
+    assert!(
+        external.is_dir(),
+        "external project directory must be retained"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "user project data"
+    );
+    std::fs::remove_dir_all(&external).unwrap();
+    cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
+async fn delete_session_refuses_to_remove_a_private_home_used_by_another_session() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let target_id = format!(
+        "delete-private-owner-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let dependent_id = format!(
+        "delete-private-dependent-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&target_id);
+    cleanup_created_session_for_test(&dependent_id);
+    let target_workspace = crate::session_workspace_path(&target_id);
+    let target_root = target_workspace.parent().unwrap().to_path_buf();
+    let nested_project = target_root.join("nested-project");
+    let marker = nested_project.join("keep.txt");
+    std::fs::create_dir_all(&target_workspace).expect("target private home should exist");
+    std::fs::create_dir_all(&nested_project).expect("nested project should exist");
+    std::fs::write(&marker, "keep").expect("nested project marker should be writable");
+
+    let target =
+        test_session_with_workspace(&target_id, "Private Home Owner", target_workspace.clone());
+    let dependent_workspace = crate::session_workspace_path(&dependent_id);
+    let mut dependent =
+        test_session_with_workspace(&dependent_id, "Private Home Dependent", dependent_workspace);
+    dependent.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    dependent.working_directory = crate::normalize_working_directory(&nested_project).unwrap();
+    session_store::save_session_to_disk(&target)
+        .await
+        .expect("target Session should save");
+    session_store::save_session_to_disk(&dependent)
+        .await
+        .expect("dependent Session should save");
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(target_id.clone(), target);
+        sessions.insert(dependent_id.clone(), dependent);
+    }
+
+    let error = delete_session_with_safety_checks(&state, &target_id, Some(MAIN_SESSION_ID))
+        .await
+        .expect_err("a referenced private home must not be deleted");
+
+    assert!(error.contains(&dependent_id));
+    assert!(error.contains("Rebind that session first"));
+    assert!(
+        marker.exists(),
+        "the dependent working directory must survive"
+    );
+    assert!(
+        session_store::sessions_dir()
+            .join(format!("{target_id}.json"))
+            .exists(),
+        "the rejected deletion must leave the target Session intact"
+    );
+    cleanup_created_session_for_test(&dependent_id);
+    cleanup_created_session_for_test(&target_id);
+}
+
+#[tokio::test]
 async fn delete_session_waits_for_in_flight_session_persistence() {
     let _guard = control_registry_test_guard();
     clear_direct_runs_for_test();
@@ -2676,6 +3167,7 @@ async fn delete_session_prunes_ghost_member_from_all_groups() {
 
 #[tokio::test]
 async fn session_control_delete_group_rejects_active_runs_then_deletes_group() {
+    let _guard = control_registry_test_guard();
     let state = Arc::new(test_app_state());
     let group_id = format!(
         "delete-group-{}",

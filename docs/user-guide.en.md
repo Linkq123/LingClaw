@@ -14,16 +14,28 @@ This guide covers day-to-day use of LingClaw. See [Deployment](deploy.en.md) for
 - Todo snapshot
 - Model override
 - MCP and bundled-skill permissions
-- Workspace at `~/.lingclaw/<session-id>/workspace/`
-- Prompt files, skills, agents, and memory
+- Private Session Home at `~/.lingclaw/<session-id>/workspace/`
+- Optional external project working directory
+- Private prompt files, skills, agents, and memory
 
-The backend generates a six-character alphanumeric ID when creating a session. You may rename its display label, but the ID, workspace path, and protocol references remain unchanged. Session deletion is irreversible: it removes the session archive and the entire `~/.lingclaw/<session-id>/` directory, including workspace files, prompts, skills, agents, and memory, then removes the member from every group. `main`, a currently connected session, or a running session cannot be deleted.
+The backend generates a six-character alphanumeric ID when creating a session. You may change its display label and bound working directory, but the ID, private Session Home, and protocol references remain unchanged. Session deletion is irreversible: it removes the session archive and the entire private `~/.lingclaw/<session-id>/` directory, then removes the member from every group. It never deletes a bound external project directory. `main`, a currently connected session, or a running session cannot be deleted.
 
 Navigation search matches names and IDs. The recent area shows at most 12 entries and always includes Main and the active session. Everything else appears under Earlier sessions.
 
-Structured session state is no longer stored as separate JSON files. Messages, todos, usage, sub-agent snapshots, and group data live in `~/.lingclaw/lingclaw.db`. Prompt files, skills, agents, Structured Memory, and normal Markdown remain in their workspaces. The first launch after an upgrade migrates the old store automatically and permanently retains the original JSON under `~/.lingclaw/backups/sqlite-migration-*/`.
+Structured session state is no longer stored as separate JSON files. Messages, todos, usage, working-directory bindings, sub-agent snapshots, and group data live in `~/.lingclaw/lingclaw.db`. Prompt files, skills, agents, Structured Memory, and normal Markdown always remain in the private Session Home. The first launch after an upgrade migrates the old store automatically and permanently retains the original JSON under `~/.lingclaw/backups/sqlite-migration-*/`.
+
+### Working directories
+
+A session supports two workspace kinds:
+
+- **LingClaw managed** — `working_directory` is the private Session Home, preserving the previous behavior.
+- **Local directory** — Bind an existing, absolute, canonicalizable project directory outside the LingClaw private data directory at `~/.lingclaw/`. More than one session may bind to the same directory.
+
+File, shell, Git, image viewing, Plan evidence, and MCP roots use `working_directory`. Persona, memory, skills, agents, MCP policy, and caches continue to use the private Session Home. LingClaw reads only a root-level `AGENTS.md`, or `AGENT.md` when it is absent; it does not scan parent directories or create templates and memory files in the project. When the directory is missing, history and session metadata remain available, but an agent run cannot start until it is rebound. Rebinding is blocked by a run, queued work, or an active plan.
 
 ### Groups
+
+Groups are disabled by default and require `settings.enableGroups` in Settings → General. When disabled, the workbench, TUI, APIs, WebSockets, and agent omit Group operations, but stored groups, history, members, and votes remain intact and return when the feature is enabled again.
 
 A group organizes several sessions into one conversation. Main handles governance but is not dispatched as a regular member. Three target modes are available:
 
@@ -48,6 +60,47 @@ A provider describes an endpoint and protocol. A model describes its ID, context
 - `sub-agent-<name>` — Named sub-agent override
 
 A session `/model` override affects that session only and takes priority over global `primary`. An invalid override never falls back silently.
+
+## Terminal workspace (TUI)
+
+Run `lingclaw tui` inside a project, or pass the full command explicitly:
+
+```text
+lingclaw tui [PATH] [--session ID] [--port PORT] [--lang auto|zh-CN|en] [--theme auto|dark|light]
+```
+
+When PATH is omitted, the current directory is used. No match opens a confirmation for a directory workspace, one match restores immediately, and several matches open a chooser. `--session` opens a specific session; when combined with an explicit PATH, both must resolve to the same normalized directory. The TUI reuses the daemon or starts it automatically, and exiting leaves the daemon running. If no model is configured yet, a native TUI wizard first configures the Provider, Base URL, masked API key, model, and primary Agent before starting the daemon.
+
+The TUI shares the WebUI HTTP/WebSocket protocol and provides streaming chat, Plan, execution events, todos, models, skills, MCP, Usage, Settings, and the optional Groups page. At least 120 columns uses navigation/chat/Inspector columns, 80–119 columns uses two, and narrower terminals switch to one page. Settings presents native general switches, Agent routing, Provider connections, and S3 fields. Raw JSON is an advanced path that prefers `$VISUAL` or `$EDITOR` (including fixed arguments such as `code --wait`) and otherwise uses the built-in multiline editor. Default builds automatically detect Kitty, Sixel, or iTerm2 image protocols; otherwise image names and links remain visible and open through the system viewer.
+
+Common keys: `Tab` / `Shift+Tab` moves focus, `Enter` sends, `Alt+Enter` or `Ctrl+J` inserts a line, `Ctrl+P` opens commands, `Ctrl+S` opens advanced Raw JSON, and `?` opens help. The first `Ctrl+C` during a run stops it; two idle presses exit. On Models, `↑/↓` selects a model, `←/→` selects Effort, and `Enter` applies both atomically; `Space` toggles the selected Skills/MCP item, while `Space/Delete/A` cycles, removes, or adds Todos. On Settings, `↑/↓` selects a field, `Space` toggles booleans, and `Enter` edits text or numeric values. Press `R` to reload any of these data pages. On the Plan page, `E/R/F/D` execute, resume, refresh, or discard, while `V` enters revision feedback. When evidence changes, `X` opens an explicit confirmation and executes with the server-issued confirmation token. `/attach PATH` adds an image, while `/target all|mentions|id[,id]` selects Group targets.
+
+The TUI also consumes the process-wide `storage_status`. In protection mode, the header and composer retain a warning and any draft not accepted by the runtime is restored. Message, image, Plan, Session, Group, and todo writes are disabled, while reads, navigation, and independent configuration saves remain available.
+
+TUI-local management commands call the same HTTP API and do not create chat messages:
+
+```text
+/session create managed | NAME
+/session create ABSOLUTE_PATH | NAME
+/session rename NAME
+/session rebind managed|ABSOLUTE_PATH
+/session find TEXT
+/session switch ID
+/session delete ID
+
+/group create NAME | MEMBER_ID[,MEMBER_ID]
+/group switch ID
+/group rename NAME
+/group members MEMBER_ID[,MEMBER_ID]
+/group promote MEMBER_ID
+/group remove MEMBER_ID
+/group delete
+
+/mcp oauth SERVER
+/mcp disconnect SERVER
+```
+
+Switch away before deleting the current Session; `main` cannot be deleted. Group commands are available only when `settings.enableGroups=true`. Existing model/Effort, Plan, Todos, Skills, and other slash commands continue over the shared WebSocket protocol.
 
 ## The workspace
 

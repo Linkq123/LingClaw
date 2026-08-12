@@ -2,27 +2,29 @@
 
 [简体中文](architecture.md) · [English](architecture.en.md) · [返回 README](../README.md)
 
-LingClaw 是单进程 Rust Runtime 加静态浏览器前端。设计目标不是隐藏 Agent 的执行过程，而是在可检查的状态机、工具边界和持久化模型中运行它。
+LingClaw 是单进程 Rust Runtime，提供静态浏览器前端与 Ratatui 终端客户端。两种界面共享 HTTP/WebSocket 协议；设计目标不是隐藏 Agent 的执行过程，而是在可检查的状态机、工具边界和持久化模型中运行它。
 
 ## 总体结构
 
 ```mermaid
 flowchart TB
     Browser["Browser workspace"] <-->|"HTTP / WebSocket"| Server["Axum server"]
+    TUI["Ratatui terminal workspace"] <-->|"HTTP / WebSocket"| Server
     Server --> Sessions["Session and Group runtime"]
     Sessions --> Loop["Analyze → Act → Observe → Finish"]
     Loop --> Prompt["Prompt, Skills, Memory, Context"]
     Loop --> Providers["OpenAI / Anthropic / Gemini / Ollama"]
     Loop --> Tools["Built-ins / MCP / Sub-agents"]
     Sessions <--> SQLite["SQLite core storage"]
-    Sessions <--> Disk["Session workspace files"]
+    Sessions <--> Home["Private Session homes"]
+    Loop <--> Project["Selected working directories"]
     Tools --> Images["Optional S3 image pipeline"]
 ```
 
 三个职责层：
 
 - **Skill**：提示构建、模型路由、上下文裁剪、思考控制、Skills 和记忆注入。
-- **CLI / Tools**：文件、shell、网络、Todos、MCP、图片和安全检查。
+- **CLI / TUI / Tools**：daemon 管理、异步终端客户端、文件、shell、网络、Todos、MCP、图片和安全检查。
 - **Loop**：WebSocket Session runtime、ReAct、Slash Commands、持久化、live replay 和后台任务。
 
 ## ReAct Runtime
@@ -67,6 +69,7 @@ SQLite v5 把生命周期拆为 `session_plans`、不可变 `session_plan_revisi
 | 模块 | 主要职责 |
 |---|---|
 | `main.rs` | Axum 路由、HTTP/WS 安全、共享状态、配置事务、live replay |
+| `tui.rs` | Ratatui 客户端、daemon 发现、目录 Session 选择、终端事件与响应式布局 |
 | `runtime_loop.rs` | 顶层 Agent Analyze/Act/Observe/Finish |
 | `agent.rs` | phase、TaskIntent、WorkingState、Task Plan、Finish 判定 |
 | `providers.rs` | Provider 消息转换、请求、流解析和 usage |
@@ -166,13 +169,13 @@ Orchestrator 验证 DAG，按拓扑层并行运行，传播依赖结果并发送
     └── agents/
 ```
 
-`lingclaw.db` 是 Session、消息、Todos、Usage、Sub-agent 快照和 Group 数据的唯一持久化来源。复杂 Provider 字段使用 JSON 列，身份、顺序、时间、Tool ID 等常用查询字段独立存储。消息保存通过指纹比较公共前缀，只替换发生变化的尾部；Session/Group 多表更新在一个事务中提交。数据库使用 WAL、`foreign_keys=ON`、`synchronous=NORMAL` 和 5 秒 busy timeout，并通过 `application_id`、`schema_migrations` 与 `user_version` 管理归属和版本。
+`lingclaw.db` 是 Session、消息、Todos、Usage、Sub-agent 快照、Group 数据和工作目录绑定的唯一持久化来源。Schema v6 在 `sessions` 中保存 `workspace_kind`、规范化 `working_directory` 及平台匹配 key，并建立目录索引。复杂 Provider 字段使用 JSON 列，身份、顺序、时间、Tool ID 等常用查询字段独立存储。消息保存通过指纹比较公共前缀，只替换发生变化的尾部；Session/Group 多表更新在一个事务中提交。数据库使用 WAL、`foreign_keys=ON`、`synchronous=NORMAL` 和 5 秒 busy timeout，并通过 `application_id`、`schema_migrations` 与 `user_version` 管理归属和版本。
 
 首次发现旧 `sessions/` 或 `groups/` 时，Runtime 在监听端口前完成严格迁移：读取 primary/`.tmp`、校验 ID/引用和哈希，把目录原子移动到 `backups/sqlite-migration-<timestamp>/`，再在一个 SQLite 事务中导入、校验并记录完成标记。两阶段 journal 支持崩溃续跑；成功后不再读取或写入旧 JSON，备份不会自动删除。Schema 升级前先创建一致性数据库备份。
 
 运行期 SQLite I/O、损坏或约束错误会把进程置为粘性的 `protected` 状态。Runtime 取消活动 Agent/Group run 并拒绝核心数据库写入，读取和独立 `.lingclaw.json` 保存仍可用。HTTP 返回稳定的 `503 storage_protected`，WebSocket 广播 `storage_status`；修复外部问题后需要重启进程。
 
-Workspace 提示、Markdown Memory、Structured Memory、Skills 和 Agents 继续使用文件系统。Session 删除先提交数据库事务（包括 Group 成员和投票清理），再删除 Workspace；文件清理失败最多留下孤立目录，不会恢复已删除的数据库实体。
+每个 Session 同时拥有两个明确边界：`session_home` 固定在 `~/.lingclaw/<id>/workspace/`，保存 Persona、Memory、Skills、Agents、MCP policy 和缓存；`working_directory` 是文件、Shell、Git、图片、Plan evidence 与 MCP roots 的项目根。外部目录只读加载根级 `AGENTS.md`/`AGENT.md`，不能覆盖 LingClaw 工具安全策略。Session 删除先提交数据库事务（包括 Group 成员和投票清理），再只删除私有 Session Home；外部项目永不删除。
 
 ### Bootstrap prompt
 
@@ -184,6 +187,7 @@ Workspace 提示、Markdown Memory、Structured Memory、Skills 和 Agents 继�
 
 ### Group 不变式
 
+- `settings.enableGroups` 缺省为 `false`。关闭时协议和模型工具都 fail closed，持久化 Group 数据保持不变；热关闭会停止活动 Group run 并断开 Group socket。
 - Main 是隐式永久 Owner，不在 `members` 中作为普通派发对象。
 - Promoted admins 存于 `admins[]`；管理员移除成员按 promoted-admin 票数计算 2/3，Owner 操作直接生效。
 - 只有 `@session-id` 参与协议路由；显示名称不参与解析。

@@ -74,6 +74,7 @@ fn test_config_with_broken_mcp() -> Config {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     }
 }
 
@@ -543,6 +544,9 @@ fn recommended_install_scripts_reuse_the_release_target() {
     assert!(windows.contains("$stopOutput = @(& $installedExe stop 2>&1)"));
     assert!(windows.contains("function Test-RustNativeToolchain"));
     assert!(windows.contains("function Ensure-RustNativeToolchain"));
+    assert!(windows.contains("$MinimumRustVersion = [Version]'1.90.0'"));
+    assert!(windows.contains("function Assert-CompatibleRust"));
+    assert!(windows.contains("@('toolchain', 'install', 'stable', '--profile', 'minimal')"));
     assert!(windows.contains("Microsoft.VisualStudio.Workload.VCTools"));
     assert!(windows.contains("@('build', '--release', '--locked', '--jobs'"));
     assert!(windows.contains("$CargoBuildJobs.ToString()"));
@@ -551,7 +555,18 @@ fn recommended_install_scripts_reuse_the_release_target() {
     assert!(windows_normalized.contains("Ensure-Rust\nEnsure-RustNativeToolchain\nBuild-Frontend"));
 
     assert!(linux.contains("--locked --offline --target-dir \"$ROOT_DIR/target\""));
+    assert!(linux.contains("MIN_RUST_VERSION=\"1.90.0\""));
+    assert!(linux.contains("rustup toolchain install stable --profile minimal"));
+    assert!(linux.contains("assert_compatible_rust"));
     assert!(!linux.contains("cargo install --path . --force\n"));
+}
+
+#[test]
+fn doctor_rust_requirement_matches_cargo_manifest() {
+    let manifest = include_str!("../../Cargo.toml");
+
+    assert_eq!(MIN_RUSTC_VERSION, (1, 90, 0));
+    assert!(manifest.contains("rust-version = \"1.90\""));
 }
 
 #[test]

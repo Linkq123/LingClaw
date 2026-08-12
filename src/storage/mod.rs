@@ -265,7 +265,15 @@ fn unlock_runtime_file(file: &std::fs::File) {
 }
 
 fn normalized_schema_sql(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    // SQLite preserves the textual shape used by ALTER TABLE. In particular,
+    // an appended column can leave the closing parenthesis attached to the
+    // final default literal, while a freshly-created table keeps a newline
+    // before it. Treat that punctuation-only whitespace as equivalent while
+    // continuing to compare every schema object and SQL token.
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" )", ")")
 }
 
 fn schema_signature(
@@ -364,6 +372,7 @@ fn validate_current_schema(connection: &rusqlite::Connection) -> Result<(), Stor
         (3, "durable_plan_feedback".to_string()),
         (4, "plan_initial_submission_marker".to_string()),
         (5, "plan_stale_override_audit".to_string()),
+        (6, "session_working_directories".to_string()),
     ];
     if migrations != expected_migrations {
         return Err(StorageError::new(format!(
@@ -575,10 +584,28 @@ impl Database {
                         "INSERT INTO schema_migrations(version, name, applied_at) VALUES (5, 'plan_stale_override_audit', ?1)",
                         [applied_at],
                     )?;
+                    transaction.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (6, 'session_working_directories', ?1)",
+                        [applied_at],
+                    )?;
                     transaction.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
                     transaction.commit()?;
                 } else {
-                    validate_current_schema(connection)?;
+                    // Managed Session homes are derived from the current
+                    // LingClaw home rather than being portable data. A copied
+                    // or restored database may therefore contain the old
+                    // machine's absolute path and index key even though the
+                    // Session itself is healthy. Reconcile them atomically
+                    // before accepting the database so workspace lookups keep
+                    // using the indexed key on the new machine.
+                    let transaction = connection.transaction_with_behavior(
+                        rusqlite::TransactionBehavior::Immediate,
+                    )?;
+                    reconcile_managed_working_directories(&transaction)?;
+                    validate_current_schema(&transaction)?;
+                    validate_database_integrity(&transaction)?;
+                    transaction.commit()?;
+                    return Ok(());
                 }
                 validate_database_integrity(connection)?;
                 Ok(())
@@ -735,11 +762,41 @@ impl Database {
     }
 }
 
+fn reconcile_managed_working_directories(
+    connection: &rusqlite::Connection,
+) -> Result<(), StorageError> {
+    let session_ids = {
+        let mut statement = connection
+            .prepare("SELECT id FROM sessions WHERE workspace_kind='managed' ORDER BY id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for session_id in session_ids {
+        crate::session_store::validate_session_id(&session_id).map_err(StorageError::new)?;
+        let path = crate::session_workspace_path(&session_id);
+        let path_text = path.to_str().ok_or_else(|| {
+            StorageError::new(format!(
+                "Managed workspace for Session '{session_id}' is not valid UTF-8"
+            ))
+        })?;
+        let key = crate::working_directory_key(&path).map_err(StorageError::new)?;
+        connection.execute(
+            r#"UPDATE sessions
+               SET working_directory=?1, working_directory_key=?2
+               WHERE id=?3 AND workspace_kind='managed'
+                 AND (working_directory<>?1 OR working_directory_key<>?2)"#,
+            rusqlite::params![path_text, key, session_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_schema(
     connection: &mut rusqlite::Connection,
     from_version: i64,
 ) -> Result<(), StorageError> {
-    if !matches!(from_version, 1..=4) {
+    if !matches!(from_version, 1..=5) {
         return Err(StorageError::new(format!(
             "No SQLite schema migration is registered from version {from_version} to {}",
             schema::SCHEMA_VERSION
@@ -838,9 +895,35 @@ fn migrate_schema(
             [crate::now_epoch() as i64],
         )?;
     }
-    transaction.execute_batch(schema::PLAN_STALE_OVERRIDE_AUDIT_SCHEMA)?;
+    if from_version <= 4 {
+        transaction.execute_batch(schema::PLAN_STALE_OVERRIDE_AUDIT_SCHEMA)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (5, 'plan_stale_override_audit', ?1)",
+            [crate::now_epoch() as i64],
+        )?;
+    }
+    transaction.execute_batch(schema::SESSION_WORKSPACE_SCHEMA)?;
+    let session_ids = {
+        let mut statement = transaction.prepare("SELECT id FROM sessions ORDER BY id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for session_id in session_ids {
+        let path = crate::session_workspace_path(&session_id);
+        let path_text = path.to_str().ok_or_else(|| {
+            StorageError::new(format!(
+                "Managed workspace for Session '{session_id}' is not valid UTF-8"
+            ))
+        })?;
+        let key = crate::working_directory_key(&path).map_err(StorageError::new)?;
+        transaction.execute(
+            "UPDATE sessions SET workspace_kind='managed', working_directory=?1, working_directory_key=?2 WHERE id=?3",
+            rusqlite::params![path_text, key, session_id],
+        )?;
+    }
     transaction.execute(
-        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (5, 'plan_stale_override_audit', ?1)",
+        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (6, 'session_working_directories', ?1)",
         [crate::now_epoch() as i64],
     )?;
     transaction.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;

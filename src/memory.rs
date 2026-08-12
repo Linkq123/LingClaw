@@ -470,6 +470,8 @@ async fn append_memory_audit_record(workspace: &Path, record: &MemoryAuditRecord
 
     if let Err(error) = file.write_all(format!("{serialized}\n").as_bytes()).await {
         eprintln!("memory audit write error: {error}");
+    } else if let Err(error) = file.flush().await {
+        eprintln!("memory audit flush error: {error}");
     }
 }
 

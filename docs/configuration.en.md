@@ -80,9 +80,12 @@ Common fields:
 | `dailyReflection` | `false` | Enable Daily Reflection |
 | `enableStateDigest` | `true` | Enable working-state digests after observations |
 | `enableTaskPlan` | `false` | Enable the automatic execution outline for ordinary Execute runs; suppressed during Plan-only and approved-plan execution |
+| `enableGroups` | `false` | Group-chat master switch; when off, WebUI, TUI, API, WebSocket, and agent Group operations are unavailable while stored Group data remains intact |
 | `enableS3` | enabled when `s3` exists | Master switch overriding S3 presence |
 
 The service always binds `127.0.0.1:<port>`. Opening a firewall does not make LingClaw listen externally. Use a protected reverse proxy or SSH tunnel for remote access.
+
+Group chat is explicitly opt-in. A legacy configuration without `enableGroups` is treated as `false`. Enabling it in Console → General or TUI Settings hot-applies the feature. Disabling it never removes groups, members, history, or votes, so enabling it later restores the data. Direct edits to `.lingclaw.json` still require a process restart.
 
 ## Providers
 
@@ -245,7 +248,7 @@ The model entry defines the user-selectable range, while `compat.thinkingFormat`
 Rules:
 
 - `transport` supports `stdio` and `streamable-http`; when omitted, `command` or `url` determines it.
-- A configured `cwd` must stay inside the current session workspace.
+- A configured `cwd` must stay inside the current session `working_directory`.
 - `headers`, OAuth client fields, and stdio `env` accept `${ENV_NAME}`.
 - OAuth tokens are stored in `~/.lingclaw/mcp-auth.json`, with refresh attempted after expiry.
 - Session policy limits servers, tools, mutating-tool confirmation, and workspace-root exposure.

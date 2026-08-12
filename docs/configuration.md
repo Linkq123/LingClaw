@@ -80,9 +80,12 @@ Settings 保存配置时会先校验、原子写入并应用新的运行时快�
 | `dailyReflection` | `false` | 启用 Daily Reflection |
 | `enableStateDigest` | `true` | 启用工具观察后的工作状态摘要 |
 | `enableTaskPlan` | `false` | 启用普通 Execute run 的“自动执行提纲”；Plan-only 与已批准计划执行期间自动抑制 |
+| `enableGroups` | `false` | Group chat 总开关；关闭时 WebUI、TUI、API、WebSocket 与 Agent Group 操作均不可用，已有 Group 数据保留 |
 | `enableS3` | 存在 `s3` 时启用 | 总开关，可覆盖 S3 配置存在状态 |
 
 服务始终绑定 `127.0.0.1:<port>`。修改防火墙不会让 LingClaw 直接监听外网；远程访问应使用受保护的反向代理或 SSH tunnel。
+
+Group chat 是显式 opt-in 功能。旧配置缺少 `enableGroups` 时也按 `false` 处理；在 Console → General 或 TUI Settings 中开启后立即热更新。关闭不会删除 Group、成员、历史或投票，重新开启即可恢复。直接编辑 `.lingclaw.json` 仍需重启进程。
 
 ## Providers
 
@@ -245,7 +248,7 @@ OpenAI-compatible 模型可以设置 `compat.thinkingFormat`。Settings 下拉�
 规则：
 
 - `transport` 支持 `stdio` 和 `streamable-http`；省略时按 `command` 或 `url` 推断。
-- `cwd` 若设置，必须位于当前 Session workspace 内。
+- `cwd` 若设置，必须位于当前 Session 的 `working_directory` 内。
 - `headers`、OAuth client 字段和 stdio `env` 支持 `${ENV_NAME}`。
 - OAuth token 存在本机 `~/.lingclaw/mcp-auth.json`，过期时尝试 refresh。
 - Session policy 可以限制 server、具体 tool、mutating tool 确认和是否暴露 workspace root。

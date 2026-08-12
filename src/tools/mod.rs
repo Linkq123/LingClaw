@@ -1870,8 +1870,15 @@ pub(crate) fn is_session_control_tool(name: &str) -> bool {
     name == TOOL_NAME_SESSION_CONTROL
 }
 
+#[allow(dead_code)] // Compatibility wrapper; runtime callers pass the feature flag explicitly.
 pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
-    json!({
+    session_control_tool_parameters_for_features(true)
+}
+
+pub(crate) fn session_control_tool_parameters_for_features(
+    enable_groups: bool,
+) -> serde_json::Value {
+    let mut schema = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -2013,41 +2020,102 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
             }
         },
         "required": ["action"]
-    })
+    });
+    if !enable_groups {
+        schema["properties"]["action"]["enum"] = json!([
+            "list_sessions",
+            "create_session",
+            "delete_session",
+            "describe_session",
+            "dispatch",
+            "stop"
+        ]);
+        schema["properties"]["sections"]["items"]["enum"] =
+            json!(["profile", "capabilities", "runtime"]);
+        let properties = schema["properties"]
+            .as_object_mut()
+            .expect("session_control properties must be an object");
+        properties.remove("group_id");
+        properties.remove("requester_session_id");
+        properties.remove("members");
+        properties["name"]["description"] = json!("Display name for create_session.");
+        properties["target"]["description"] =
+            json!("Target session id for describe_session or delete_session.");
+        properties["session_id"]["description"] =
+            json!("Alias for target when action is describe_session or delete_session.");
+        properties["targets"]["description"] =
+            json!("Explicit target session ids for dispatch or stop.");
+        properties["wait"]["description"] = json!(
+            "For dispatch, wait until the delegated runs complete or timeout before returning."
+        );
+    }
+    schema
 }
 
-fn session_control_tool_description() -> &'static str {
-    "Control other persistent sessions from the main session. Use this to list lightweight session cards, create/delete sessions, describe one session's profile/capabilities/runtime details on demand, manage groups and group admins, dispatch work, collect group results, post group messages, remove group members, or stop delegated session runs. Only the main session can use this tool; each target session keeps its own model, MCP policy, skills, TaskPlan setting, workspace, and permissions."
+fn session_control_tool_description(enable_groups: bool) -> &'static str {
+    if enable_groups {
+        "Control other persistent sessions from the main session. Use this to list lightweight session cards, create/delete sessions, describe one session's profile/capabilities/runtime details on demand, manage groups and group admins, dispatch work, collect group results, post group messages, remove group members, or stop delegated session runs. Only the main session can use this tool; each target session keeps its own model, MCP policy, skills, TaskPlan setting, workspace, and permissions."
+    } else {
+        "Control other persistent sessions from the main session. Use this to list lightweight session cards, create/delete sessions, describe one session's profile/capabilities/runtime details on demand, dispatch work directly to explicit sessions, or stop delegated session runs. Only the main session can use this tool; each target session keeps its own model, MCP policy, skills, TaskPlan setting, workspace, and permissions."
+    }
 }
 
+#[allow(dead_code)] // Compatibility wrapper; runtime callers pass the feature flag explicitly.
 pub(crate) fn session_control_tool_definition_openai() -> serde_json::Value {
+    session_control_tool_definition_openai_for_features(true)
+}
+
+pub(crate) fn session_control_tool_definition_openai_for_features(
+    enable_groups: bool,
+) -> serde_json::Value {
     json!({
         "type": "function",
         "function": {
             "name": TOOL_NAME_SESSION_CONTROL,
-            "description": session_control_tool_description(),
-            "parameters": session_control_tool_parameters(),
+            "description": session_control_tool_description(enable_groups),
+            "parameters": session_control_tool_parameters_for_features(enable_groups),
         }
     })
 }
 
+#[allow(dead_code)] // Compatibility wrapper; runtime callers pass the feature flag explicitly.
 pub(crate) fn session_control_tool_definition_anthropic() -> serde_json::Value {
+    session_control_tool_definition_anthropic_for_features(true)
+}
+
+pub(crate) fn session_control_tool_definition_anthropic_for_features(
+    enable_groups: bool,
+) -> serde_json::Value {
     json!({
         "name": TOOL_NAME_SESSION_CONTROL,
-        "description": session_control_tool_description(),
-        "input_schema": session_control_tool_parameters(),
+        "description": session_control_tool_description(enable_groups),
+        "input_schema": session_control_tool_parameters_for_features(enable_groups),
     })
 }
 
+#[allow(dead_code)] // Compatibility wrapper; runtime callers pass the feature flag explicitly.
 pub(crate) fn session_control_tool_definition_ollama() -> serde_json::Value {
     session_control_tool_definition_openai()
 }
 
+pub(crate) fn session_control_tool_definition_ollama_for_features(
+    enable_groups: bool,
+) -> serde_json::Value {
+    session_control_tool_definition_openai_for_features(enable_groups)
+}
+
+#[allow(dead_code)] // Compatibility wrapper; runtime callers pass the feature flag explicitly.
 pub(crate) fn session_control_tool_definition_gemini() -> serde_json::Value {
+    session_control_tool_definition_gemini_for_features(true)
+}
+
+pub(crate) fn session_control_tool_definition_gemini_for_features(
+    enable_groups: bool,
+) -> serde_json::Value {
     json!({
         "name": TOOL_NAME_SESSION_CONTROL,
-        "description": session_control_tool_description(),
-        "parameters": gemini_tool_parameters(session_control_tool_parameters()),
+        "description": session_control_tool_description(enable_groups),
+        "parameters": gemini_tool_parameters(session_control_tool_parameters_for_features(enable_groups)),
     })
 }
 

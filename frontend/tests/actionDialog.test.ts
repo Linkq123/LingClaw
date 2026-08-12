@@ -61,6 +61,252 @@ describe('application action dialog', () => {
     expect(document.activeElement).toBe(document.getElementById('opener'));
   });
 
+  it('creates a Session bound to a browsed local directory', async () => {
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const browse = vi.fn().mockResolvedValue({
+      current: 'E:\\work\\project',
+      parent: 'E:\\work',
+      home: 'C:\\Users\\tester',
+      roots: ['C:\\', 'E:\\'],
+      directories: [{ name: 'src', path: 'E:\\work\\project\\src' }],
+    });
+    const resultPromise = openActionDialog({
+      kind: 'create-session',
+      initialName: 'Project',
+      initialWorkspace: { kind: 'managed' },
+      browse,
+      submit,
+    });
+    await Promise.resolve();
+
+    const directoryMode = document.querySelector<HTMLInputElement>(
+      '.action-dialog-workspace-mode input[value="directory"]',
+    )!;
+    directoryMode.checked = true;
+    directoryMode.dispatchEvent(new Event('change', { bubbles: true }));
+    document.querySelector<HTMLButtonElement>('.action-dialog-workspace-browse')?.click();
+    await vi.waitFor(() =>
+      expect(document.querySelector<HTMLInputElement>('#action-dialog-workspace-path')?.value).toBe(
+        'E:\\work\\project',
+      ),
+    );
+    expect(document.querySelector('.action-dialog-workspace-directory')?.textContent).toBe('src');
+    expect(document.querySelector('.action-dialog-workspace-nav')?.textContent).toContain('Home');
+    document
+      .querySelector<HTMLFormElement>('.action-dialog-form')
+      ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await expect(resultPromise).resolves.toEqual({
+      kind: 'create-session',
+      name: 'Project',
+      workspace: { kind: 'directory', path: 'E:\\work\\project' },
+    });
+    expect(submit).toHaveBeenCalledWith({
+      name: 'Project',
+      workspace: { kind: 'directory', path: 'E:\\work\\project' },
+    });
+  });
+
+  it('validates and submits a manually edited workspace path', async () => {
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const browse = vi.fn(async (path?: string) => {
+      const current = path || 'E:\\work\\project';
+      return {
+        current,
+        parent: 'E:\\work',
+        home: 'C:\\Users\\tester',
+        roots: ['C:\\', 'E:\\'],
+        directories: [],
+      };
+    });
+    const resultPromise = openActionDialog({
+      kind: 'edit-session',
+      sessionId: 'project',
+      initialName: 'Project',
+      initialWorkspace: { kind: 'directory', path: 'E:\\work\\project' },
+      browse,
+      submit,
+    });
+    await vi.waitFor(() => expect(browse).toHaveBeenCalledWith('E:\\work\\project'));
+
+    const pathInput = document.querySelector<HTMLInputElement>('#action-dialog-workspace-path')!;
+    pathInput.value = 'E:\\work\\another-project';
+    pathInput.dispatchEvent(new Event('input', { bubbles: true }));
+    document
+      .querySelector<HTMLFormElement>('.action-dialog-form')
+      ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await expect(resultPromise).resolves.toEqual({
+      kind: 'edit-session',
+      name: 'Project',
+      workspace: { kind: 'directory', path: 'E:\\work\\another-project' },
+    });
+    expect(browse).toHaveBeenLastCalledWith('E:\\work\\another-project');
+    expect(submit).toHaveBeenCalledWith({
+      name: 'Project',
+      workspace: { kind: 'directory', path: 'E:\\work\\another-project' },
+    });
+  });
+
+  it('requires an explicit confirmation for a disk root', async () => {
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const resultPromise = openActionDialog({
+      kind: 'edit-session',
+      sessionId: 'project',
+      initialName: 'Project',
+      initialWorkspace: { kind: 'directory', path: 'E:\\' },
+      browse: vi.fn(),
+      submit,
+    });
+    await Promise.resolve();
+    document
+      .querySelector<HTMLFormElement>('.action-dialog-form')
+      ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    expect(document.querySelector('.action-dialog-error')?.textContent).toContain(
+      'Confirm the broad directory',
+    );
+    await vi.waitFor(() =>
+      expect(document.activeElement).toBe(
+        document.querySelector<HTMLInputElement>('#action-dialog-workspace-path'),
+      ),
+    );
+    const confirm = document.querySelector<HTMLInputElement>(
+      '.action-dialog-workspace-warning input',
+    )!;
+    confirm.checked = true;
+    confirm.dispatchEvent(new Event('change', { bubbles: true }));
+    document
+      .querySelector<HTMLFormElement>('.action-dialog-form')
+      ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await expect(resultPromise).resolves.toMatchObject({
+      kind: 'edit-session',
+      workspace: { kind: 'directory', path: 'E:\\' },
+    });
+  });
+
+  it('requires an explicit confirmation for the browsed user home', async () => {
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const browse = vi.fn().mockResolvedValue({
+      current: 'C:\\Users\\tester',
+      parent: 'C:\\Users',
+      home: 'C:\\Users\\tester',
+      roots: ['C:\\'],
+      directories: [],
+    });
+    const resultPromise = openActionDialog({
+      kind: 'edit-session',
+      sessionId: 'home-project',
+      initialName: 'Home project',
+      initialWorkspace: { kind: 'directory', path: 'C:\\Users\\tester' },
+      browse,
+      submit,
+    });
+    await Promise.resolve();
+
+    await vi.waitFor(() => expect(browse).toHaveBeenCalledOnce());
+    const pathInput = document.querySelector<HTMLInputElement>('#action-dialog-workspace-path')!;
+    pathInput.value = 'C:\\Users\\tester\\';
+    pathInput.dispatchEvent(new Event('input', { bubbles: true }));
+    document
+      .querySelector<HTMLFormElement>('.action-dialog-form')
+      ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    expect(document.querySelector('.action-dialog-error')?.textContent).toContain(
+      'Confirm the broad directory',
+    );
+    expect(submit).not.toHaveBeenCalled();
+    forceDismissActionDialog();
+    await expect(resultPromise).resolves.toBeNull();
+  });
+
+  it('blocks submit while user-home metadata is still loading', async () => {
+    let resolveBrowse!: (value: {
+      current: string;
+      parent: string;
+      home: string;
+      roots: string[];
+      directories: never[];
+    }) => void;
+    const browse = vi.fn().mockReturnValue(
+      new Promise((resolve) => {
+        resolveBrowse = resolve;
+      }),
+    );
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const resultPromise = openActionDialog({
+      kind: 'edit-session',
+      sessionId: 'home-project',
+      initialName: 'Home project',
+      initialWorkspace: { kind: 'directory', path: 'C:\\Users\\tester' },
+      browse,
+      submit,
+    });
+    await Promise.resolve();
+
+    const form = document.querySelector<HTMLFormElement>('.action-dialog-form')!;
+    const submitButton = document.querySelector<HTMLButtonElement>('.action-dialog-submit')!;
+    expect(submitButton.disabled).toBe(true);
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+    expect(submit).not.toHaveBeenCalled();
+
+    resolveBrowse({
+      current: 'C:\\Users\\tester',
+      parent: 'C:\\Users',
+      home: 'C:\\Users\\tester',
+      roots: ['C:\\'],
+      directories: [],
+    });
+    await vi.waitFor(() =>
+      expect(document.querySelector('.action-dialog-workspace-warning')).not.toBeNull(),
+    );
+    expect(document.querySelector<HTMLButtonElement>('.action-dialog-submit')?.disabled).toBe(
+      false,
+    );
+    expect(submit).not.toHaveBeenCalled();
+
+    forceDismissActionDialog();
+    await expect(resultPromise).resolves.toBeNull();
+  });
+
+  it('allows name-only edits when the existing workspace is unavailable', async () => {
+    const submit = vi.fn().mockResolvedValue(undefined);
+    const browse = vi.fn().mockRejectedValue(new Error('directory is missing'));
+    const resultPromise = openActionDialog({
+      kind: 'edit-session',
+      sessionId: 'missing-project',
+      initialName: 'Missing project',
+      initialWorkspace: { kind: 'directory', path: 'E:\\work\\missing-project' },
+      browse,
+      submit,
+    });
+
+    await vi.waitFor(() =>
+      expect(document.querySelector('.action-dialog-error')?.textContent).toContain(
+        'directory is missing',
+      ),
+    );
+    expect(document.querySelector<HTMLButtonElement>('.action-dialog-submit')?.disabled).toBe(
+      false,
+    );
+
+    const nameInput = document.querySelector<HTMLInputElement>('.action-dialog-field input')!;
+    nameInput.value = 'Renamed project';
+    nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+    document
+      .querySelector<HTMLFormElement>('.action-dialog-form')
+      ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+    await expect(resultPromise).resolves.toEqual({
+      kind: 'edit-session',
+      name: 'Renamed project',
+      workspace: { kind: 'directory', path: 'E:\\work\\missing-project' },
+    });
+    expect(submit).toHaveBeenCalledWith({
+      name: 'Renamed project',
+      workspace: { kind: 'directory', path: 'E:\\work\\missing-project' },
+    });
+  });
+
   it('validates group members, excludes Main, and returns typed member ids', async () => {
     const submit = vi.fn().mockResolvedValue(undefined);
     const resultPromise = openActionDialog({

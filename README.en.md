@@ -77,6 +77,15 @@ The first launch opens the Setup Wizard. Before regular chat is enabled, configu
 
 LingClaw never silently starts a regular agent run with a built-in fallback model. After configuration and startup, open [http://127.0.0.1:18989](http://127.0.0.1:18989).
 
+You can also open the terminal workspace directly from a project directory:
+
+```bash
+cd /path/to/project
+lingclaw tui
+```
+
+`lingclaw tui [PATH]` reuses a running local service or starts the daemon automatically. It restores sessions bound to the normalized directory, offers to create a directory workspace named after the folder when none exists, and presents a chooser when several sessions match. If no usable model exists, an in-terminal wizard configures a Provider, model, and primary Agent while masking the API key throughout. The daemon keeps running after the TUI exits.
+
 The composer distinguishes each recovery path:
 
 - When no provider or model is configured, it opens Settings → Models.
@@ -98,7 +107,7 @@ lingclaw db status
 lingclaw db backup
 ```
 
-Sessions, groups, messages, todos, usage, and sub-agent snapshots live in `~/.lingclaw/lingclaw.db`. On upgrade from the JSON store, LingClaw validates and migrates the old `sessions/` and `groups/` directories before opening its listener. The originals remain permanently under `~/.lingclaw/backups/sqlite-migration-*/`; LingClaw does not dual-write them.
+Sessions, groups, messages, todos, usage, working-directory bindings, and sub-agent snapshots live in `~/.lingclaw/lingclaw.db`. On upgrade from the JSON store, LingClaw validates and migrates the old `sessions/` and `groups/` directories before opening its listener. The originals remain permanently under `~/.lingclaw/backups/sqlite-migration-*/`; LingClaw does not dual-write them.
 
 See the [deployment guide](docs/deploy.en.md) for installation details, systemd, Docker, and reverse proxies.
 
@@ -122,9 +131,11 @@ The same session and tool system supports:
 
 Models use `provider/model` routing. Primary, Fast, Sub-agent, Memory, Reflection, and Context roles can use different models. A regular session can search and atomically switch its model and allowed Thinking Effort directly in the composer; the choice persists, while `/model` and `/think` remain compatible.
 
-### Isolate context with sessions and collaborate through groups
+### Bind sessions to projects and collaborate through groups
 
-Each session owns its workspace, prompt files, history, todos, memory, and capability settings. Groups organize multiple sessions into a shared conversation with broadcast, selected-target, and precise `@session-id` modes. The UI shows friendly names while the protocol keeps stable IDs.
+Each session has a private LingClaw `session_home` for prompts, memory, skills, agents, and policy. File, shell, Git, image, and Plan-evidence operations use a rebindable `working_directory`. The managed default remains `~/.lingclaw/<session-id>/workspace/`, or a session can bind to an existing project directory. Deleting a session removes its database record and private home, never the external project.
+
+Groups organize multiple sessions into a shared conversation with broadcast, selected-target, and precise `@session-id` modes. The UI shows friendly names while the protocol keeps stable IDs. Groups are off by default and require an explicit General setting; disabling and re-enabling the feature preserves all existing data.
 
 ### Extend capabilities with built-in tools, MCP, and skills
 
@@ -160,6 +171,14 @@ The group context bar provides All, Selected, and @mention dispatch modes. Main 
 
 Session navigation becomes a full-screen drawer on phones, and tool details become a bottom sheet. The two-level composer separates multiline content from attachments, model/Effort, Plan, stop, and send actions; when images are unavailable, the `+` menu still explains why. Critical touch targets remain at least 44px, with keyboard navigation, focus return, and reduced-motion support intact.
 
+### A terminal workspace on the same runtime
+
+`lingclaw tui [PATH]` uses the existing HTTP/WebSocket protocol for session/workspace navigation, streaming chat, Plan, execution events, models, skills, MCP, Usage, Settings, todos, and the optional Groups page. Wide terminals use three columns, medium terminals use two, and narrow terminals switch to a single page. Settings presents native fields for general switches, Agent routing, Provider connections, and S3; use `↑/↓` to select, `Space` to toggle, and `Enter` to edit. `Ctrl+P` opens the command palette, while `Ctrl+S` opens advanced Raw JSON through `$VISUAL`/`$EDITOR` or the built-in multiline editor. Default builds detect Kitty, Sixel, or iTerm2 for native image previews; unsupported terminals retain the image name, link, and system-viewer fallback.
+
+<p align="center">
+  <img src="docs/assets/readme/en/tui.webp" alt="LingClaw terminal workspace with a directory-backed session, chat, execution stack, and model Effort" width="100%">
+</p>
+
 ### Full-screen Console and visual Usage
 
 Settings and Usage live in a dedicated full-screen LingClaw Console that switches at the same level as the workspace. Desktop layouts use sidebar navigation, while narrow screens use a compact category picker. Switching categories preserves drafts in visited views, returning to the workspace restores focus, and transitions respect the system reduced-motion preference.
@@ -170,21 +189,23 @@ Models are presented as searchable cards with Provider and capability filters, w
 
 ```mermaid
 flowchart LR
-    UI["Browser UI"] <-->|"WebSocket / HTTP"| Runtime["LingClaw Runtime"]
+    UI["Browser UI / TUI"] <-->|"WebSocket / HTTP"| Runtime["LingClaw Runtime"]
     Runtime --> Loop["ReAct Agent Loop"]
     Loop --> Providers["Configured Model Providers"]
     Loop --> Tools["Built-in Tools"]
     Tools --> MCP["MCP Servers"]
     Runtime <--> DB["SQLite Core Storage"]
-    Runtime <--> Store["Local Session Workspaces"]
+    Runtime <--> Home["Private Session Homes"]
+    Loop <--> Project["Selected Working Directories"]
     Tools --> S3["Optional S3-compatible Storage"]
 ```
 
-- **Browser UI** — Responsive workspace for session navigation, streaming messages, and execution stacks, with Settings and Usage managed in the full-screen Console.
+- **Browser UI / TUI** — Share one protocol and runtime state. The browser provides a responsive workspace; the terminal opens directly from the current project directory.
 - **Runtime** — A single Rust process that manages WebSockets, configuration snapshots, concurrent sessions, group dispatch, and persistence.
 - **SQLite** — `~/.lingclaw/lingclaw.db` is the only persistent source for sessions, messages, todos, usage, sub-agent snapshots, and groups; configuration and workspace files remain on the filesystem.
 - **Agent Loop** — Selects a model, invokes tools, absorbs observations, and finishes within explicit phases and limits.
-- **Workspace** — Stored at `~/.lingclaw/<session-id>/workspace/` by default, containing prompts, skills, agents, and memory.
+- **Session Home** — Always under `~/.lingclaw/<session-id>/workspace/`, storing prompts, skills, agents, memory, and policy without writing templates into an external project.
+- **Working Directory** — The actual project root used by file, shell, Git, image, Plan-evidence, and MCP-root operations; it may be managed or bound to an existing absolute directory.
 
 See the [architecture guide](docs/architecture.en.md) for modules, provider conversion, security boundaries, and persistence.
 
@@ -194,17 +215,18 @@ See the [architecture guide](docs/architecture.en.md) for modules, provider conv
 |---|---|---|
 | Configuration and credentials | `~/.lingclaw/` | The whole file is not synchronized automatically; credentials are sent to the corresponding provider, MCP server, or S3 service for authentication |
 | Sessions, groups, messages, todos, and usage | `~/.lingclaw/lingclaw.db` | The database is not synchronized automatically; relevant content is sent to your selected provider when it enters model context |
-| Workspace prompts, skills, agents, and memory files | `~/.lingclaw/<session-id>/workspace/` | Sent to your selected provider when injected into model context |
+| Session Home prompts, skills, agents, and memory files | `~/.lingclaw/<session-id>/workspace/` | Sent to your selected provider when injected into model context |
+| Project working directory | An existing absolute directory selected by the user, or the managed Session Home | File content leaves the machine only when a tool reads it or root project rules are injected; deleting the session never deletes an external directory |
 | Prompts, conversations, and tool observations | Current session and runtime | Sent to your selected provider as model-request content |
 | User attachments and tool images | Optional S3-compatible storage | Uploaded only when S3 and image capability are enabled |
 | MCP data | The corresponding MCP server | Determined by the servers and tools you enable |
 
 - The web service binds to `127.0.0.1` by default and does not listen directly on a LAN or public interface.
-- Configuration, SQLite core data, and session workspaces stay under `~/.lingclaw/`; LingClaw does not automatically synchronize the complete archive.
-- Use `lingclaw db backup [PATH]` for a consistent live SQLite snapshot. A complete disaster-recovery backup must also include configuration, MCP authentication, and workspace files.
+- Configuration, SQLite core data, and private Session Homes stay under `~/.lingclaw/`; bound project directories remain at their user-selected locations. LingClaw does not automatically synchronize the complete archive.
+- Use `lingclaw db backup [PATH]` for a consistent live SQLite snapshot. A complete disaster-recovery backup must also include configuration, MCP authentication, private Session Homes, and any project directories that need protection.
 - Model requests may contain system prompts, conversation history, tool observations, and todo or memory content injected into context. This content is sent to the model providers you configure, whose data policies apply.
 - Local image uploads and tool-image feedback require optional S3-compatible storage. OpenAI and Anthropic require signed URLs reachable by the provider; Gemini and Ollama images are fetched by LingClaw locally.
-- File tools stay inside the current session workspace. Network tools perform SSRF checks and reject redirects. Command tools apply dangerous-command checks and timeouts.
+- File, shell, Git, image, and Plan tools stay inside the session `working_directory`. An external directory contributes only its root `AGENTS.md` (or `AGENT.md` fallback); LingClaw does not scan parents or write its templates there. Network tools perform SSRF checks and reject redirects, while command tools apply dangerous-command checks and timeouts.
 - MCP tools are controlled by the current session policy, and tools that may change external state can require confirmation.
 
 LingClaw can execute commands and edit workspace files. Review its tool permissions and protect credentials stored in `.lingclaw.json`, just as you would with any local development agent.
@@ -225,6 +247,8 @@ See [`.lingclaw.json.example`](.lingclaw.json.example) for the canonical modern 
 ## Development
 
 ### Backend
+
+Requires Rust 1.90 or newer.
 
 ```bash
 cargo fmt --check

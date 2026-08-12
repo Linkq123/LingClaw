@@ -239,6 +239,8 @@ fn load_legacy_sessions(dir: &Path) -> Result<Vec<Candidate<Session>>, StorageEr
         }
         crate::session_store::normalize_session(&mut session);
         session.workspace = crate::session_workspace_path(&session.id);
+        session.working_directory = session.workspace.clone();
+        session.workspace_kind = crate::SessionWorkspaceKind::Managed;
         Ok(Candidate {
             id: session.id.clone(),
             value: session,

@@ -14,16 +14,28 @@
 - Todos 快照
 - 模型覆盖
 - MCP 与系统 Skills 权限
-- `~/.lingclaw/<session-id>/workspace/` 工作区
-- 提示文件、Skills、Agents 和记忆
+- `~/.lingclaw/<session-id>/workspace/` 私有 Session Home
+- 可选的外部项目工作目录
+- 私有提示文件、Skills、Agents 和记忆
 
-创建 Session 时由后端生成 6 位英数字 ID。显示名称可以修改，但 ID、工作区路径和协议引用不会改变。删除 Session 是不可恢复操作：它会删除 Session 存档和整个 `~/.lingclaw/<session-id>/` 目录，包括工作区文件、提示、Skills、Agents 和记忆，并从所有 Group 中移除该成员。`main`、当前已连接或正在运行的 Session 不能删除。
+创建 Session 时由后端生成 6 位英数字 ID。显示名称和绑定的工作目录可以修改，但 ID、私有 Session Home 和协议引用不会改变。删除 Session 是不可恢复操作：它会删除 Session 存档和整个 `~/.lingclaw/<session-id>/` 私有目录，并从所有 Group 中移除该成员；绑定的外部项目目录永远不会被删除。`main`、当前已连接或正在运行的 Session 不能删除。
 
 会话导航按名称或 ID 搜索。最近区域最多显示 12 项，并始终包含 Main 和当前会话；其余内容收进“更早会话”。
 
-Session 的结构化状态不再保存为单独 JSON：消息、Todos、Usage、Sub-agent 快照和 Group 数据统一位于 `~/.lingclaw/lingclaw.db`。提示文件、Skills、Agents、Structured Memory 和普通 Markdown 仍保留在各自的 Workspace 中。首次从旧版启动时会自动迁移；旧 JSON 会移动到 `~/.lingclaw/backups/sqlite-migration-*/` 永久留存。
+Session 的结构化状态不再保存为单独 JSON：消息、Todos、Usage、工作目录绑定、Sub-agent 快照和 Group 数据统一位于 `~/.lingclaw/lingclaw.db`。提示文件、Skills、Agents、Structured Memory 和普通 Markdown 始终保留在私有 Session Home。首次从旧版启动时会自动迁移；旧 JSON 会移动到 `~/.lingclaw/backups/sqlite-migration-*/` 永久留存。
+
+### 工作目录
+
+Session 可使用两种工作目录：
+
+- **LingClaw 托管**：`working_directory` 与私有 Session Home 相同，保持旧版行为。
+- **本机目录**：绑定一个现存、绝对且可规范化的项目目录；该目录不能位于 LingClaw 私有数据目录 `~/.lingclaw/` 内。多个 Session 可以绑定同一目录。
+
+文件、Shell、Git、图片查看、Plan evidence 和 MCP roots 使用 `working_directory`；Persona、Memory、Skills、Agents、MCP policy 和缓存仍使用私有 Session Home。LingClaw 只读取外部项目根目录的 `AGENTS.md`，缺失时读取 `AGENT.md`，不扫描父目录，也不会在项目中创建模板或记忆文件。目录暂时不可用时仍能查看历史和修改 Session，但必须重绑后才能开始 Agent run。运行、排队任务或活动计划存在时不能重绑。
 
 ### Group
+
+Group 默认关闭，需要在 Settings → General 中启用 `settings.enableGroups`。关闭后工作台、TUI、API、WebSocket 和 Agent 都不会提供 Group 操作，但数据库中的既有群组、历史、成员和投票不会删除；重新启用即可恢复。
 
 Group 把多个 Session 组织为群聊。Main 负责治理，但不会作为普通 dispatch member 重复执行成员任务。群聊支持三种目标模式：
 
@@ -48,6 +60,47 @@ Provider 描述 API 端点和协议，Model 描述可用的模型 ID、上下文
 - `sub-agent-<name>`：特定 Sub-agent 覆盖
 
 Session 的 `/model` 覆盖只影响该 Session，并优先于全局 `primary`。无效覆盖不会静默回退。
+
+## 终端工作台（TUI）
+
+在项目目录运行 `lingclaw tui`，或显式运行：
+
+```text
+lingclaw tui [PATH] [--session ID] [--port PORT] [--lang auto|zh-CN|en] [--theme auto|dark|light]
+```
+
+PATH 省略时使用当前目录。无匹配 Session 时会确认创建目录工作空间；一个匹配直接恢复；多个匹配显示选择器。`--session` 可直接打开指定 Session，与显式 PATH 同时使用时必须属于同一个规范化目录。TUI 会复用已有 daemon；服务未运行时自动启动，退出 TUI 不会停止 daemon。首次缺少模型配置时会先显示 TUI 原生引导，依次配置 Provider、Base URL、隐藏输入的 API Key、模型和主 Agent，然后再启动 daemon。
+
+TUI 与 WebUI 使用相同 HTTP/WebSocket 协议，提供流式对话、Plan、Execution、Todos、模型、Skills、MCP、Usage、Settings 和可选 Group 页面。宽度不少于 120 列时显示导航/对话/Inspector 三栏，80–119 列为双栏，更窄时为单页。Settings 原生展示常规开关、Agent 路由、Provider 连接和 S3 字段；Raw JSON 仅作为高级入口，优先使用 `$VISUAL` 或 `$EDITOR`（支持固定参数，例如 `code --wait`），均未配置时使用内置多行编辑器。默认构建会自动检测 Kitty、Sixel 或 iTerm2 原生图片协议；不支持时显示名称、链接并允许用系统查看器打开。
+
+常用按键：`Tab` / `Shift+Tab` 切换焦点，`Enter` 发送，`Alt+Enter` 或 `Ctrl+J` 换行，`Ctrl+P` 打开命令面板，`Ctrl+S` 打开高级 Raw JSON，`?` 显示帮助。运行时第一次 `Ctrl+C` 停止，空闲时连续两次 `Ctrl+C` 退出。Models 页用 `↑/↓` 选择模型、`←/→` 选择 Effort、`Enter` 原子应用；Skills/MCP 页用 `Space` 切换当前项；Todos 页用 `Space/Delete/A` 更新、删除或新增；Settings 页用 `↑/↓` 选择字段、`Space` 切换布尔项、`Enter` 编辑文本或数值，并可在这些数据页按 `R` 重新加载。Plan 页使用 `E/R/F/D` 执行、恢复、刷新或丢弃，`V` 输入修订意见；证据变化时，`X` 会显示二次确认并携带服务端签发的确认令牌执行。`/attach PATH` 添加图片，`/target all|mentions|id[,id]` 设置 Group 目标。
+
+TUI 同样消费进程级 `storage_status`。进入存储保护模式后，标题和 Composer 会持续显示警告，尚未被 Runtime 接受的草稿会恢复；消息、图片、Plan、Session、Group 和 Todo 写操作被禁用，但读取、导航和独立配置保存仍然可用。
+
+TUI 的本地管理命令直接调用同一 HTTP API，不会生成聊天消息：
+
+```text
+/session create managed | NAME
+/session create ABSOLUTE_PATH | NAME
+/session rename NAME
+/session rebind managed|ABSOLUTE_PATH
+/session find TEXT
+/session switch ID
+/session delete ID
+
+/group create NAME | MEMBER_ID[,MEMBER_ID]
+/group switch ID
+/group rename NAME
+/group members MEMBER_ID[,MEMBER_ID]
+/group promote MEMBER_ID
+/group remove MEMBER_ID
+/group delete
+
+/mcp oauth SERVER
+/mcp disconnect SERVER
+```
+
+删除当前 Session 前需先切换到另一个 Session；`main` 不可删除。Group 命令只在 `settings.enableGroups=true` 时可用。模型/Effort、Plan、Todos、Skills 等既有 Slash Command 继续通过共享 WebSocket 协议执行。
 
 ## 工作台
 

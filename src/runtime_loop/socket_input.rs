@@ -161,19 +161,28 @@ pub(crate) async fn ensure_session_ready(
         .unwrap_or(&session_id)
         .to_string();
 
-    {
-        let mut sessions = state.sessions.lock().await;
-        if let Some(existing_session_id) = sessions
+    let existing_session = {
+        let sessions = state.sessions.lock().await;
+        sessions
             .keys()
             .find(|existing_id| crate::session_ids_match(existing_id, &effective_session_id))
             .cloned()
-        {
-            let session = sessions
-                .get_mut(&existing_session_id)
-                .expect("existing session id should still be present");
-            refresh_session_system_prompt(state, session);
-            return Ok((existing_session_id, false));
+            .and_then(|existing_session_id| {
+                sessions
+                    .get(&existing_session_id)
+                    .cloned()
+                    .map(|session| (existing_session_id, session))
+            })
+    };
+    if let Some((existing_session_id, session_snapshot)) = existing_session {
+        let sys =
+            crate::session_store::build_refreshed_session_system_prompt(state, &session_snapshot)
+                .await;
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&existing_session_id) {
+            crate::session_store::replace_session_system_prompt(session, sys);
         }
+        return Ok((existing_session_id, false));
     }
 
     let config = state.config();
@@ -241,7 +250,8 @@ pub(crate) async fn ensure_session_ready(
                 (session, true)
             }
         };
-    refresh_session_system_prompt(state, &mut session);
+    let sys = crate::session_store::build_refreshed_session_system_prompt(state, &session).await;
+    crate::session_store::replace_session_system_prompt(&mut session, sys);
 
     if created_fresh
         && let Err(error) = crate::session_store::save_session_to_disk_locked(&session).await
@@ -517,6 +527,28 @@ fn build_plan_feedback_text(
     Ok(sections.join("\n\n"))
 }
 
+async fn reject_unavailable_run_workspace(
+    state: &AppState,
+    current_session_id: &str,
+    tx: &WsTx,
+) -> bool {
+    match super::agent_run_workspace_available(state, current_session_id).await {
+        Some(true) | None => return false,
+        Some(false) => {}
+    }
+    ws_send(
+        tx,
+        &json!({
+            "type":"error",
+            "code":"workspace_unavailable",
+            "content":"The Session working directory is unavailable. Rebind it before starting an Agent run.",
+            "dismissible":true,
+        }),
+    )
+    .await;
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_plan_action(
     action: PlanActionPayload,
@@ -533,7 +565,7 @@ pub(super) async fn handle_plan_action(
             session
                 .pending_plan
                 .as_ref()
-                .map(|plan| (plan.clone(), session.workspace.clone()))
+                .map(|plan| (plan.clone(), session.working_directory.clone()))
         })
     };
     let Some((plan_snapshot, workspace)) = snapshot else {
@@ -747,6 +779,9 @@ pub(super) async fn handle_plan_action(
     else {
         return IdleSocketInputAction::Continue;
     };
+    if reject_unavailable_run_workspace(state, current_session_id, tx).await {
+        return IdleSocketInputAction::Continue;
+    }
     let Some(mut reservation) = super::try_reserve_agent_run(
         state,
         current_session_id,
@@ -1540,6 +1575,10 @@ pub(crate) async fn handle_idle_socket_input(
         return IdleSocketInputAction::Continue;
     }
 
+    if reject_unavailable_run_workspace(state, current_session_id, tx).await {
+        return IdleSocketInputAction::Continue;
+    }
+
     let Some(reservation) = super::try_reserve_agent_run(
         state,
         current_session_id,
@@ -1951,7 +1990,7 @@ async fn build_busy_command_events(
         events.push(payload);
     }
     if result.session_list_changed {
-        match crate::socket_sync::build_session_list_payload(state) {
+        match crate::socket_sync::build_session_list_payload(state).await {
             Ok(payload) => events.push(payload),
             Err(_) => events.push(json!({
                 "type": "storage_status",

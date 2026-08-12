@@ -82,6 +82,8 @@ fn basic_session(id: &str, name: &str) -> crate::Session {
         todos: crate::todos::TodoSnapshot::empty(20),
         pending_plan: None,
         version: crate::SESSION_VERSION,
+        working_directory: (PathBuf::new()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: PathBuf::new(),
     }
 }
@@ -276,6 +278,8 @@ fn create_current_database(path: &Path) {
                 VALUES (4, 'plan_initial_submission_marker', 1);
             INSERT INTO schema_migrations(version, name, applied_at)
                 VALUES (5, 'plan_stale_override_audit', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (6, 'session_working_directories', 1);
             "#,
         )
         .expect("migration ledger should initialize");
@@ -287,11 +291,25 @@ fn create_current_database(path: &Path) {
         .expect("schema version should initialize");
 }
 
+fn remove_v6_session_workspace_schema(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            r#"
+            DROP INDEX idx_sessions_working_directory;
+            ALTER TABLE sessions DROP COLUMN working_directory_key;
+            ALTER TABLE sessions DROP COLUMN working_directory;
+            ALTER TABLE sessions DROP COLUMN workspace_kind;
+            "#,
+        )
+        .expect("pre-v6 Session schema should initialize");
+}
+
 fn create_v1_plan_database(path: &Path, include_assistant_message: bool) {
     let connection = rusqlite::Connection::open(path).expect("test database should open");
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v6_session_workspace_schema(&connection);
     connection
         .execute_batch(
             r#"
@@ -359,6 +377,7 @@ fn create_v2_plan_database(path: &Path) {
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v6_session_workspace_schema(&connection);
     connection
         .execute_batch(
             r#"
@@ -385,6 +404,7 @@ fn create_v3_plan_database(path: &Path) {
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v6_session_workspace_schema(&connection);
     connection
         .execute_batch(
             r#"
@@ -412,6 +432,7 @@ fn create_v4_plan_database(path: &Path) {
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v6_session_workspace_schema(&connection);
     connection
         .execute_batch(
             r#"
@@ -432,6 +453,47 @@ fn create_v4_plan_database(path: &Path) {
         .expect("application id should initialize");
     connection
         .pragma_update(None, "user_version", 4)
+        .expect("schema version should initialize");
+}
+
+fn create_v5_database(path: &Path, session_id: &str) {
+    let connection = rusqlite::Connection::open(path).expect("test database should open");
+    connection
+        .execute_batch(schema::INITIAL_SCHEMA)
+        .expect("base schema should initialize");
+    remove_v6_session_workspace_schema(&connection);
+    connection
+        .execute(
+            r#"INSERT INTO sessions(
+                id, name, created_at, updated_at, tool_calls_count, model_override,
+                think_level, show_react, show_tools, show_reasoning,
+                visible_message_count, version
+            ) VALUES (?1, 'Pre-v6 Session', 1, 2, 0, NULL,
+                      'medium', 1, 1, 1, 0, 7)"#,
+            [session_id],
+        )
+        .expect("pre-v6 Session should insert");
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (1, 'initial_core_storage', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (2, 'plan_lifecycle', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (3, 'durable_plan_feedback', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (4, 'plan_initial_submission_marker', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (5, 'plan_stale_override_audit', 1);
+            "#,
+        )
+        .expect("v5 migration ledger should initialize");
+    connection
+        .pragma_update(None, "application_id", schema::APPLICATION_ID)
+        .expect("application id should initialize");
+    connection
+        .pragma_update(None, "user_version", 5)
         .expect("schema version should initialize");
 }
 
@@ -696,6 +758,7 @@ async fn schema_v2_migration_adds_durable_plan_feedback() {
             (3, "durable_plan_feedback".to_string()),
             (4, "plan_initial_submission_marker".to_string()),
             (5, "plan_stale_override_audit".to_string()),
+            (6, "session_working_directories".to_string()),
         ]
     );
 
@@ -789,6 +852,148 @@ async fn schema_v4_migration_adds_plan_stale_override_audit() {
     assert_eq!(version, schema::SCHEMA_VERSION);
     assert_eq!(override_default, None);
     assert_eq!(migration_name, "plan_stale_override_audit");
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_v5_migration_backfills_managed_working_directories() {
+    let home = temp_home("schema-v5-working-directories");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    let session_id = format!("pre-v6-{}", TEMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+    create_v5_database(&path, &session_id);
+
+    let database = Database::open(path.clone())
+        .await
+        .expect("v5 database should migrate");
+    let row = database
+        .read({
+            let session_id = session_id.clone();
+            move |connection| {
+                connection
+                    .query_row(
+                        "SELECT workspace_kind, working_directory, working_directory_key FROM sessions WHERE id=?1",
+                        [&session_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .map_err(StorageError::from)
+            }
+        })
+        .await
+        .expect("migrated workspace fields should be readable");
+    let expected = crate::session_workspace_path(&session_id);
+    assert_eq!(row.0, "managed");
+    assert_eq!(PathBuf::from(&row.1), expected);
+    assert_eq!(row.2, crate::working_directory_key(&expected).unwrap());
+
+    let backups = std::fs::read_dir(home.join("backups"))
+        .expect("schema backup directory should exist")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("schema backups should be readable");
+    assert!(backups.iter().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("lingclaw-schema-v5-")
+    }));
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn reopening_a_restored_database_reindexes_managed_working_directories() {
+    let home = temp_home("managed-workspace-reindex");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    let database = Database::open(path.clone()).await.unwrap();
+    database
+        .save_session(&basic_session("main", "Main"))
+        .await
+        .unwrap();
+    database
+        .call(|connection| {
+            connection.execute(
+                "UPDATE sessions SET working_directory='Z:/old-home/main/workspace', working_directory_key='z:/old-home/main/workspace' WHERE id='main'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    drop(database);
+
+    let reopened = Database::open(path).await.unwrap();
+    let expected = crate::session_workspace_path("main");
+    let expected_text = expected.to_str().unwrap().to_string();
+    let expected_key = crate::working_directory_key(&expected).unwrap();
+    let row = reopened
+        .read(|connection| {
+            connection
+                .query_row(
+                    "SELECT working_directory, working_directory_key FROM sessions WHERE id='main'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(StorageError::from)
+        })
+        .await
+        .unwrap();
+    assert_eq!(row, (expected_text, expected_key.clone()));
+
+    let summaries = reopened
+        .list_session_summaries_for_working_directory(&expected_key)
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, "main");
+
+    drop(reopened);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn workspace_lookup_uses_the_normalized_directory_key() {
+    let (home, database) = open_temp_database("workspace-lookup").await;
+    let first_directory = home.join("project-a");
+    let second_directory = home.join("project-b");
+    std::fs::create_dir_all(&first_directory).unwrap();
+    std::fs::create_dir_all(&second_directory).unwrap();
+    let first_directory = crate::normalize_working_directory(&first_directory).unwrap();
+    let second_directory = crate::normalize_working_directory(&second_directory).unwrap();
+
+    let mut first = basic_session("workspace-a", "Workspace A");
+    first.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    first.workspace = home.join("private-a");
+    first.working_directory = first_directory.clone();
+    let mut second = basic_session("workspace-b", "Workspace B");
+    second.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    second.workspace = home.join("private-b");
+    second.working_directory = second_directory;
+    database.save_session(&first).await.unwrap();
+    database.save_session(&second).await.unwrap();
+
+    let summaries = database
+        .list_session_summaries_for_working_directory(
+            &crate::working_directory_key(&first_directory).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|summary| summary.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["workspace-a"]
+    );
 
     drop(database);
     remove_home(&home);
@@ -3443,6 +3648,11 @@ async fn invalid_session_top_level_fields_enter_sticky_protected_mode() {
             "show-reasoning",
             "UPDATE sessions SET show_reasoning=3 WHERE id='main'",
             "Invalid persisted session show_reasoning flag",
+        ),
+        (
+            "relative-working-directory",
+            "UPDATE sessions SET workspace_kind='directory', working_directory='relative/project', working_directory_key='relative/project' WHERE id='main'",
+            "non-absolute external working directory",
         ),
     ];
 

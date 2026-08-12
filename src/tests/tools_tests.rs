@@ -36,6 +36,7 @@ fn test_config() -> Config {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     }
 }
 
@@ -1006,6 +1007,42 @@ fn view_image_is_only_added_to_definitions_and_prompts_conditionally() {
     let with = render_read_only_tool_prompt_lines_with_view_image(&test_config(), true);
     assert!(!without.contains(TOOL_NAME_VIEW_IMAGE));
     assert!(with.contains(TOOL_NAME_VIEW_IMAGE));
+}
+
+#[test]
+fn disabled_groups_are_absent_from_the_session_control_contract() {
+    let schema = session_control_tool_parameters_for_features(false);
+    let properties = schema["properties"]
+        .as_object()
+        .expect("session_control properties");
+    let actions = schema["properties"]["action"]["enum"]
+        .as_array()
+        .expect("session_control action enum");
+
+    assert!(actions.iter().all(|action| {
+        !matches!(
+            action.as_str(),
+            Some(
+                "list_groups"
+                    | "create_group"
+                    | "update_group"
+                    | "delete_group"
+                    | "promote_group_admin"
+                    | "remove_group_member"
+                    | "post_group_message"
+                    | "collect"
+            )
+        )
+    }));
+    assert!(!properties.contains_key("group_id"));
+    assert!(!properties.contains_key("members"));
+    assert!(!properties.contains_key("requester_session_id"));
+
+    let definition = session_control_tool_definition_openai_for_features(false);
+    let advertised = definition.to_string().to_ascii_lowercase();
+    assert!(!advertised.contains("group chat"));
+    assert!(!advertised.contains("create_group"));
+    assert!(!advertised.contains("group_id"));
 }
 
 #[test]

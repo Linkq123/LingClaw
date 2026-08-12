@@ -1002,3 +1002,73 @@ fn prompt_cache_signature_is_metadata_only() {
     );
     let _ = fs::remove_dir_all(&workspace);
 }
+
+#[test]
+fn external_workspace_rules_are_root_only_and_do_not_replace_private_persona() {
+    let root = std::env::temp_dir().join(format!("lingclaw-project-rules-{}", std::process::id()));
+    let session_home = root.join("private");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("nested")).unwrap();
+    fs::create_dir_all(&session_home).unwrap();
+    fs::write(session_home.join("AGENTS.md"), "private persona rule").unwrap();
+    fs::write(project.join("AGENT.md"), "root project rule").unwrap();
+    fs::write(
+        project.join("nested/AGENTS.md"),
+        "nested rule must not load",
+    )
+    .unwrap();
+
+    let persona = load_persona(&session_home);
+    let project_rules = load_project_rules(&project, &session_home);
+
+    assert!(persona.contains("private persona rule"));
+    assert!(project_rules.contains("root project rule"));
+    assert!(!project_rules.contains("nested rule must not load"));
+    assert!(project_rules.contains("cannot override LingClaw safety"));
+    assert!(!project.join("AGENTS.md").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn external_workspace_rules_can_be_preloaded_without_blocking_the_runtime_worker() {
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-project-rules-async-{}",
+        std::process::id()
+    ));
+    let session_home = root.join("private");
+    let project = root.join("project");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&session_home).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("AGENTS.md"), "async project rule").unwrap();
+
+    let project_rules = load_project_rules_async(&project, &session_home).await;
+
+    assert!(project_rules.contains("async project rule"));
+    assert!(project_rules.contains("cannot override LingClaw safety"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn external_workspace_rules_do_not_follow_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-project-rules-symlink-{}",
+        std::process::id()
+    ));
+    let session_home = root.join("private");
+    let project = root.join("project");
+    let outside = root.join("outside-rules.md");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&session_home).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(&outside, "must not leave the selected project").unwrap();
+    symlink(&outside, project.join("AGENTS.md")).unwrap();
+
+    let project_rules = load_project_rules(&project, &session_home);
+
+    assert!(project_rules.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}

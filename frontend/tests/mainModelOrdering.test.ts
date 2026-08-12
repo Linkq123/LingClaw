@@ -90,7 +90,11 @@ describe('main model payload ordering', () => {
         if (url === '/api/client-config') {
           uploadTokenFetchCount += 1;
           return Promise.resolve(
-            jsonResponse({ upload_token: 'upload-token', s3_config_id: clientS3ConfigId }),
+            jsonResponse({
+              upload_token: 'upload-token',
+              s3_config_id: clientS3ConfigId,
+              features: { groups: true },
+            }),
           );
         }
         if (url.startsWith('/api/session-group?group=')) {
@@ -118,6 +122,7 @@ describe('main model payload ordering', () => {
     await import('../src/main.js');
     stateModule = await import('../src/state.js');
     composerModule = await import('../src/composerAvailability.js');
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
     socket = FakeWebSocket.instances.at(-1)!;
     await vi.waitFor(() => expect(stateModule.state.composerConfigRevision).toBe(100));
     socket.onopen?.();
@@ -580,8 +585,9 @@ describe('main model payload ordering', () => {
     const createButton = stateModule.dom.sessionDrawerNewBtn!;
     createButton.disabled = false;
     createButton.click();
+    document.querySelector<HTMLButtonElement>('.action-dialog-submit')?.click();
 
-    expect(stateModule.state.sessionIdentityMutationInFlight).toBe(true);
+    await vi.waitFor(() => expect(stateModule.state.sessionIdentityMutationInFlight).toBe(true));
     expect(stateModule.state.sessionSwitchInFlight).toBe(false);
     expect(createButton.disabled).toBe(true);
     expect(stateModule.dom.attachBtn?.disabled).toBe(false);
@@ -646,7 +652,8 @@ describe('main model payload ordering', () => {
     stateModule.state.composerSessionTransitionPending = false;
     stateModule.dom.sessionDrawerNewBtn!.disabled = false;
     stateModule.dom.sessionDrawerNewBtn!.click();
-    expect(stateModule.state.sessionIdentityMutationInFlight).toBe(true);
+    document.querySelector<HTMLButtonElement>('.action-dialog-submit')?.click();
+    await vi.waitFor(() => expect(stateModule.state.sessionIdentityMutationInFlight).toBe(true));
 
     composerModule.beginComposerSessionTransition(false, 'main');
     stateModule.state.sessionSwitchInFlight = true;

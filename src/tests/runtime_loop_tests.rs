@@ -40,6 +40,7 @@ fn test_config() -> Config {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     }
 }
 
@@ -275,6 +276,53 @@ async fn recv_json_with_timeout(rx: &mut tokio::sync::mpsc::Receiver<String>) ->
         .expect("timed out waiting for message")
         .expect("channel closed before message arrived");
     serde_json::from_str(&payload).expect("payload json")
+}
+
+#[tokio::test]
+async fn initial_session_sync_omits_group_discovery_when_groups_are_disabled() {
+    let mut config = test_config();
+    config.enable_groups = false;
+    let state = test_app_state_with_config(config);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(
+            MAIN_SESSION_ID.to_string(),
+            test_session(MAIN_SESSION_ID, "Main", None),
+        );
+    }
+
+    send_existing_session_payloads(&tx, &state, MAIN_SESSION_ID).await;
+
+    let events = [
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+    ];
+    let event_types = events
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        [
+            "session",
+            "view_state",
+            "todos_state",
+            "history",
+            "feature_status"
+        ]
+    );
+    assert_eq!(events[4]["features"]["groups"], false);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "disabled Group discovery must not emit an additional WebSocket payload"
+    );
 }
 
 #[tokio::test]
@@ -1507,6 +1555,7 @@ async fn handle_idle_socket_input_reports_changed_plan_evidence_before_execution
 
     let mut session = test_session(&session_id, "Plan Stale Confirmation", None);
     session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
     session.pending_plan = Some(crate::PendingPlan {
         id: "plan_evidence".into(),
         revision: 2,
@@ -2073,13 +2122,20 @@ async fn handle_idle_socket_input_broadcasts_session_list_when_session_set_chang
 
     assert!(matches!(action, IdleSocketInputAction::Continue));
 
-    let current_events = [
-        recv_json_with_timeout(&mut rx).await,
-        recv_json_with_timeout(&mut rx).await,
-        recv_json_with_timeout(&mut rx).await,
-        recv_json_with_timeout(&mut rx).await,
-        recv_json_with_timeout(&mut rx).await,
-    ];
+    let mut current_events = Vec::new();
+    for _ in 0..8 {
+        current_events.push(recv_json_with_timeout(&mut rx).await);
+        let current_types = current_events
+            .iter()
+            .filter_map(|payload| payload["type"].as_str())
+            .collect::<HashSet<_>>();
+        if ["system", "session", "session_list"]
+            .into_iter()
+            .all(|event_type| current_types.contains(event_type))
+        {
+            break;
+        }
+    }
     let current_types = current_events
         .iter()
         .map(|payload| payload["type"].as_str().unwrap_or_default().to_string())
@@ -2415,6 +2471,7 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -2424,6 +2481,7 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
     assert!(current_types.contains(&"view_state".to_string()));
     assert!(current_types.contains(&"todos_state".to_string()));
     assert!(current_types.contains(&"history".to_string()));
+    assert!(current_types.contains(&"feature_status".to_string()));
     assert!(current_types.contains(&"session_group_list".to_string()));
     assert!(current_types.contains(&"session_list".to_string()));
 
@@ -2485,6 +2543,7 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -2493,6 +2552,7 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
     assert!(current_types.contains(&"session".to_string()));
     assert!(current_types.contains(&"view_state".to_string()));
     assert!(current_types.contains(&"todos_state".to_string()));
+    assert!(current_types.contains(&"feature_status".to_string()));
     assert!(current_types.contains(&"session_group_list".to_string()));
     assert!(current_types.contains(&"history".to_string()));
 }
@@ -2573,6 +2633,7 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -2581,6 +2642,7 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
     assert!(current_types.contains(&"session".to_string()));
     assert!(current_types.contains(&"view_state".to_string()));
     assert!(current_types.contains(&"todos_state".to_string()));
+    assert!(current_types.contains(&"feature_status".to_string()));
     assert!(current_types.contains(&"session_group_list".to_string()));
     assert!(current_types.contains(&"history".to_string()));
     assert!(current_types.contains(&"start".to_string()));
@@ -2792,6 +2854,7 @@ async fn execute_tool_with_live_output_drains_events_before_return() {
         &test_config(),
         &reqwest::Client::new(),
         &workspace,
+        &workspace,
         false,
         None,
         None,
@@ -2858,6 +2921,7 @@ async fn execute_tool_with_live_output_preserves_queued_events() {
             &test_config(),
             &reqwest::Client::new(),
             &workspace,
+            &workspace,
             false,
             None,
             None,
@@ -2921,6 +2985,7 @@ async fn execute_tool_with_live_output_returns_when_live_queue_is_full() {
             &test_config(),
             &reqwest::Client::new(),
             &workspace,
+            &workspace,
             false,
             None,
             None,
@@ -2972,6 +3037,7 @@ async fn execute_tool_with_live_output_drops_extra_events_when_local_live_queue_
         &serde_json::to_string(&args).expect("args should serialize"),
         &test_config(),
         &reqwest::Client::new(),
+        &workspace,
         &workspace,
         false,
         None,
@@ -3276,6 +3342,81 @@ async fn run_agent_session_rechecks_model_configuration_at_the_run_boundary() {
 }
 
 #[tokio::test]
+async fn run_agent_session_marks_approved_plan_failed_when_workspace_is_unavailable() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "missing-workspace-plan-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let missing_workspace = temp_workspace("missing-approved-plan-workspace");
+    let mut session = test_session(&session_id, "Missing Plan Workspace", None);
+    session.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    session.working_directory = missing_workspace;
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_missing_workspace".into(),
+        revision: 2,
+        status: crate::plan::PlanStatus::Executing,
+        approved_at: Some(20),
+        execution_attempt: 1,
+        created_at: 10,
+        updated_at: 20,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let (_inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
+
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        1,
+        &cancel,
+        &live_tx,
+        &mut inbound_rx,
+        &stop_requested,
+        AgentRunMode::Execute,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(outcome.run_failed);
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+    let sessions = state.sessions.lock().await;
+    let plan = sessions[&session_id]
+        .pending_plan
+        .as_ref()
+        .expect("approved plan should remain visible");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Failed);
+    assert!(plan.finished_at.is_some());
+    drop(sessions);
+
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "plan_state" && event["plan"]["status"] == "failed" })
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "error" && event["code"] == "workspace_unavailable" })
+    );
+
+    crate::session_store::delete_session_from_storage(&session_id)
+        .await
+        .expect("test session should be removed");
+}
+
+#[tokio::test]
 async fn run_agent_session_prioritizes_stop_request_over_cancel() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
@@ -3470,6 +3611,7 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -3575,6 +3717,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
 }
 
 fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
+    let workspace = std::env::temp_dir();
     Session {
         id: id.to_string(),
         name: name.to_string(),
@@ -3613,7 +3756,9 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 0,
-        workspace: PathBuf::new(),
+        working_directory: workspace.clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
+        workspace,
     }
 }
 
@@ -3641,6 +3786,7 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -4289,6 +4435,38 @@ async fn session_control_tool_is_only_exposed_for_main_execute_tools() {
 }
 
 #[tokio::test]
+async fn runtime_tool_catalog_uses_the_live_group_feature_flag() {
+    let state = Arc::new(test_app_state());
+    let config = state.config();
+    assert!(config.enable_groups, "the test run snapshot enables Groups");
+    let workspace = temp_workspace("live-group-feature-tools");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let definitions = build_runtime_tools_for_working_directory(
+        &config,
+        Provider::OpenAI,
+        &workspace,
+        &workspace,
+        MAIN_SESSION_ID,
+        false,
+    )
+    .await;
+    let session_control = definitions
+        .iter()
+        .find(|definition| {
+            tool_definition_name(definition) == Some(crate::tools::TOOL_NAME_SESSION_CONTROL)
+        })
+        .expect("main execute tools should include session_control")
+        .to_string();
+
+    assert!(!session_control.contains("create_group"));
+    assert!(!session_control.contains("list_groups"));
+    assert!(!session_control.contains("group_id"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn session_control_tool_rejects_non_main_session_even_if_called() {
     let state = Arc::new(test_app_state());
 
@@ -4631,7 +4809,7 @@ async fn plan_only_allowed_tool_requires_enabled_mcp_policy_tool() {
         "global cached descriptor is read-only"
     );
     assert!(
-        !is_plan_only_allowed_tool(exposed_name, &config, &workspace),
+        !is_plan_only_allowed_tool(exposed_name, &config, &workspace, &workspace),
         "PlanOnly must reject MCP tools not enabled by the session policy"
     );
 
@@ -4643,17 +4821,13 @@ async fn plan_only_allowed_tool_requires_enabled_mcp_policy_tool() {
 async fn plan_only_allowed_tool_accepts_policy_enabled_read_only_mcp_tool() {
     let _guard = crate::tools::mcp::acquire_mcp_test_guard().await;
     let config = plan_only_mcp_test_config();
-    let workspace = temp_workspace("plan-only-mcp-policy-allow");
-    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session_home = temp_workspace("plan-only-mcp-policy-allow-home");
+    let working_directory = temp_workspace("plan-only-mcp-policy-allow-project");
+    std::fs::create_dir_all(&session_home).expect("session home should be created");
+    std::fs::create_dir_all(&working_directory).expect("working directory should be created");
     let exposed_name = "mcp__mock__search__def456";
-    crate::tools::mcp::insert_cached_tool_descriptors_for_test(
-        "mock",
-        &config,
-        &workspace,
-        vec![cached_read_only_mcp_descriptor(exposed_name)],
-    );
     crate::tools::mcp::save_session_policy(
-        &workspace,
+        &session_home,
         &crate::tools::mcp::McpSessionPolicy {
             enabled_servers: HashSet::from(["mock".to_string()]),
             enabled_tools: HashSet::from([exposed_name.to_string()]),
@@ -4661,11 +4835,25 @@ async fn plan_only_allowed_tool_accepts_policy_enabled_read_only_mcp_tool() {
         },
     )
     .expect("policy should save");
+    let policy = crate::tools::mcp::load_session_policy(&session_home);
+    crate::tools::mcp::insert_cached_tool_descriptors_for_policy_for_test(
+        "mock",
+        &config,
+        &working_directory,
+        &policy,
+        vec![cached_read_only_mcp_descriptor(exposed_name)],
+    );
 
-    assert!(is_plan_only_allowed_tool(exposed_name, &config, &workspace));
+    assert!(is_plan_only_allowed_tool(
+        exposed_name,
+        &config,
+        &session_home,
+        &working_directory
+    ));
 
     crate::tools::mcp::clear_cached_runtime_state_for_server("mock");
-    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&session_home);
+    let _ = std::fs::remove_dir_all(&working_directory);
 }
 
 #[tokio::test]
@@ -6018,6 +6206,7 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: Some(format!("## Observation Hint\n{}", "A".repeat(1_400))),
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -6163,6 +6352,7 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: Some(format!("## Observation Hint\n{}", "A".repeat(6_000))),
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -6291,6 +6481,7 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: Some("## Observation Hint\nlegacy observation context".into()),
         last_observation_strength: agent::AutoObservationStrength::Strong,
         last_tool_results_count: 3,
@@ -6439,6 +6630,7 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -6557,6 +6749,7 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -6732,6 +6925,7 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -6831,6 +7025,7 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -7001,6 +7196,7 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -7122,6 +7318,7 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,
@@ -7281,6 +7478,7 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,

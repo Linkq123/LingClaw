@@ -1,5 +1,5 @@
 pub(crate) const APPLICATION_ID: i64 = 0x4C_43_4C_57;
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 
 pub(crate) const INITIAL_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -25,9 +25,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     show_tools INTEGER NOT NULL,
     show_reasoning INTEGER NOT NULL,
     visible_message_count INTEGER NOT NULL,
-    version INTEGER NOT NULL
+    version INTEGER NOT NULL,
+    workspace_kind TEXT NOT NULL DEFAULT 'managed',
+    working_directory TEXT NOT NULL DEFAULT '',
+    working_directory_key TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_sessions_working_directory
+    ON sessions(working_directory_key, updated_at DESC, id);
 
 CREATE TABLE IF NOT EXISTS session_messages (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -293,4 +298,12 @@ ALTER TABLE session_plans ADD COLUMN initial_submission_pending INTEGER NOT NULL
 
 pub(crate) const PLAN_STALE_OVERRIDE_AUDIT_SCHEMA: &str = r#"
 ALTER TABLE session_plans ADD COLUMN stale_override_confirmed_at INTEGER;
+"#;
+
+pub(crate) const SESSION_WORKSPACE_SCHEMA: &str = r#"
+ALTER TABLE sessions ADD COLUMN workspace_kind TEXT NOT NULL DEFAULT 'managed';
+ALTER TABLE sessions ADD COLUMN working_directory TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN working_directory_key TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_sessions_working_directory
+    ON sessions(working_directory_key, updated_at DESC, id);
 "#;

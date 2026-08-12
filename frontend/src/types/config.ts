@@ -55,6 +55,7 @@ export interface SettingsConfig {
   dailyReflection?: boolean;
   enableStateDigest?: boolean;
   enableTaskPlan?: boolean;
+  enableGroups?: boolean;
   enableS3?: boolean;
   openaiStreamIncludeUsage?: boolean;
   anthropicPromptCaching?: boolean;

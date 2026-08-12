@@ -1,7 +1,8 @@
 use super::*;
 
 use crate::prompts::{
-    SystemPromptToolMode, build_system_prompt_with_query_cached_for_tool_mode_with_view_image,
+    SystemPromptToolMode, build_system_prompt_with_preloaded_project_rules,
+    load_project_rules_async,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
@@ -262,6 +263,22 @@ pub(crate) async fn release_agent_run_for_stop_requested(
     false
 }
 
+pub(crate) async fn agent_run_workspace_available(
+    state: &AppState,
+    session_id: &str,
+) -> Option<bool> {
+    let working_directory = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .map(|session| session.working_directory.clone())
+    };
+    match working_directory {
+        Some(path) => Some(session_store::working_directory_available(&path).await),
+        None => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentRunMode {
     Execute,
@@ -296,6 +313,7 @@ struct AgentPhaseState {
     retrieved_task_memory_key: Option<String>,
     retrieved_task_memory_cycle: Option<usize>,
     cycle_workspace: PathBuf,
+    session_home: PathBuf,
     last_observation_hint: Option<String>,
     last_observation_strength: agent::AutoObservationStrength,
     last_tool_results_count: usize,
@@ -840,6 +858,15 @@ async fn prepare_analyze_snapshot(
     phase_state: &mut AgentPhaseState,
 ) -> Option<AnalyzeSnapshot> {
     let config = ctx.config.clone();
+    let (session_home, working_directory) = {
+        let sessions = ctx.state.sessions.lock().await;
+        let session = sessions.get(ctx.current_session_id)?;
+        (session.workspace.clone(), session.working_directory.clone())
+    };
+    // External project guidance may live on a slow or disconnected filesystem.
+    // Load it through the bounded blocking pool before taking the Session mutex;
+    // prompt construction below remains synchronous and cannot stall a Tokio worker.
+    let project_rules = load_project_rules_async(&working_directory, &session_home).await;
     let mut sessions = ctx.state.sessions.lock().await;
     let session = sessions.get_mut(ctx.current_session_id)?;
     let base_model = ctx.model.clone();
@@ -886,14 +913,16 @@ async fn prepare_analyze_snapshot(
     // so capability gating must follow the consumer rather than the producer.
     let view_image_available =
         tool_images_available_for_consumer(&config, &base_model, phase_state.tool_images_disabled);
-    let mut fresh_system = build_system_prompt_with_query_cached_for_tool_mode_with_view_image(
+    let mut fresh_system = build_system_prompt_with_preloaded_project_rules(
         &prompt_config,
         &session.workspace,
+        &session.working_directory,
         &model_str,
         &enabled_system_skills,
         latest_query.as_deref(),
         system_prompt_tool_mode,
         view_image_available,
+        &project_rules,
     );
 
     refresh_retrieved_task_memory(
@@ -909,9 +938,19 @@ async fn prepare_analyze_snapshot(
         && phase_state.approved_plan.is_none()
     {
         let available_tools = if phase_state.run_mode.is_plan_only() {
-            available_tool_names_for_plan_only(&config, &session.workspace, view_image_available)
+            available_tool_names_for_plan_only_with_working_directory(
+                &config,
+                &session.workspace,
+                &session.working_directory,
+                view_image_available,
+            )
         } else {
-            available_tool_names_for_plan(&config, &session.workspace, view_image_available)
+            available_tool_names_for_plan_with_working_directory(
+                &config,
+                &session.workspace,
+                &session.working_directory,
+                view_image_available,
+            )
         };
         let available_agent_names = if phase_state.run_mode.is_plan_only() {
             Vec::new()
@@ -1061,7 +1100,8 @@ async fn prepare_analyze_snapshot(
         *first = fresh_system;
     }
 
-    phase_state.cycle_workspace = session.workspace.clone();
+    phase_state.session_home = session.workspace.clone();
+    phase_state.cycle_workspace = session.working_directory.clone();
     let think_level = config.normalize_model_effort(&model_str, &session.think_level);
 
     Some(AnalyzeSnapshot {
@@ -1210,13 +1250,25 @@ async fn build_cycle_tools(
 ) -> Vec<serde_json::Value> {
     let config = ctx.config.clone();
     let mut definitions = if phase_state.run_mode.is_plan_only() {
-        build_plan_only_tools(&config, resolved.provider, &phase_state.cycle_workspace).await
-    } else {
-        build_runtime_tools(
+        build_plan_only_tools_for_working_directory(
             &config,
             resolved.provider,
+            &phase_state.session_home,
+            &phase_state.cycle_workspace,
+        )
+        .await
+    } else {
+        build_runtime_tools_for_working_directory(
+            &config,
+            resolved.provider,
+            &phase_state.session_home,
             &phase_state.cycle_workspace,
             ctx.current_session_id,
+            // Model/provider settings remain pinned to the immutable run
+            // snapshot, but feature gates are process-live. This prevents a
+            // Main Agent that spans a Settings hot reload from continuing to
+            // advertise Group operations after Groups have been disabled.
+            ctx.state.config().enable_groups,
         )
         .await
     };
@@ -1257,61 +1309,86 @@ fn tool_definition_name(value: &serde_json::Value) -> Option<&str> {
         .or_else(|| value.get("name").and_then(serde_json::Value::as_str))
 }
 
-pub(crate) async fn build_plan_only_tools(
+pub(crate) async fn build_plan_only_tools_for_working_directory(
     config: &Config,
     provider: Provider,
-    workspace: &Path,
+    session_home: &Path,
+    working_directory: &Path,
 ) -> Vec<serde_json::Value> {
     let mut definitions = tools::read_only_tool_definitions_for_provider(provider);
-    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mcp_policy = tools::mcp::load_session_policy(session_home);
     let (cached_servers, enabled_servers) =
-        tools::mcp::cached_server_counts_for_policy(config, workspace, &mcp_policy);
+        tools::mcp::cached_server_counts_for_policy(config, working_directory, &mcp_policy);
     let mut mcp_tools = match (enabled_servers > 0, cached_servers == enabled_servers) {
         (false, _) => Vec::new(),
         (true, true) => match provider {
             Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic_for_policy(
                 config,
-                workspace,
+                working_directory,
                 &mcp_policy,
             ),
             Provider::OpenAI | Provider::OpenAIResponses => {
                 tools::mcp::cached_tool_definitions_openai_for_policy(
                     config,
-                    workspace,
+                    working_directory,
                     &mcp_policy,
                 )
             }
             Provider::Ollama => tools::mcp::cached_tool_definitions_ollama_for_policy(
                 config,
-                workspace,
+                working_directory,
                 &mcp_policy,
             ),
             Provider::Gemini => tools::mcp::cached_tool_definitions_gemini_for_policy(
                 config,
-                workspace,
+                working_directory,
                 &mcp_policy,
             ),
         },
         (true, false) => match provider {
             Provider::Anthropic => {
-                tools::mcp::tool_definitions_anthropic_for_policy(config, workspace, &mcp_policy)
-                    .await
+                tools::mcp::tool_definitions_anthropic_for_policy(
+                    config,
+                    working_directory,
+                    &mcp_policy,
+                )
+                .await
             }
             Provider::OpenAI | Provider::OpenAIResponses => {
-                tools::mcp::tool_definitions_openai_for_policy(config, workspace, &mcp_policy).await
+                tools::mcp::tool_definitions_openai_for_policy(
+                    config,
+                    working_directory,
+                    &mcp_policy,
+                )
+                .await
             }
             Provider::Ollama => {
-                tools::mcp::tool_definitions_ollama_for_policy(config, workspace, &mcp_policy).await
+                tools::mcp::tool_definitions_ollama_for_policy(
+                    config,
+                    working_directory,
+                    &mcp_policy,
+                )
+                .await
             }
             Provider::Gemini => {
-                tools::mcp::tool_definitions_gemini_for_policy(config, workspace, &mcp_policy).await
+                tools::mcp::tool_definitions_gemini_for_policy(
+                    config,
+                    working_directory,
+                    &mcp_policy,
+                )
+                .await
             }
         },
     }
     .into_iter()
     .filter(|definition| {
         tool_definition_name(definition).is_some_and(|name| {
-            tools::mcp::is_read_only_tool_name_for_policy(name, config, workspace, &mcp_policy)
+            tools::mcp::is_read_only_tool_name_for_policy(
+                name,
+                config,
+                working_directory,
+                &mcp_policy,
+            )
         })
     })
     .collect::<Vec<_>>();
@@ -1319,9 +1396,19 @@ pub(crate) async fn build_plan_only_tools(
     definitions
 }
 
-fn available_tool_names_for_plan(
+#[cfg(test)]
+pub(crate) async fn build_plan_only_tools(
     config: &Config,
+    provider: Provider,
     workspace: &Path,
+) -> Vec<serde_json::Value> {
+    build_plan_only_tools_for_working_directory(config, provider, workspace, workspace).await
+}
+
+fn available_tool_names_for_plan_with_working_directory(
+    config: &Config,
+    session_home: &Path,
+    working_directory: &Path,
     include_view_image: bool,
 ) -> Vec<String> {
     let mut names = tools::tool_specs()
@@ -1329,14 +1416,14 @@ fn available_tool_names_for_plan(
         .filter(|spec| include_view_image || spec.name != tools::TOOL_NAME_VIEW_IMAGE)
         .map(|spec| spec.name.to_string())
         .collect::<Vec<_>>();
-    let agents = crate::subagents::discovery::discover_all_agents(workspace);
+    let agents = crate::subagents::discovery::discover_all_agents(session_home);
     if !agents.is_empty() {
         names.push(tools::TOOL_NAME_TASK.to_string());
         names.push(tools::TOOL_NAME_ORCHESTRATE.to_string());
     }
-    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mcp_policy = tools::mcp::load_session_policy(session_home);
     names.extend(
-        tools::mcp::cached_list_tools_for_policy(config, workspace, &mcp_policy)
+        tools::mcp::cached_list_tools_for_policy(config, working_directory, &mcp_policy)
             .into_iter()
             .map(|tool| tool.exposed_name),
     );
@@ -1345,9 +1432,10 @@ fn available_tool_names_for_plan(
     names
 }
 
-fn available_tool_names_for_plan_only(
+fn available_tool_names_for_plan_only_with_working_directory(
     config: &Config,
-    workspace: &Path,
+    session_home: &Path,
+    working_directory: &Path,
     include_view_image: bool,
 ) -> Vec<String> {
     let mut names = tools::tool_specs()
@@ -1358,9 +1446,9 @@ fn available_tool_names_for_plan_only(
         })
         .map(|spec| spec.name.to_string())
         .collect::<Vec<_>>();
-    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mcp_policy = tools::mcp::load_session_policy(session_home);
     names.extend(
-        tools::mcp::cached_list_tools_for_policy(config, workspace, &mcp_policy)
+        tools::mcp::cached_list_tools_for_policy(config, working_directory, &mcp_policy)
             .into_iter()
             .filter(tools::mcp::is_read_only_tool_descriptor)
             .map(|tool| tool.exposed_name),
@@ -1368,6 +1456,34 @@ fn available_tool_names_for_plan_only(
     names.sort();
     names.dedup();
     names
+}
+
+#[cfg(test)]
+fn available_tool_names_for_plan(
+    config: &Config,
+    workspace: &Path,
+    include_view_image: bool,
+) -> Vec<String> {
+    available_tool_names_for_plan_with_working_directory(
+        config,
+        workspace,
+        workspace,
+        include_view_image,
+    )
+}
+
+#[cfg(test)]
+fn available_tool_names_for_plan_only(
+    config: &Config,
+    workspace: &Path,
+    include_view_image: bool,
+) -> Vec<String> {
+    available_tool_names_for_plan_only_with_working_directory(
+        config,
+        workspace,
+        workspace,
+        include_view_image,
+    )
 }
 
 fn merge_tool_rankings(
@@ -1394,16 +1510,18 @@ fn merge_tool_rankings(
     base
 }
 
-pub(crate) async fn build_runtime_tools(
+pub(crate) async fn build_runtime_tools_for_working_directory(
     config: &Config,
     provider: Provider,
-    workspace: &Path,
+    session_home: &Path,
+    working_directory: &Path,
     current_session_id: &str,
+    groups_enabled: bool,
 ) -> Vec<serde_json::Value> {
     let mut extra_tools = Vec::new();
 
     // Sub-agent task + orchestrate tools (only added when agents are discovered)
-    let agents = crate::subagents::discovery::discover_all_agents(workspace);
+    let agents = crate::subagents::discovery::discover_all_agents(session_home);
     if !agents.is_empty() {
         let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
         let task_def = match provider {
@@ -1429,63 +1547,106 @@ pub(crate) async fn build_runtime_tools(
 
     if crate::is_main(current_session_id) {
         let session_control_def = match provider {
-            Provider::Anthropic => tools::session_control_tool_definition_anthropic(),
-            Provider::OpenAI | Provider::OpenAIResponses => {
-                tools::session_control_tool_definition_openai()
+            Provider::Anthropic => {
+                tools::session_control_tool_definition_anthropic_for_features(groups_enabled)
             }
-            Provider::Ollama => tools::session_control_tool_definition_ollama(),
-            Provider::Gemini => tools::session_control_tool_definition_gemini(),
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::session_control_tool_definition_openai_for_features(groups_enabled)
+            }
+            Provider::Ollama => {
+                tools::session_control_tool_definition_ollama_for_features(groups_enabled)
+            }
+            Provider::Gemini => {
+                tools::session_control_tool_definition_gemini_for_features(groups_enabled)
+            }
         };
         extra_tools.push(session_control_def);
     }
 
-    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mcp_policy = tools::mcp::load_session_policy(session_home);
     let (cached_servers, enabled_servers) =
-        tools::mcp::cached_server_counts_for_policy(config, workspace, &mcp_policy);
+        tools::mcp::cached_server_counts_for_policy(config, working_directory, &mcp_policy);
     let mut mcp_tools = match (enabled_servers > 0, cached_servers == enabled_servers) {
         (false, _) => Vec::new(),
         (true, true) => match provider {
             Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic_for_policy(
                 config,
-                workspace,
+                working_directory,
                 &mcp_policy,
             ),
             Provider::OpenAI | Provider::OpenAIResponses => {
                 tools::mcp::cached_tool_definitions_openai_for_policy(
                     config,
-                    workspace,
+                    working_directory,
                     &mcp_policy,
                 )
             }
             Provider::Ollama => tools::mcp::cached_tool_definitions_ollama_for_policy(
                 config,
-                workspace,
+                working_directory,
                 &mcp_policy,
             ),
             Provider::Gemini => tools::mcp::cached_tool_definitions_gemini_for_policy(
                 config,
-                workspace,
+                working_directory,
                 &mcp_policy,
             ),
         },
         (true, false) => match provider {
             Provider::Anthropic => {
-                tools::mcp::tool_definitions_anthropic_for_policy(config, workspace, &mcp_policy)
-                    .await
+                tools::mcp::tool_definitions_anthropic_for_policy(
+                    config,
+                    working_directory,
+                    &mcp_policy,
+                )
+                .await
             }
             Provider::OpenAI | Provider::OpenAIResponses => {
-                tools::mcp::tool_definitions_openai_for_policy(config, workspace, &mcp_policy).await
+                tools::mcp::tool_definitions_openai_for_policy(
+                    config,
+                    working_directory,
+                    &mcp_policy,
+                )
+                .await
             }
             Provider::Ollama => {
-                tools::mcp::tool_definitions_ollama_for_policy(config, workspace, &mcp_policy).await
+                tools::mcp::tool_definitions_ollama_for_policy(
+                    config,
+                    working_directory,
+                    &mcp_policy,
+                )
+                .await
             }
             Provider::Gemini => {
-                tools::mcp::tool_definitions_gemini_for_policy(config, workspace, &mcp_policy).await
+                tools::mcp::tool_definitions_gemini_for_policy(
+                    config,
+                    working_directory,
+                    &mcp_policy,
+                )
+                .await
             }
         },
     };
     extra_tools.append(&mut mcp_tools);
     extra_tools
+}
+
+#[cfg(test)]
+pub(crate) async fn build_runtime_tools(
+    config: &Config,
+    provider: Provider,
+    workspace: &Path,
+    current_session_id: &str,
+) -> Vec<serde_json::Value> {
+    build_runtime_tools_for_working_directory(
+        config,
+        provider,
+        workspace,
+        workspace,
+        current_session_id,
+        config.enable_groups,
+    )
+    .await
 }
 
 fn token_usage_source(token_count: Option<u64>) -> &'static str {
@@ -1595,17 +1756,18 @@ async fn execute_tool(
     args_str: &str,
     config: &Config,
     http: &Client,
-    workspace: &Path,
+    session_home: &Path,
+    working_directory: &Path,
     isolated_mcp_session: bool,
     event_tx: Option<tools::ToolEventSender>,
     image_budget: Option<tools::mcp::ToolImageBudget>,
 ) -> tools::ToolOutcome {
-    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mcp_policy = tools::mcp::load_session_policy(session_home);
     let mcp_result = tools::mcp::execute_tool_for_policy_with_image_budget(
         name,
         args_str,
         config,
-        workspace,
+        working_directory,
         isolated_mcp_session,
         &mcp_policy,
         image_budget.clone(),
@@ -1620,7 +1782,7 @@ async fn execute_tool(
             args_str,
             config,
             http,
-            workspace,
+            working_directory,
             event_tx,
             image_budget,
         )
@@ -1700,7 +1862,8 @@ async fn execute_tool_with_live_output(
     args_str: &str,
     config: &Config,
     http: &Client,
-    workspace: &Path,
+    session_home: &Path,
+    working_directory: &Path,
     isolated_mcp_session: bool,
     replay_ctx: Option<crate::LiveOutputReplayCtx>,
     image_budget: Option<tools::mcp::ToolImageBudget>,
@@ -1711,7 +1874,8 @@ async fn execute_tool_with_live_output(
             args_str,
             config,
             http,
-            workspace,
+            session_home,
+            working_directory,
             isolated_mcp_session,
             None,
             image_budget,
@@ -1726,7 +1890,7 @@ async fn execute_tool_with_live_output(
         args_str,
         config,
         http,
-        workspace,
+        working_directory,
         None,
         Some(event_tx),
     );
@@ -1798,7 +1962,8 @@ async fn execute_task_tool(
     args_str: &str,
     config: &Config,
     http: &Client,
-    workspace: &Path,
+    agent_home: &Path,
+    working_directory: &Path,
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
@@ -1859,10 +2024,10 @@ async fn execute_task_tool(
     let effective_prompt =
         crate::subagents::executor::augment_subagent_prompt_with_current_time(prompt);
 
-    let spec = match crate::subagents::discovery::find_agent(workspace, agent_name) {
+    let spec = match crate::subagents::discovery::find_agent(agent_home, agent_name) {
         Some(s) => s,
         None => {
-            let available = crate::subagents::discovery::discover_all_agents(workspace);
+            let available = crate::subagents::discovery::discover_all_agents(agent_home);
             let names: Vec<&str> = available.iter().map(|a| a.name.as_str()).collect();
             return tools::ToolOutcome {
                 output: format!(
@@ -1914,12 +2079,13 @@ async fn execute_task_tool(
     // (e.g. timeout or cancellation in run_tool_with_feedback).
     let mut guard = TaskEventGuard::new(live_tx, agent_name, &task_id);
 
-    let outcome = crate::subagents::executor::run_subagent(
+    let outcome = crate::subagents::executor::run_subagent_with_working_directory(
         &spec,
         &effective_prompt,
         config,
         http,
-        workspace,
+        agent_home,
+        working_directory,
         live_tx,
         cancel,
         hooks,
@@ -2016,7 +2182,8 @@ async fn execute_orchestrate_tool(
     args_str: &str,
     config: &Config,
     http: &Client,
-    workspace: &Path,
+    agent_home: &Path,
+    working_directory: &Path,
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
@@ -2069,7 +2236,7 @@ async fn execute_orchestrate_tool(
     };
 
     // Validate plan (IDs, agents, dependencies, cycles)
-    let plan = match crate::subagents::orchestrator::validate_plan(tasks, workspace) {
+    let plan = match crate::subagents::orchestrator::validate_plan(tasks, agent_home) {
         Ok(p) => p,
         Err(e) => {
             return tools::ToolOutcome {
@@ -2082,11 +2249,12 @@ async fn execute_orchestrate_tool(
         }
     };
 
-    let outcome = crate::subagents::orchestrator::execute_orchestration(
+    let outcome = crate::subagents::orchestrator::execute_orchestration_with_working_directory(
         &plan,
         config,
         http,
-        workspace,
+        agent_home,
+        working_directory,
         live_tx,
         cancel,
         hooks,
@@ -2305,7 +2473,12 @@ fn runtime_timeout_for_tool(tool_name: &str, config: &Config) -> Option<Duration
     tools::tool_runtime_timeout(tool_name, config)
 }
 
-fn is_plan_only_allowed_tool(tool_name: &str, config: &Config, workspace: &Path) -> bool {
+fn is_plan_only_allowed_tool(
+    tool_name: &str,
+    config: &Config,
+    session_home: &Path,
+    working_directory: &Path,
+) -> bool {
     if tool_name == crate::plan::TOOL_NAME_SUBMIT_PLAN {
         return true;
     }
@@ -2313,8 +2486,8 @@ fn is_plan_only_allowed_tool(tool_name: &str, config: &Config, workspace: &Path)
         return true;
     }
 
-    let mcp_policy = tools::mcp::load_session_policy(workspace);
-    tools::mcp::is_read_only_tool_name_for_policy(tool_name, config, workspace, &mcp_policy)
+    let mcp_policy = tools::mcp::load_session_policy(session_home);
+    tools::mcp::is_read_only_tool_name_for_policy(tool_name, config, working_directory, &mcp_policy)
 }
 
 fn is_internal_plan_tool(tool_name: &str) -> bool {
@@ -2509,7 +2682,12 @@ async fn execute_tool_call(
         return Ok((outcome, None, PlanEvidenceCapture::default()));
     }
     if phase_state.run_mode.is_plan_only()
-        && !is_plan_only_allowed_tool(&tc.function.name, &config, &phase_state.cycle_workspace)
+        && !is_plan_only_allowed_tool(
+            &tc.function.name,
+            &config,
+            &phase_state.session_home,
+            &phase_state.cycle_workspace,
+        )
     {
         if !tools::is_todos_tool(&tc.function.name) {
             let display_args =
@@ -2644,6 +2822,7 @@ async fn execute_tool_call(
                 &effective_args,
                 &delegated_config,
                 &ctx.state.http,
+                &phase_state.session_home,
                 &phase_state.cycle_workspace,
                 ctx.live_tx,
                 task_cancel,
@@ -2668,6 +2847,7 @@ async fn execute_tool_call(
                 &effective_args,
                 &delegated_config,
                 &ctx.state.http,
+                &phase_state.session_home,
                 &phase_state.cycle_workspace,
                 ctx.live_tx,
                 orch_cancel,
@@ -2728,6 +2908,7 @@ async fn execute_tool_call(
                 &effective_args,
                 &config,
                 &ctx.state.http,
+                &phase_state.session_home,
                 &phase_state.cycle_workspace,
                 false,
                 Some(crate::LiveOutputReplayCtx {
@@ -3840,7 +4021,7 @@ async fn run_analyze_phase(
                 &ctx.state.http,
                 &resolved,
                 &retry_messages,
-                &phase_state.cycle_workspace,
+                &phase_state.session_home,
                 config.s3.as_ref(),
                 ctx.live_tx,
                 &effective_think,
@@ -4125,6 +4306,7 @@ async fn run_act_phase(
 
         // 3. Launch non-rejected tool futures concurrently.
         let run_mode = phase_state.run_mode;
+        let session_home = &phase_state.session_home;
         let cycle_workspace = &phase_state.cycle_workspace;
         let futures: Vec<_> = tool_calls
             .iter()
@@ -4175,6 +4357,7 @@ async fn run_act_phase(
                             args,
                             &config,
                             &ctx.state.http,
+                            session_home,
                             cycle_workspace,
                             true,
                             Some(crate::LiveOutputReplayCtx {
@@ -4619,6 +4802,39 @@ async fn mark_planning_plan_terminal(
     Some(plan.clone())
 }
 
+async fn fail_plan_before_agent_phase(
+    state: &Arc<AppState>,
+    session_id: &str,
+    run_mode: AgentRunMode,
+    approved_plan: Option<&crate::PendingPlan>,
+    live_tx: &LiveTx,
+) {
+    let terminal_plan = if run_mode.is_plan_only() {
+        mark_planning_plan_terminal(state, session_id, crate::plan::PlanStatus::Failed).await
+    } else {
+        mark_execution_plan_terminal(
+            state,
+            session_id,
+            approved_plan,
+            crate::plan::PlanStatus::Failed,
+        )
+        .await
+    };
+    let Some(plan) = terminal_plan else {
+        return;
+    };
+
+    if let Err(error) = session_store::save_current_session_to_disk(state, session_id).await {
+        eprintln!("ERROR: failed to save plan after Agent start was rejected: {error}");
+        return;
+    }
+    let _ = live_send(
+        live_tx,
+        json!({"type":"plan_state", "plan": plan.to_live_value()}),
+    )
+    .await;
+}
+
 async fn run_finish_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -5012,6 +5228,33 @@ pub(crate) async fn run_agent_session(
             }
         },
     };
+    if agent_run_workspace_available(state, current_session_id).await == Some(false) {
+        fail_plan_before_agent_phase(
+            state,
+            current_session_id,
+            run_mode,
+            approved_plan.as_ref(),
+            live_tx,
+        )
+        .await;
+        release_agent_run_reservation(state, current_session_id, &reservation).await;
+        let _ = live_send(
+            live_tx,
+            json!({
+                "type":"error",
+                "code":"workspace_unavailable",
+                "content":"The Session working directory is unavailable. Rebind it before starting an Agent run.",
+                "dismissible":true,
+            }),
+        )
+        .await;
+        return AgentRunOutcome {
+            rerun_agent: false,
+            shutting_down: false,
+            run_stopped: false,
+            run_failed: true,
+        };
+    }
     let model_snapshot = match model_snapshot {
         Some(snapshot) if snapshot.explicit => Some(snapshot),
         Some(_) => None,
@@ -5020,6 +5263,14 @@ pub(crate) async fn run_agent_session(
             .filter(|snapshot| snapshot.explicit),
     };
     let Some(model_snapshot) = model_snapshot else {
+        fail_plan_before_agent_phase(
+            state,
+            current_session_id,
+            run_mode,
+            approved_plan.as_ref(),
+            live_tx,
+        )
+        .await;
         release_agent_run_reservation(state, current_session_id, &reservation).await;
         let _ = live_send(
             live_tx,
@@ -5062,6 +5313,7 @@ pub(crate) async fn run_agent_session(
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
+        session_home: PathBuf::new(),
         last_observation_hint: None,
         last_observation_strength: agent::AutoObservationStrength::None,
         last_tool_results_count: 0,

@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 
 use super::{Database, StorageError};
 use crate::{
-    ChatMessage, DailyUsageSnapshot, PendingPlan, Session, SubagentHistorySnapshot,
+    ChatMessage, DailyUsageSnapshot, PendingPlan, Session, SessionWorkspaceKind,
+    SubagentHistorySnapshot,
     plan::{PlanArtifact, PlanEvidence, PlanProgressStep, PlanStatus, PlanStepStatus},
     session_store::{SessionSummary, sanitized_non_system_message_count},
     todos::{TodoItem, TodoSnapshot, TodoStatus, TodoUpdatedBy},
@@ -67,6 +68,9 @@ pub(crate) struct SessionUsageSnapshot {
 struct LoadedSession {
     id: String,
     name: String,
+    workspace_kind: String,
+    working_directory: String,
+    working_directory_key: String,
     created_at: i64,
     updated_at: i64,
     tool_calls_count: i64,
@@ -260,7 +264,14 @@ fn rebase_persisted_plan_message_indices(
 }
 
 fn prepare_session(session: &Session) -> Result<StoredSession, StorageError> {
-    let session = crate::session_store::session_for_storage(session).map_err(StorageError::new)?;
+    let session_home = session.workspace.clone();
+    let working_directory = session.working_directory.clone();
+    let workspace_kind = session.workspace_kind;
+    let mut session =
+        crate::session_store::session_for_storage(session).map_err(StorageError::new)?;
+    session.workspace = session_home;
+    session.working_directory = working_directory;
+    session.workspace_kind = workspace_kind;
     let messages = session
         .messages
         .iter()
@@ -352,12 +363,16 @@ fn save_prepared_session(
     let session = &stored.session;
     connection.execute(
         r#"INSERT INTO sessions(
-            id, name, created_at, updated_at, tool_calls_count, model_override,
+            id, name, workspace_kind, working_directory, working_directory_key,
+            created_at, updated_at, tool_calls_count, model_override,
             think_level, show_react, show_tools, show_reasoning,
             visible_message_count, version
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         ON CONFLICT(id) DO UPDATE SET
             name=excluded.name,
+            workspace_kind=excluded.workspace_kind,
+            working_directory=excluded.working_directory,
+            working_directory_key=excluded.working_directory_key,
             created_at=excluded.created_at,
             updated_at=excluded.updated_at,
             tool_calls_count=excluded.tool_calls_count,
@@ -371,6 +386,12 @@ fn save_prepared_session(
         params![
             session.id,
             session.name,
+            session.workspace_kind.as_str(),
+            session
+                .working_directory
+                .to_str()
+                .ok_or_else(|| { StorageError::new("Working directory must be valid UTF-8") })?,
+            crate::working_directory_key(&session.working_directory).map_err(StorageError::new)?,
             to_i64(session.created_at, "session created_at")?,
             to_i64(session.updated_at, "session updated_at")?,
             i64::try_from(session.tool_calls_count).map_err(|_| rusqlite::Error::InvalidQuery)?,
@@ -837,9 +858,32 @@ impl Database {
         self.blocking_read(query_session_summaries)
     }
 
+    #[cfg(not(test))]
+    pub(crate) fn list_session_summaries_for_working_directory_blocking(
+        &self,
+        working_directory_key: &str,
+    ) -> Result<Vec<SessionSummary>, StorageError> {
+        let working_directory_key = working_directory_key.to_string();
+        self.blocking_read(move |connection| {
+            query_session_summaries_for_working_directory(connection, &working_directory_key)
+        })
+    }
+
     #[cfg(test)]
     pub(crate) async fn list_session_summaries(&self) -> Result<Vec<SessionSummary>, StorageError> {
         self.read(query_session_summaries).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn list_session_summaries_for_working_directory(
+        &self,
+        working_directory_key: &str,
+    ) -> Result<Vec<SessionSummary>, StorageError> {
+        let working_directory_key = working_directory_key.to_string();
+        self.read(move |connection| {
+            query_session_summaries_for_working_directory(connection, &working_directory_key)
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -1161,28 +1205,119 @@ fn query_session_summaries(
 ) -> Result<Vec<SessionSummary>, StorageError> {
     let mut statement = connection.prepare(
         r#"SELECT id, name, model_override, visible_message_count,
-                  tool_calls_count, created_at, updated_at
+                  tool_calls_count, created_at, updated_at,
+                  workspace_kind, working_directory, working_directory_key
            FROM sessions ORDER BY
              CASE WHEN lower(id)='main' THEN 0 ELSE 1 END,
              updated_at DESC, id"#,
     )?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-            ))
-        })?
+        .query_map([], session_summary_row)?
         .collect::<Result<Vec<_>, _>>()?;
+    rebuild_session_summaries(rows)
+}
+
+fn query_session_summaries_for_working_directory(
+    connection: &mut rusqlite::Connection,
+    working_directory_key: &str,
+) -> Result<Vec<SessionSummary>, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT id, name, model_override, visible_message_count,
+                  tool_calls_count, created_at, updated_at,
+                  workspace_kind, working_directory, working_directory_key
+           FROM sessions
+           WHERE working_directory_key=?1
+           ORDER BY CASE WHEN lower(id)='main' THEN 0 ELSE 1 END,
+                    updated_at DESC, id"#,
+    )?;
+    let rows = statement
+        .query_map([working_directory_key], session_summary_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    rebuild_session_summaries(rows)
+}
+
+type SessionSummaryRow = (
+    String,
+    String,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+);
+
+fn session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummaryRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn rebuild_working_directory(
+    session_id: &str,
+    workspace_kind: SessionWorkspaceKind,
+    stored_path: &str,
+    stored_key: &str,
+) -> Result<std::path::PathBuf, StorageError> {
+    if workspace_kind == SessionWorkspaceKind::Managed {
+        // Managed homes follow the current LingClaw home. This intentionally
+        // permits a database backup to be restored under a different user
+        // directory without retaining the old machine's absolute path.
+        return Ok(crate::session_workspace_path(session_id));
+    }
+
+    let path = std::path::PathBuf::from(stored_path);
+    if !path.is_absolute() {
+        return Err(StorageError::new(format!(
+            "Session '{session_id}' has a non-absolute external working directory"
+        )));
+    }
+    let expected_key = crate::working_directory_key(&path).map_err(StorageError::new)?;
+    if stored_key != expected_key {
+        return Err(StorageError::new(format!(
+            "Session '{session_id}' has an inconsistent working directory key"
+        )));
+    }
+    Ok(path)
+}
+
+fn rebuild_session_summaries(
+    rows: Vec<SessionSummaryRow>,
+) -> Result<Vec<SessionSummary>, StorageError> {
     rows.into_iter()
         .map(
-            |(id, name, model_override, messages, tool_calls, created_at, updated_at)| {
+            |(
+                id,
+                name,
+                model_override,
+                messages,
+                tool_calls,
+                created_at,
+                updated_at,
+                workspace_kind,
+                working_directory,
+                working_directory_key,
+            )| {
                 validate_persisted_session_identity(&id, &name)?;
+                let workspace_kind =
+                    SessionWorkspaceKind::parse(&workspace_kind).map_err(StorageError::new)?;
+                let working_directory = rebuild_working_directory(
+                    &id,
+                    workspace_kind,
+                    &working_directory,
+                    &working_directory_key,
+                )?;
                 Ok(SessionSummary {
                     id,
                     name,
@@ -1192,6 +1327,8 @@ fn query_session_summaries(
                     created_at: to_u64(created_at, "session created_at")?,
                     updated_at: to_u64(updated_at, "session updated_at")?,
                     corrupt: false,
+                    workspace_kind,
+                    working_directory,
                 })
             },
         )
@@ -1264,7 +1401,8 @@ fn load_session_record(
 ) -> Result<Option<LoadedSession>, StorageError> {
     let Some(mut loaded) = connection
         .query_row(
-            r#"SELECT id, name, created_at, updated_at, tool_calls_count,
+            r#"SELECT id, name, workspace_kind, working_directory, working_directory_key,
+                      created_at, updated_at, tool_calls_count,
                       model_override, think_level, show_react, show_tools,
                       show_reasoning, version
                FROM sessions WHERE id=?1"#,
@@ -1273,15 +1411,18 @@ fn load_session_record(
                 Ok(LoadedSession {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    tool_calls_count: row.get(4)?,
-                    model_override: row.get(5)?,
-                    think_level: row.get(6)?,
-                    show_react: row.get(7)?,
-                    show_tools: row.get(8)?,
-                    show_reasoning: row.get(9)?,
-                    version: row.get(10)?,
+                    workspace_kind: row.get(2)?,
+                    working_directory: row.get(3)?,
+                    working_directory_key: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    tool_calls_count: row.get(7)?,
+                    model_override: row.get(8)?,
+                    think_level: row.get(9)?,
+                    show_react: row.get(10)?,
+                    show_tools: row.get(11)?,
+                    show_reasoning: row.get(12)?,
+                    version: row.get(13)?,
                     ..LoadedSession::default()
                 })
             },
@@ -1933,6 +2074,14 @@ fn rebuild_session(loaded: LoadedSession) -> Result<Session, StorageError> {
             }
         }
     }
+    let workspace_kind =
+        SessionWorkspaceKind::parse(&loaded.workspace_kind).map_err(StorageError::new)?;
+    let working_directory = rebuild_working_directory(
+        &loaded.id,
+        workspace_kind,
+        &loaded.working_directory,
+        &loaded.working_directory_key,
+    )?;
     let mut session = Session {
         id: loaded.id,
         name: loaded.name,
@@ -1964,8 +2113,13 @@ fn rebuild_session(loaded: LoadedSession) -> Result<Session, StorageError> {
         version: u32::try_from(loaded.version)
             .map_err(|_| StorageError::new("Invalid session version"))?,
         workspace: crate::session_workspace_path(""),
+        working_directory,
+        workspace_kind,
     };
     session.workspace = crate::session_workspace_path(&session.id);
+    if session.workspace_kind == SessionWorkspaceKind::Managed {
+        session.working_directory = session.workspace.clone();
+    }
     crate::session_store::normalize_session(&mut session);
     Ok(session)
 }

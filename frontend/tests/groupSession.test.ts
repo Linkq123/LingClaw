@@ -18,6 +18,7 @@ describe('group sessions', () => {
     state.composerSessionTransitionPending = false;
     state.composerSessionIdentityPending = false;
     state.imageUploadInFlight = false;
+    state.groupsEnabled = true;
   });
 
   it('persists and clears the active group id', async () => {

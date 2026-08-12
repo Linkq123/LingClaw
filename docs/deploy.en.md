@@ -35,7 +35,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 
 The script:
 
-- Checks Rust and installs rustup through `winget` when missing.
+- Checks Rust >= 1.90, installs rustup through `winget` when missing, and upgrades an older rustup-managed stable toolchain before building.
 - Compiles a minimal Rust native-linker probe; when the MSVC C++ Build Tools workload is missing, it offers a `winget` installation before the main build.
 - Checks Node.js >= 20.19.0 and npm, installing Node.js LTS when needed.
 - Runs `frontend\npm ci` and `npm run build`; if Node cannot be prepared, it falls back to an existing `static/index.html`.
@@ -59,7 +59,7 @@ $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.c
 
 ### Manual build
 
-A manual build also requires the Microsoft C++ Build Tools "Desktop development with C++" workload, Node.js >= 20.19.0, and npm. Install Build Tools, Rust, and Node.js with winget:
+A manual build also requires Rust >= 1.90, the Microsoft C++ Build Tools "Desktop development with C++" workload, Node.js >= 20.19.0, and npm. Install Build Tools, Rust, and Node.js with winget:
 
 ```powershell
 winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
@@ -114,7 +114,7 @@ bash scripts/install-linux.sh
 
 The script supports common dependency paths for Ubuntu/Debian/Kali and CentOS/RHEL/Fedora/AlmaLinux/Rocky. It:
 
-- Installs or reuses Rust.
+- Installs or reuses Rust >= 1.90 and upgrades an older rustup-managed stable toolchain.
 - Prepares OpenSSL and pkg-config build dependencies.
 - Builds the frontend with Node.js >= 20.19.0, downloading a temporary runtime or using system packages when needed.
 - Builds the release binary once, reuses that artifact for installation, and deploys `static/`, bundled skills, and bundled sub-agents.
@@ -122,9 +122,10 @@ The script supports common dependency paths for Ubuntu/Debian/Kali and CentOS/RH
 
 ### Manual build
 
-In addition to the system build dependencies below, install Node.js >= 20.19.0 and npm. Distribution packages may be older than required, so verify the versions before continuing:
+In addition to the system build dependencies below, install Rust >= 1.90, Node.js >= 20.19.0, and npm. Distribution packages may be older than required, so verify the versions before continuing:
 
 ```bash
+rustc --version
 node --version
 npm --version
 ```
@@ -207,12 +208,19 @@ lingclaw install        # Install from the current source directory
 lingclaw install -d DIR # Install from a chosen source directory
 lingclaw db status      # Inspect SQLite read-only; never creates a missing DB
 lingclaw db backup      # Create and verify a consistent online SQLite snapshot
+lingclaw tui [PATH]     # Open the terminal workspace from this or another project
 lingclaw --version
 ```
 
 `start` and `restart` perform a bounded MCP preflight. A failed server warns but does not prevent service startup. `mcp-check` uses runtime timeouts for a more complete handshake and catalog diagnosis.
 
 After startup, open [http://127.0.0.1:18989](http://127.0.0.1:18989).
+
+### TUI and working directories
+
+`lingclaw tui [PATH]` completes any required first-time model setup inside the terminal before checking `/api/health` on the selected port. It reuses the daemon launcher when no service exists and polls until ready; exiting the TUI leaves the daemon running. PATH defaults to the current directory and must be an existing, canonicalizable absolute directory. A directory may bind several sessions; use `--session ID` to choose one, with `--port`, `--lang`, and `--theme` for terminal overrides. The setup masks API-key input, and Raw JSON uses the built-in editor when `$VISUAL`/`$EDITOR` is absent.
+
+Private prompts, memory, skills, agents, MCP policy, and caches always stay under `~/.lingclaw/<session-id>/workspace/`. An external working directory is used only for files, shell, Git, images, Plan evidence, and MCP roots. A deployment backup therefore cannot rely on `~/.lingclaw/` alone when sessions bind external projects. Default builds detect Kitty/Sixel/iTerm2; unsupported terminals retain the link and system-viewer fallback, while `--no-default-features` produces a text-only build.
 
 ## systemd
 
@@ -366,7 +374,7 @@ lingclaw db backup
 lingclaw db backup /path/to/lingclaw-snapshot.db
 ```
 
-The default destination is `~/.lingclaw/backups/lingclaw-<timestamp>.db`. The command refuses to overwrite an existing target and verifies integrity after completion. It backs up `lingclaw.db` only, not configuration, MCP OAuth, or workspaces.
+The default destination is `~/.lingclaw/backups/lingclaw-<timestamp>.db`. The command refuses to overwrite an existing target and verifies integrity after completion. It backs up `lingclaw.db` only, not configuration, MCP OAuth, private Session Homes, or external project working directories.
 
 Stop the service and archive the full data directory:
 
@@ -382,6 +390,8 @@ Important data:
 - `lingclaw.db` — Sessions, groups, messages, todos, usage, and sub-agent snapshots
 - `backups/` — Manual snapshots, schema-upgrade snapshots, and permanent legacy-JSON migration backups
 - `<session-id>/workspace/` — Prompts, skills, agents, and memory
+
+Project working directories bound elsewhere are not part of this archive, and session deletion never removes them. Protect them through their own version-control or backup policy.
 
 There is no `db restore` command in this release. Stop LingClaw before restoring the complete user directory or replacing `lingclaw.db` with a verified snapshot. Preserve user ownership and verify local paths, MCP commands, and S3 identity before starting the service.
 

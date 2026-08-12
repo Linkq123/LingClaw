@@ -297,6 +297,7 @@ function renderableSessions(): RenderableSession[] {
 }
 
 function renderableGroups(): RenderableGroup[] {
+  if (!state.groupsEnabled) return [];
   const items: RenderableGroup[] = dedupeValidIds(
     state.sessionGroups.map((group) => ({
       ...group,
@@ -458,7 +459,16 @@ function createSessionRow(session: RenderableSession): HTMLElement {
 
   const meta = document.createElement('div');
   meta.className = 'session-drawer-row-meta';
-  meta.textContent = session.id;
+  const workspaceName = session.workspace?.display_name || session.workspace?.path || '';
+  meta.textContent =
+    session.workspace?.kind === 'directory' && workspaceName
+      ? tr('session.workspaceMeta', { id: session.id, workspace: workspaceName })
+      : session.id;
+  if (session.workspace?.path) meta.title = session.workspace.path;
+  if (session.workspace?.available === false) {
+    meta.classList.add('is-unavailable');
+    meta.textContent += ` · ${tr('session.workspaceUnavailable')}`;
+  }
 
   content.append(titleRow, meta);
   mainButton.appendChild(content);
@@ -469,7 +479,7 @@ function createSessionRow(session: RenderableSession): HTMLElement {
     actions.push({
       action: 'rename',
       icon: 'edit',
-      label: tr('session.rename', { name: session.name || session.id }),
+      label: tr('session.edit', { name: session.name || session.id }),
       onSelect: () => callbacks?.onRename?.(session.id),
     });
   }
@@ -783,16 +793,18 @@ export function renderSessionDrawer(): void {
     empty.textContent = tr('session.noSessions');
     nodes.push(empty);
   }
-  nodes.push(
-    createSectionHeader(tr('session.sectionGroups'), groups.length, callbacks?.onCreateGroup),
-  );
-  if (groups.length > 0) {
-    nodes.push(...groups.map(createGroupRow));
-  } else {
-    const empty = document.createElement('div');
-    empty.className = 'session-drawer-empty session-drawer-empty-compact';
-    empty.textContent = tr('session.noGroups');
-    nodes.push(empty);
+  if (state.groupsEnabled) {
+    nodes.push(
+      createSectionHeader(tr('session.sectionGroups'), groups.length, callbacks?.onCreateGroup),
+    );
+    if (groups.length > 0) {
+      nodes.push(...groups.map(createGroupRow));
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'session-drawer-empty session-drawer-empty-compact';
+      empty.textContent = tr('session.noGroups');
+      nodes.push(empty);
+    }
   }
   dom.sessionDrawerList.replaceChildren(...nodes);
 }

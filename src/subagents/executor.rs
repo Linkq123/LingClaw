@@ -438,7 +438,8 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
     args_str: &str,
     config: &Config,
     http: &Client,
-    workspace: &Path,
+    session_home: &Path,
+    working_directory: &Path,
     _isolated_mcp_session: bool,
     replay_ctx: Option<crate::LiveOutputReplayCtx>,
     image_budget: Option<tools::mcp::ToolImageBudget>,
@@ -454,7 +455,8 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
         args_str,
         config,
         http,
-        workspace,
+        session_home,
+        working_directory,
         _isolated_mcp_session,
         None,
         Some(event_tx),
@@ -759,13 +761,19 @@ async fn request_forced_final_response(
     Ok((final_messages, response))
 }
 
+struct SubagentPromptContext<'a> {
+    config: &'a Config,
+    working_directory: &'a Path,
+    session_policy: &'a tools::mcp::McpSessionPolicy,
+    project_rules: &'a str,
+}
+
 fn disable_subagent_tool_images_for_compatibility(
     messages: &mut [ChatMessage],
     allowed_tools: &mut Vec<String>,
     tool_defs: &mut Vec<serde_json::Value>,
     spec: &SubAgentSpec,
-    config: &Config,
-    workspace: &Path,
+    prompt_context: &SubagentPromptContext<'_>,
 ) {
     providers::strip_tool_images_for_compatibility(messages);
     allowed_tools.retain(|tool| tool != tools::TOOL_NAME_VIEW_IMAGE);
@@ -784,8 +792,7 @@ fn disable_subagent_tool_images_for_compatibility(
         system.content = Some(build_subagent_system_prompt(
             spec,
             allowed_tools,
-            config,
-            workspace,
+            prompt_context,
         ));
     }
 }
@@ -798,6 +805,7 @@ fn disable_subagent_tool_images_for_compatibility(
 /// - Independent ReAct loop with max_turns limit
 /// - Result streamed back via parent's LiveTx with prefixed events
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn run_subagent(
     spec: &SubAgentSpec,
     prompt: &str,
@@ -810,24 +818,72 @@ pub(crate) async fn run_subagent(
     replay_ctx: Option<crate::LiveOutputReplayCtx>,
     task_id: &str,
 ) -> SubAgentOutcome {
+    run_subagent_with_working_directory(
+        spec,
+        prompt,
+        config,
+        http,
+        workspace,
+        workspace,
+        parent_live_tx,
+        cancel,
+        hooks,
+        replay_ctx,
+        task_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_subagent_with_working_directory(
+    spec: &SubAgentSpec,
+    prompt: &str,
+    config: &Config,
+    http: &Client,
+    session_home: &Path,
+    working_directory: &Path,
+    parent_live_tx: &LiveTx,
+    cancel: CancellationToken,
+    hooks: &HookRegistry,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
+    task_id: &str,
+) -> SubAgentOutcome {
     let model_id = resolve_subagent_model(config, &spec.name).to_string();
     let resolved = config.resolve_model(&model_id);
     let provider_name = config.resolve_provider_name(&model_id);
 
     // Warm only the MCP tools that this session has explicitly enabled.
     // Disabled MCP servers must not be spawned just because a sub-agent runs.
-    tools::mcp::ensure_policy_tools_cached(config, workspace).await;
+    let session_policy = tools::mcp::load_session_policy(session_home);
+    tools::mcp::ensure_tools_cached_for_policy(config, working_directory, &session_policy).await;
+    let project_rules = prompts::load_project_rules_async(working_directory, session_home).await;
+    let prompt_context = SubagentPromptContext {
+        config,
+        working_directory,
+        session_policy: &session_policy,
+        project_rules: &project_rules,
+    };
 
     // Build filtered tool definitions for this sub-agent (includes MCP tools).
-    let mut allowed_tools = super::filter_tools_for_agent_with_mcp(spec, config, workspace);
+    let mut allowed_tools = super::filter_tools_for_agent_with_mcp_policy(
+        spec,
+        config,
+        working_directory,
+        &session_policy,
+    );
     if !tools::view_image_available(config, &model_id) {
         allowed_tools.retain(|tool| tool != tools::TOOL_NAME_VIEW_IMAGE);
     }
-    let mut tool_defs =
-        build_filtered_tool_defs(&allowed_tools, config, workspace, resolved.provider);
+    let mut tool_defs = build_filtered_tool_defs(
+        &allowed_tools,
+        config,
+        working_directory,
+        &session_policy,
+        resolved.provider,
+    );
 
     // Build isolated message history.
-    let system_prompt = build_subagent_system_prompt(spec, &allowed_tools, config, workspace);
+    let system_prompt = build_subagent_system_prompt(spec, &allowed_tools, &prompt_context);
     let mut messages: Vec<ChatMessage> = vec![
         ChatMessage {
             role: "system".into(),
@@ -951,7 +1007,7 @@ pub(crate) async fn run_subagent(
                         http,
                         &resolved,
                         &messages,
-                        workspace,
+                        session_home,
                         config.s3.as_ref(),
                         &sub_tx,
                         &think_level,
@@ -972,8 +1028,7 @@ pub(crate) async fn run_subagent(
                         &mut allowed_tools,
                         &mut tool_defs,
                         spec,
-                        config,
-                        workspace,
+                        &prompt_context,
                     );
                 }
                 let result = call_outcome.result;
@@ -1045,11 +1100,14 @@ pub(crate) async fn run_subagent(
                     let mut all_read_only = tool_calls.len() > 1;
                     if all_read_only {
                         for tc in tool_calls {
-                            if !tools::is_parallelizable_tool_call(
-                                &tc.function.name,
-                                config,
-                                workspace,
-                            ) {
+                            if !tools::is_parallelizable_tool(&tc.function.name)
+                                && !tools::mcp::is_read_only_tool_name_for_policy(
+                                    &tc.function.name,
+                                    config,
+                                    working_directory,
+                                    &session_policy,
+                                )
+                            {
                                 all_read_only = false;
                                 break;
                             }
@@ -1101,7 +1159,7 @@ pub(crate) async fn run_subagent(
                                     }),
                                 tool_id: tc.id.clone(),
                                 cycle: cycles,
-                                workspace: workspace.to_path_buf(),
+                                workspace: working_directory.to_path_buf(),
                                 outcome_output: None,
                                 outcome_is_error: None,
                                 outcome_duration_ms: None,
@@ -1171,7 +1229,8 @@ pub(crate) async fn run_subagent(
                                         &effective_args,
                                         config,
                                         http,
-                                        workspace,
+                                        session_home,
+                                        working_directory,
                                         false,
                                         replay_ctx.clone(),
                                         Some(call_image_budget.clone()),
@@ -1191,7 +1250,8 @@ pub(crate) async fn run_subagent(
                                         &effective_args,
                                         config,
                                         http,
-                                        workspace,
+                                        session_home,
+                                        working_directory,
                                         false,
                                         replay_ctx.clone(),
                                         Some(call_image_budget.clone()),
@@ -1221,7 +1281,7 @@ pub(crate) async fn run_subagent(
                             let outcome = apply_after_tool_exec_hook(
                                 hooks,
                                 config,
-                                workspace,
+                                working_directory,
                                 cycles,
                                 &tc.function.name,
                                 &effective_args,
@@ -1364,7 +1424,7 @@ pub(crate) async fn run_subagent(
                                     }),
                                 tool_id: tc.id.clone(),
                                 cycle: cycles,
-                                workspace: workspace.to_path_buf(),
+                                workspace: working_directory.to_path_buf(),
                                 outcome_output: None,
                                 outcome_is_error: None,
                                 outcome_duration_ms: None,
@@ -1465,7 +1525,8 @@ pub(crate) async fn run_subagent(
                                 let name = tc.function.name.clone();
                                 let cfg = config.clone();
                                 let cl = http.clone();
-                                let ws = workspace.to_path_buf();
+                                let session_home = session_home.to_path_buf();
+                                let working_directory = working_directory.to_path_buf();
                                 let parent_live_tx = parent_live_tx.clone();
                                 let task_id = task_id.to_string();
                                 let agent_name = spec.name.clone();
@@ -1484,7 +1545,8 @@ pub(crate) async fn run_subagent(
                                             &args,
                                             &cfg,
                                             &cl,
-                                            &ws,
+                                            &session_home,
+                                            &working_directory,
                                             true,
                                             replay_ctx,
                                             Some(call_image_budget),
@@ -1532,7 +1594,7 @@ pub(crate) async fn run_subagent(
                             let outcome = finalize_parallel_batch_outcome(
                                 hooks,
                                 config,
-                                workspace,
+                                working_directory,
                                 cycles,
                                 &tc.function.name,
                                 eff_args,
@@ -1699,7 +1761,7 @@ pub(crate) async fn run_subagent(
             &resolved,
             config,
             http,
-            workspace,
+            session_home,
             &messages,
             parent_live_tx,
         )
@@ -1812,14 +1874,17 @@ pub(crate) async fn run_subagent(
 fn build_subagent_system_prompt(
     spec: &SubAgentSpec,
     allowed_tools: &[String],
-    config: &Config,
-    workspace: &Path,
+    prompt_context: &SubagentPromptContext<'_>,
 ) -> String {
     let tool_list = if allowed_tools.is_empty() {
         "(no tools available)".to_string()
     } else {
         // Build a lookup of MCP tool descriptions from cache.
-        let mcp_descriptors = tools::mcp::cached_list_tools(config, workspace);
+        let mcp_descriptors = tools::mcp::cached_list_tools_for_policy(
+            prompt_context.config,
+            prompt_context.working_directory,
+            prompt_context.session_policy,
+        );
         let mcp_desc_map: std::collections::HashMap<&str, &str> = mcp_descriptors
             .iter()
             .map(|d| (d.exposed_name.as_str(), d.description.as_str()))
@@ -1842,7 +1907,7 @@ fn build_subagent_system_prompt(
             .join("\n")
     };
 
-    format!(
+    let mut prompt = format!(
         "{}\n\n---\n\n\
          ## Sub-Agent Context\n\
          You are running as a sub-agent with isolated context. \
@@ -1855,13 +1920,16 @@ fn build_subagent_system_prompt(
          - You cannot delegate to other sub-agents (no `task` tool).\n\
          - Provide your final answer as a clear, well-structured response.",
         spec.system_prompt, tool_list, spec.max_turns,
-    )
+    );
+    prompt.push_str(prompt_context.project_rules);
+    prompt
 }
 
 fn build_filtered_tool_defs(
     allowed_tools: &[String],
     config: &Config,
-    workspace: &Path,
+    working_directory: &Path,
+    session_policy: &tools::mcp::McpSessionPolicy,
     provider: crate::config::Provider,
 ) -> Vec<serde_json::Value> {
     let all_specs = crate::tools::tool_specs();
@@ -1899,7 +1967,8 @@ fn build_filtered_tool_defs(
         .collect();
 
     // Append MCP tool definitions from cache.
-    let mcp_descriptors = tools::mcp::cached_list_tools(config, workspace);
+    let mcp_descriptors =
+        tools::mcp::cached_list_tools_for_policy(config, working_directory, session_policy);
     for descriptor in mcp_descriptors {
         if !allowed_tools.iter().any(|a| a == &descriptor.exposed_name) {
             continue;
@@ -1944,18 +2013,19 @@ async fn execute_subagent_tool(
     args_str: &str,
     config: &Config,
     http: &Client,
-    workspace: &Path,
+    session_home: &Path,
+    working_directory: &Path,
     isolated_mcp_session: bool,
     event_tx: Option<tools::ToolEventSender>,
     bounded_event_tx: Option<tools::BoundedToolEventSender>,
     image_budget: Option<tools::mcp::ToolImageBudget>,
 ) -> tools::ToolOutcome {
-    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mcp_policy = tools::mcp::load_session_policy(session_home);
     let mcp_result = tools::mcp::execute_tool_for_policy_with_image_budget(
         name,
         args_str,
         config,
-        workspace,
+        working_directory,
         isolated_mcp_session,
         &mcp_policy,
         image_budget.clone(),
@@ -1970,7 +2040,7 @@ async fn execute_subagent_tool(
             args_str,
             config,
             http,
-            workspace,
+            working_directory,
             event_tx,
             bounded_event_tx,
             image_budget,
@@ -2020,6 +2090,7 @@ mod tests {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         }
     }
 
@@ -2029,6 +2100,78 @@ mod tests {
             .expect("system time should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}"))
+    }
+
+    #[tokio::test]
+    async fn subagent_prompt_preserves_external_project_rules_across_rebuilds() {
+        let root = unique_temp_workspace("lingclaw-subagent-project-rules");
+        let session_home = root.join("session-home");
+        let project = root.join("project");
+        tokio::fs::create_dir_all(&session_home)
+            .await
+            .expect("session home should be created");
+        tokio::fs::create_dir_all(&project)
+            .await
+            .expect("project should be created");
+        tokio::fs::write(
+            project.join("AGENTS.md"),
+            "# Project rule\n\nKeep delegated edits scoped.",
+        )
+        .await
+        .expect("project rules should be written");
+
+        let project_rules = prompts::load_project_rules_async(&project, &session_home).await;
+        let spec = SubAgentSpec {
+            name: "reviewer".into(),
+            description: String::new(),
+            system_prompt: "Review the delegated work.".into(),
+            max_turns: 4,
+            tools: Default::default(),
+            mcp_policy: None,
+            source: Default::default(),
+            path: String::new(),
+        };
+        let config = test_config();
+        let policy = tools::mcp::McpSessionPolicy::default();
+        let prompt_context = SubagentPromptContext {
+            config: &config,
+            working_directory: &project,
+            session_policy: &policy,
+            project_rules: &project_rules,
+        };
+        let allowed_tools = vec![tools::TOOL_NAME_VIEW_IMAGE.to_string()];
+        let initial = build_subagent_system_prompt(&spec, &allowed_tools, &prompt_context);
+        assert!(initial.contains("Keep delegated edits scoped."));
+
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: Some(initial),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        }];
+        let mut rebuilt_tools = allowed_tools;
+        let mut tool_defs = Vec::new();
+        disable_subagent_tool_images_for_compatibility(
+            &mut messages,
+            &mut rebuilt_tools,
+            &mut tool_defs,
+            &spec,
+            &prompt_context,
+        );
+        assert!(
+            messages[0]
+                .content
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains("Keep delegated edits scoped."))
+        );
+
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("temporary project should be removed");
     }
 
     #[tokio::test]
@@ -2069,6 +2212,7 @@ mod tests {
                 &serde_json::to_string(&args).expect("args should serialize"),
                 &test_config(),
                 &Client::new(),
+                &workspace,
                 &workspace,
                 false,
                 None,
@@ -2135,6 +2279,7 @@ mod tests {
                 &serde_json::to_string(&args).expect("args should serialize"),
                 &test_config(),
                 &Client::new(),
+                &workspace,
                 &workspace,
                 false,
                 None,

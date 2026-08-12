@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::executor::{augment_subagent_prompt_with_current_time, run_subagent};
+use super::executor::{
+    augment_subagent_prompt_with_current_time, run_subagent_with_working_directory,
+};
 use crate::hooks::HookRegistry;
 use crate::{Config, LiveTx, live_send, truncate};
 
@@ -479,11 +481,33 @@ pub(crate) fn interpolate_results(prompt: &str, completed: &HashMap<String, Stri
 /// If a task fails, all transitive dependents are skipped. Independent branches
 /// continue executing.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn execute_orchestration(
     plan: &OrchestrationPlan,
     config: &Config,
     http: &Client,
     workspace: &Path,
+    live_tx: &LiveTx,
+    cancel: CancellationToken,
+    hooks: &HookRegistry,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
+) -> OrchestrationOutcome {
+    execute_orchestration_with_working_directory(
+        plan, config, http, workspace, workspace, live_tx, cancel, hooks, replay_ctx,
+    )
+    .await
+}
+
+/// Execute an orchestration using private agent definitions from `agent_home`
+/// while all delegated file, shell, Git, image, and MCP work is rooted in the
+/// Session's selected `working_directory`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_orchestration_with_working_directory(
+    plan: &OrchestrationPlan,
+    config: &Config,
+    http: &Client,
+    agent_home: &Path,
+    working_directory: &Path,
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
@@ -599,7 +623,8 @@ pub(crate) async fn execute_orchestration(
                 &plan.tasks[idx],
                 config,
                 http,
-                workspace,
+                agent_home,
+                working_directory,
                 live_tx,
                 cancel.child_token(),
                 hooks,
@@ -615,7 +640,8 @@ pub(crate) async fn execute_orchestration(
                 plan,
                 config,
                 http,
-                workspace,
+                agent_home,
+                working_directory,
                 live_tx,
                 &cancel,
                 hooks,
@@ -751,7 +777,8 @@ async fn execute_single_task(
     task: &OrchestrationTask,
     config: &Config,
     http: &Client,
-    workspace: &Path,
+    agent_home: &Path,
+    working_directory: &Path,
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
@@ -762,7 +789,7 @@ async fn execute_single_task(
     let start = std::time::Instant::now();
 
     // Look up agent spec
-    let spec = match crate::subagents::discovery::find_agent(workspace, &task.agent) {
+    let spec = match crate::subagents::discovery::find_agent(agent_home, &task.agent) {
         Some(s) => s,
         None => {
             let _ = live_send(
@@ -815,12 +842,13 @@ async fn execute_single_task(
     let composite_task_id = format!("{orchestrate_id}:{}", task.id);
 
     // Run sub-agent
-    let outcome = run_subagent(
+    let outcome = run_subagent_with_working_directory(
         &spec,
         &effective_prompt,
         config,
         http,
-        workspace,
+        agent_home,
+        working_directory,
         live_tx,
         cancel,
         hooks,
@@ -904,7 +932,8 @@ async fn execute_parallel_tasks(
     plan: &OrchestrationPlan,
     config: &Config,
     http: &Client,
-    workspace: &Path,
+    agent_home: &Path,
+    working_directory: &Path,
     live_tx: &LiveTx,
     cancel: &CancellationToken,
     hooks: &HookRegistry,
@@ -923,7 +952,8 @@ async fn execute_parallel_tasks(
                     task,
                     config,
                     http,
-                    workspace,
+                    agent_home,
+                    working_directory,
                     live_tx,
                     child_cancel,
                     hooks,

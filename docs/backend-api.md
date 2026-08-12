@@ -107,6 +107,7 @@
 
 ```json
 {
+  "service": "lingclaw",
   "status": "ok",
   "version": "2.x.x",
   "model": "openai/gpt-4o-mini",
@@ -120,6 +121,7 @@
 
 ### 字段说明
 
+- `service`：固定为 `lingclaw`，供本地客户端确认目标端口运行的是 LingClaw 服务
 - `status`：固定为 `ok`
 - `version`：后端版本
 - `model`：显式配置且当前可解析的默认模型；未配置或已失效时为 `null`
@@ -144,7 +146,13 @@
       "tool_calls": 18,
       "model": "openai/gpt-4o-mini",
       "created_at": 1710000000,
-      "updated_at": 1710001234
+      "updated_at": 1710001234,
+      "workspace": {
+        "kind": "managed",
+        "path": "C:\\Users\\me\\.lingclaw\\main\\workspace",
+        "display_name": "workspace",
+        "available": true
+      }
     },
     {
       "id": "research-notes",
@@ -165,6 +173,8 @@
 - `messages` 为会话消息条数
 - `tool_calls` 为累计工具调用次数
 - 列表同时覆盖默认 `main` 和其他已创建 session
+- 每项 `workspace` 表示 Agent 实际使用的工作目录；`kind` 为 `managed` 或 `directory`。`available=false` 时历史仍可读取，但 Agent run 必须在重绑后才能启动
+- 可选查询参数 `workspace=<absolute-path>` 按规范化目录精确匹配。Windows 匹配不区分大小写，Linux 精确匹配；查询直接使用 SQLite 工作目录索引
 
 ## 4.2.1 POST /api/session
 
@@ -172,7 +182,19 @@
 
 ### 请求
 
-无请求体。
+请求体可省略，此时创建旧版兼容的托管 Session。也可以指定显示名称和工作目录：
+
+```json
+{
+  "name": "My Project",
+  "workspace": {
+    "kind": "directory",
+    "path": "E:\\work\\project"
+  }
+}
+```
+
+`workspace.kind="managed"` 使用 `~/.lingclaw/<id>/workspace/`。`directory` 要求 `path` 是现存、绝对、可规范化且可表示为 UTF-8 的目录，并且不能位于 LingClaw 私有数据目录 `~/.lingclaw/` 内。
 
 ### 响应
 
@@ -195,12 +217,13 @@
 ### 说明
 
 - 新 Session 会立即写入 `~/.lingclaw/lingclaw.db`；其 Workspace 仍位于 `~/.lingclaw/<id>/workspace/`
+- 对目录 Session 而言，该路径是私有 `session_home`；文件、Shell、Git、图片、Plan evidence 和 MCP roots 使用请求中的外部目录。LingClaw 不会向外部目录写入模板、Persona 或 Memory
 - 创建成功后会广播新的 session 列表
 - 若随机 id 碰撞，后端会重新生成；连续失败返回 `500`
 
 ## 4.2.2 PUT /api/session
 
-修改指定 session 的显示名称；session id 和工作区路径不变。
+修改指定 session 的显示名称和/或工作目录；session id 和私有 Session Home 不变。
 
 ### 查询参数
 
@@ -210,7 +233,11 @@
 
 ```json
 {
-  "name": "Research Notes"
+  "name": "Research Notes",
+  "workspace": {
+    "kind": "directory",
+    "path": "E:\\work\\research"
+  }
 }
 ```
 
@@ -235,12 +262,72 @@
 ### 说明
 
 - `name` 会去除首尾空白，不能为空，最长 80 个字符
+- `workspace` 可省略；`managed` 重新绑定到私有 Session Home，`directory` 使用与创建接口相同的路径校验
+- Agent run、排队委托或活动计划存在时禁止重绑，分别返回 `409 session_busy` 或 `409 plan_active`
+- 外部目录暂时丢失不影响历史与元数据读取；开始运行返回 `workspace_unavailable`
+- 删除 Session 只删除数据库状态和私有 `~/.lingclaw/<id>/`，永不删除外部工作目录
 - 保存成功后会持久化 session，并广播新的 session 列表
 - 未知 session 返回 `404`，非法名称返回 `400`
 
-## 4.2.3 Session Group APIs
+## 4.2.3 DELETE /api/session
+
+删除指定的非 Main Session。该接口使用与 `/delete`、WebUI 相同的运行安全检查：活动连接、直接运行、排队或委托任务存在时拒绝删除。
+
+```text
+DELETE /api/session?session=<session-id>
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "session_id": "a1b2c3",
+  "message": "Deleted session: a1b2c3"
+}
+```
+
+- 请求必须通过本机 Host/Origin 校验。
+- `main` 永远不可删除。
+- 删除数据库状态和私有 Session Home；绑定的外部工作目录永不删除。
+- 删除成功后广播新的 Session 列表。
+
+## 4.2.4 GET /api/workspaces/browse
+
+本机目录选择器使用的只读接口。仅接受通过本地请求校验的调用。
+
+```text
+GET /api/workspaces/browse?path=E%3A%5Cwork
+```
+
+响应只包含当前规范化目录、父目录、用户 Home、磁盘根和直接子目录；不返回文件名或文件内容：
+
+```json
+{
+  "current": "E:\\work",
+  "parent": "E:\\",
+  "home": "C:\\Users\\me",
+  "roots": ["C:\\", "E:\\"],
+  "directories": [
+    { "name": "project", "path": "E:\\work\\project" }
+  ]
+}
+```
+
+## 4.2.4 Session Group APIs
 
 Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、成员 Session ID、升级管理员、待投票项、群聊消息和成员 run 状态。`main` 是每个 Group 的隐式 owner/admin，不写入成员表，因此不会被 Group dispatch 派发。Group 有独立历史；被派发的成员 Session 也会收到一条固定格式用户消息，内容为 Group 上下文摘要和 Main 指令，因此 Group 历史与成员 Session 历史都会被写入。
+
+Group 功能由 `settings.enableGroups` 显式启用，缺省为 `false`。关闭时本节所有 HTTP 接口统一返回：
+
+```json
+{
+  "code": "group_feature_disabled",
+  "error": "Group chat is disabled by configuration."
+}
+```
+
+状态码为 `403 Forbidden`；已有 Group 数据不会删除。
 
 ### GET /api/session-groups
 
@@ -411,14 +498,17 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
 
 ## 4.4 GET /api/client-config
 
-返回前端运行所需的轻量配置。目前主要用于图片上传 token 和当前 S3 配置身份。
+返回前端和 TUI 运行所需的轻量配置，包括功能发现、图片上传 token 和当前 S3 配置身份。客户端应在读取 Group 数据或建立 Group socket 前先读取该接口。
 
 ### 响应
 
 ```json
 {
   "upload_token": "...",
-  "s3_config_id": "..."
+  "s3_config_id": "...",
+  "features": {
+    "groups": false
+  }
 }
 ```
 
@@ -427,6 +517,7 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
 - 仅本地请求可访问
 - `upload_token` 由前端拿到后用于 `POST /api/upload-images`
 - `s3_config_id` 是不包含明文凭据的当前 S3 配置身份；未配置 S3 时为 `null`
+- `features.groups` 是当前热更新的 Group 开关；字段缺失的旧服务端应按 `false` 处理
 - 客户端必须把 token 与同一次有效配置身份一起使用；强制刷新产生的新响应应覆盖旧的并发响应
 
 ## 4.5 GET /api/config
@@ -514,7 +605,7 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
 
 ### 请求体
 
-顶层必须包含 `config` 字段。Settings 等“先读后整份保存”的客户端还应携带上次 GET 返回的可选 `baseConfigFileEtag`：
+顶层必须包含 `config` 字段。Settings 等“先读后整份保存”的客户端还应携带上次 GET 返回的可选 `baseConfigFileEtag`。可选 `session` 指定此次 MCP `cwd` 校验所使用的 Session 工作目录；缺失时使用当前已加载 Main 的工作目录，并为旧客户端保留托管 Main 目录回退：
 
 ```json
 {
@@ -532,6 +623,7 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
       "dailyReflection": false,
       "enableStateDigest": true,
       "enableTaskPlan": false,
+      "enableGroups": false,
       "enableS3": true,
       "openaiStreamIncludeUsage": false,
       "anthropicPromptCaching": false
@@ -595,6 +687,7 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
       "lifecycleDays": 14
     }
   },
+  "session": "main",
   "baseConfigFileEtag": "4d2f0a9f4c8a0e7b4f51b6d61ce1c56b9f80fbfe13a4b3662bce289b55b6905f"
 }
 ```
@@ -618,6 +711,8 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
 
 若 `baseConfigFileEtag` 与写锁内重新读取到的文件内容不一致，服务端返回 `409 Conflict`，不会写文件或热重载。响应包含当前 `config`（若仍可解析）、`configRevision` 与 `configFileEtag`；客户端应保留本地编辑并明确让用户重新加载，而不是自动覆盖任一版本。只执行 Session `/model` 不会改变文件 ETag，因此不会产生无关的 Settings 保存冲突。
 
+当配置包含 MCP `cwd` 时，服务端会按 `session` 对应的持久化 `working_directory` 执行路径边界校验。显式 Session 不存在时返回 `404`；`session` 不是非空字符串时返回 `400`。这不会把 MCP policy 或其他 LingClaw 私有数据写入外部工作目录。
+
 ```json
 {
   "error": "Configuration changed after it was loaded. Reload the latest configuration before saving.",
@@ -637,6 +732,7 @@ Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、
 - `maxLlmRetries`: 非负整数
 - `enableStateDigest` 默认可开启
 - `enableTaskPlan` 默认关闭；界面名称为“自动执行提纲”。开启后仅在没有批准计划的普通 Execute run 中生成 `TaskPlan`、注入 `## Task Plan` 动态上下文并发送 `task_plan` live event；Plan-only 与批准计划执行期间抑制
+- `enableGroups` 默认关闭；热关闭会停止活动 Group run、广播 `feature_status` 并断开 Group socket，但不删除持久化 Group 数据
 
 #### models.providers
 
@@ -1533,7 +1629,7 @@ ws://127.0.0.1:18989/ws?group=a1b2c3&session=main
 - 普通 session socket 省略 `session` 时默认绑定 `main`；group socket 必须显式传 `session=main` 作为前端 group 控制 UI 的连接要求
 - 指定的 session 不存在时，服务端会按该 id 创建新 session（前提是 id 合法）
 - 非法 session id，以及已持久化但损坏或当前无法加载的 session，都会回退到 `main`，并额外推送一条 `error` 事件说明原因
-- `group` 存在时进入 group chat，不会自动创建 group；未知/非法 group 或未携带 `session=main` 的 group socket 会返回 `error` 并关闭。`session=main` 是 UI 防误用约束，不是浏览器/本地进程之间的安全授权边界
+- `group` 存在时进入 group chat，不会自动创建 group；`settings.enableGroups=false` 时在升级前返回 `403 group_feature_disabled`。未知/非法 group 或未携带 `session=main` 的 group socket 会返回 `error` 并关闭。`session=main` 是 UI 防误用约束，不是浏览器/本地进程之间的安全授权边界
 
 建立连接后，服务端通常会按以下顺序推送初始化事件：
 
@@ -1783,6 +1879,21 @@ Group socket 初始化顺序通常为：
 下表列出前端需要处理的主要事件。
 
 ## 5.3.1 会话与历史
+
+### `feature_status`
+
+Settings 热保存功能开关后，普通 Session socket 收到：
+
+```json
+{
+  "type": "feature_status",
+  "features": {
+    "groups": false
+  }
+}
+```
+
+Group 从开启变为关闭时，Runtime 先把活动成员 run 持久化为 `stopped`、取消成员任务并向相关连接广播一次该事件，然后关闭 Group socket。客户端应清空 Group 运行态并返回 Main；普通 Session socket 保持连接。重新开启后可重新请求原 Group 数据。
 
 ### `storage_status`
 
@@ -2960,7 +3071,7 @@ Provider 映射如下：
 
 - `/api/config/test-model` 与 `/api/config/test-mcp` 的“联通性失败”通常返回 `200 + {ok:false}`
 - `/api/config` 在配置文件语法错误时不会返回 4xx，而是返回可恢复信息
-- `/api/sessions` 返回当前已知 session 摘要列表，`main` 固定置顶；`POST /api/session` 创建随机 6 位 id 的新 session，`PUT /api/session` 只修改 session 显示名称
+- `/api/sessions` 返回当前已知 Session 摘要列表，`main` 固定置顶；`POST /api/session` 创建随机 6 位 id 的新 Session，`PUT /api/session` 修改显示名称和/或工作目录，`DELETE /api/session` 删除非 Main Session
 - `/api/todos` 使用整表替换 + revision 冲突语义；冲突时返回 `409 + 当前快照`
 - 普通 Session WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片或运行选项消息 / plan_action / 兼容 execute_plan_id”自动分流；Group WebSocket 使用 `type:"group_message"`，并拒绝 Plan Mode
 - 忙碌时普通文本会进入 deferred intervention 队列，不会立即中断主执行

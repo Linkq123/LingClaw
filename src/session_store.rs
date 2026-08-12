@@ -17,8 +17,8 @@ use std::{
 };
 
 use crate::{
-    Config, Session, config_dir_path, context_input_budget_for_model, estimate_tokens_for_provider,
-    format_token_count, format_usage_block, prompts,
+    Config, Session, SessionWorkspaceKind, config_dir_path, context_input_budget_for_model,
+    estimate_tokens_for_provider, format_token_count, format_usage_block, prompts,
 };
 
 use super::{AppState, ChatMessage};
@@ -44,6 +44,8 @@ pub(crate) struct SessionSummary {
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
     pub(crate) corrupt: bool,
+    pub(crate) workspace_kind: SessionWorkspaceKind,
+    pub(crate) working_directory: PathBuf,
 }
 
 impl SessionSummary {
@@ -57,14 +59,32 @@ impl SessionSummary {
             created_at: session.created_at,
             updated_at: session.updated_at,
             corrupt: false,
+            workspace_kind: session.workspace_kind,
+            working_directory: session.working_directory.clone(),
         }
     }
 
-    pub(crate) fn to_json(&self, config: &Config, session: Option<&Session>) -> serde_json::Value {
+    pub(crate) fn to_json(
+        &self,
+        config: &Config,
+        session: Option<&Session>,
+        workspace_available: bool,
+    ) -> serde_json::Value {
         let model = session
             .map(|session| session.effective_model(&config.model).to_string())
             .or_else(|| self.model_override.clone())
             .unwrap_or_else(|| config.model.clone());
+        // `std::fs::canonicalize` returns extended-length `\\?\` paths on
+        // Windows. Keep those internally for stable matching, but never expose
+        // the implementation prefix in the WebUI/TUI-facing summary.
+        let workspace_path = crate::display_working_directory(&self.working_directory);
+        let display_name = self
+            .working_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&workspace_path)
+            .to_string();
         json!({
             "id": self.id,
             "name": self.name,
@@ -74,8 +94,25 @@ impl SessionSummary {
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "corrupt": self.corrupt,
+            "workspace": {
+                "kind": self.workspace_kind.as_str(),
+                "path": workspace_path,
+                "display_name": display_name,
+                "available": workspace_available,
+            },
         })
     }
+}
+
+/// Probe a working directory without blocking a Tokio worker or allowing a
+/// disconnected network/removable path to stall Session discovery indefinitely.
+pub(crate) async fn working_directory_available(path: &Path) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        tokio::fs::metadata(path),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok_and(|metadata| metadata.is_dir()))
 }
 
 #[cfg(test)]
@@ -871,6 +908,8 @@ pub(crate) fn session_for_storage(session: &Session) -> Result<Session, String> 
     let mut stored: Session = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
     normalize_session(&mut stored);
     stored.workspace = crate::session_workspace_path(&stored.id);
+    stored.working_directory = session.working_directory.clone();
+    stored.workspace_kind = session.workspace_kind;
     Ok(stored)
 }
 
@@ -879,6 +918,12 @@ pub(crate) fn load_session_snapshot_from_path(path: &Path) -> Option<Session> {
     let data = std::fs::read_to_string(path).ok()?;
     let mut session: Session = serde_json::from_str(&data).ok()?;
     normalize_session(&mut session);
+    // Legacy JSON snapshots never carried workspace metadata. Test-mode JSON
+    // storage therefore has the same v5 migration semantics as production:
+    // every recovered Session is managed and rooted in its private home.
+    session.workspace = crate::session_workspace_path(&session.id);
+    session.working_directory = session.workspace.clone();
+    session.workspace_kind = SessionWorkspaceKind::Managed;
     Some(session)
 }
 
@@ -942,6 +987,9 @@ pub(crate) fn load_session_from_storage_result(id: &str) -> Result<Option<Sessio
         session.workspace = super::session_workspace_path(&session.id);
         std::fs::create_dir_all(&session.workspace).ok();
         prompts::ensure_session_workspace(&session.workspace);
+        if session.workspace_kind == SessionWorkspaceKind::Managed {
+            session.working_directory = session.workspace.clone();
+        }
         Ok(Some(session))
     }
 
@@ -991,6 +1039,8 @@ pub(crate) fn load_session_from_storage_result(id: &str) -> Result<Option<Sessio
         session.workspace = super::session_workspace_path(&session.id);
         std::fs::create_dir_all(&session.workspace).ok();
         prompts::ensure_session_workspace(&session.workspace);
+        session.workspace_kind = SessionWorkspaceKind::Managed;
+        session.working_directory = session.workspace.clone();
         Ok(Some(session))
     }
 }
@@ -1000,15 +1050,23 @@ pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
     load_session_from_storage_result(id).ok().flatten()
 }
 
-pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Session) {
+pub(crate) async fn build_refreshed_session_system_prompt(
+    state: &AppState,
+    session: &Session,
+) -> crate::ChatMessage {
     let config = state.config();
     let model = session.effective_model(&config.model).to_string();
-    let sys = crate::prompts::build_system_prompt(
+    crate::prompts::build_system_prompt_for_working_directory_async(
         &config,
         &session.workspace,
+        &session.working_directory,
         &model,
         &session.enabled_system_skills,
-    );
+    )
+    .await
+}
+
+pub(crate) fn replace_session_system_prompt(session: &mut Session, sys: crate::ChatMessage) {
     if let Some(first) = session.messages.first_mut()
         && first.role == "system"
     {
@@ -1029,13 +1087,25 @@ pub(crate) fn sanitized_non_system_message_count(session: &Session) -> usize {
 pub(crate) fn list_saved_session_summaries_result(
     dir: &Path,
 ) -> Result<Vec<SessionSummary>, String> {
+    list_saved_session_summaries_for_workspace_result(dir, None)
+}
+
+pub(crate) fn list_saved_session_summaries_for_workspace_result(
+    dir: &Path,
+    working_directory_key: Option<&str>,
+) -> Result<Vec<SessionSummary>, String> {
     #[cfg(not(test))]
     {
         let _ = dir;
-        crate::storage::Database::global()
-            .map_err(|error| error.to_string())?
-            .list_session_summaries_blocking()
-            .map_err(|error| error.to_string())
+        let database = crate::storage::Database::global().map_err(|error| error.to_string())?;
+        match working_directory_key {
+            Some(key) => database
+                .list_session_summaries_for_working_directory_blocking(key)
+                .map_err(|error| error.to_string()),
+            None => database
+                .list_session_summaries_blocking()
+                .map_err(|error| error.to_string()),
+        }
     }
 
     #[cfg(test)]
@@ -1057,10 +1127,20 @@ pub(crate) fn list_saved_session_summaries_result(
                             created_at: 0,
                             updated_at: 0,
                             corrupt: true,
+                            workspace_kind: SessionWorkspaceKind::Managed,
+                            working_directory: crate::session_workspace_path(id),
                         });
                     }
                 }
             }
+        }
+        if let Some(expected_key) = working_directory_key {
+            out.retain(|summary| {
+                crate::working_directory_key(&summary.working_directory)
+                    .ok()
+                    .as_deref()
+                    == Some(expected_key)
+            });
         }
         sort_session_summaries(&mut out);
         Ok(out)

@@ -23,6 +23,7 @@ type GroupPersistGateLock =
     OnceLock<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 static GROUP_PERSIST_GATES: GroupPersistGateLock = OnceLock::new();
 static GROUP_ROSTER_GATE: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+static GROUP_FEATURE_GATE: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionGroup {
@@ -214,6 +215,13 @@ pub(crate) fn group_roster_gate() -> Arc<tokio::sync::Mutex<()>> {
     GROUP_ROSTER_GATE
         .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Serializes Group feature transitions against Group reads and mutations.
+/// Normal operations take a read guard; configuration saves take the write
+/// guard before changing `enableGroups` and keep it through hot-disable.
+pub(crate) fn group_feature_gate() -> &'static tokio::sync::RwLock<()> {
+    GROUP_FEATURE_GATE.get_or_init(|| tokio::sync::RwLock::new(()))
 }
 
 pub(crate) fn validate_group_id(id: &str) -> Result<&str, String> {
@@ -830,6 +838,8 @@ mod tests {
             created_at: 0,
             updated_at,
             corrupt: false,
+            workspace_kind: crate::SessionWorkspaceKind::Managed,
+            working_directory: std::path::PathBuf::new(),
         }
     }
 

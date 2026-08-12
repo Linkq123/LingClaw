@@ -3,6 +3,27 @@ use serde_json::json;
 use std::{collections::HashMap, time::Duration};
 
 #[test]
+fn group_chat_is_opt_in_and_parses_the_explicit_setting() {
+    let omitted: JsonConfig = serde_json::from_str(r#"{"settings":{}}"#)
+        .expect("settings without enableGroups should parse");
+    let enabled: JsonConfig = serde_json::from_str(r#"{"settings":{"enableGroups":true}}"#)
+        .expect("enableGroups should parse");
+
+    assert!(
+        !omitted
+            .settings
+            .unwrap_or_default()
+            .enable_groups
+            .unwrap_or(false),
+        "missing enableGroups must remain disabled for upgraded installations"
+    );
+    assert_eq!(
+        enabled.settings.unwrap_or_default().enable_groups,
+        Some(true)
+    );
+}
+
+#[test]
 fn primary_model_selection_ignores_blank_json_before_environment() {
     let (model, explicit) = selected_primary_model(
         Some("   ".to_string()),
@@ -167,6 +188,7 @@ fn runtime_alignment_config(
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     }
 }
 

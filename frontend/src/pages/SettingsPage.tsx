@@ -480,6 +480,9 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
         <SettingsRow label={tr('settings.field.taskPlan')}>
           <TriSelect value={s.enableTaskPlan} onChange={(v) => set({ enableTaskPlan: v })} />
         </SettingsRow>
+        <SettingsRow label={tr('settings.field.enableGroups')}>
+          <TriSelect value={s.enableGroups} onChange={(v) => set({ enableGroups: v })} />
+        </SettingsRow>
         <SettingsRow label={tr('settings.field.enableS3')}>
           <TriSelect value={s.enableS3} onChange={(v) => set({ enableS3: v })} />
         </SettingsRow>
@@ -2169,6 +2172,7 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
 
 function CorruptConfigView({
   data,
+  sessionId,
   conflict,
   onDirtyChange,
   onStatus,
@@ -2177,6 +2181,7 @@ function CorruptConfigView({
   onReloaded,
 }: {
   data: ConfigApiResponse;
+  sessionId: string;
   conflict: boolean;
   onDirtyChange: (dirty: boolean) => void;
   onStatus: (msg: string, type?: string) => void;
@@ -2222,6 +2227,7 @@ function CorruptConfigView({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           config: parsed,
+          ...(sessionId !== 'main' ? { session: sessionId } : {}),
           ...(typeof data.configFileEtag === 'string'
             ? { baseConfigFileEtag: data.configFileEtag }
             : {}),
@@ -2992,6 +2998,7 @@ export function SettingsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           config: finalConfig,
+          ...(settingsSessionId !== 'main' ? { session: settingsSessionId } : {}),
           ...(loadedConfigFileEtag ? { baseConfigFileEtag: loadedConfigFileEtag } : {}),
         }),
       });
@@ -3116,6 +3123,7 @@ export function SettingsPage() {
           >
             <CorruptConfigView
               data={corruptData}
+              sessionId={settingsSessionId}
               conflict={configConflict}
               onDirtyChange={setCorruptDraftDirty}
               onStatus={handleStatus}

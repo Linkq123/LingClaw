@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 MIN_NODE_VERSION="20.19.0"
+MIN_RUST_VERSION="1.90.0"
 PREFERRED_NODE_MAJOR="24"
 TEMP_NODE_DIR=""
 
@@ -33,8 +34,26 @@ prompt_yes_no() {
 
 ensure_rust() {
   if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
-    info "Rust environment already installed: $(rustc --version)"
-    info 'No additional Rust environment installation is required.'
+    local rust_version
+    rust_version="$(current_rust_version || true)"
+    if [[ -n "$rust_version" ]] && version_gte "$rust_version" "$MIN_RUST_VERSION"; then
+      info "Rust environment already installed: $(rustc --version)"
+      info 'No additional Rust environment installation is required.'
+      return 0
+    fi
+
+    if ! command -v rustup >/dev/null 2>&1; then
+      warn "The active Rust compiler is ${rust_version:-unknown}, but LingClaw requires rustc >= $MIN_RUST_VERSION. This Rust installation is not managed by rustup; update it manually or install rustup from https://rustup.rs, then retry."
+      exit 1
+    fi
+
+    info "Updating the Rust stable toolchain (LingClaw requires rustc >= $MIN_RUST_VERSION)."
+    rustup toolchain install stable --profile minimal
+    rustup default stable
+    # Keep this installer on stable even when the source directory has an older override.
+    export RUSTUP_TOOLCHAIN=stable
+    hash -r
+    assert_compatible_rust
     return 0
   fi
 
@@ -45,10 +64,33 @@ ensure_rust() {
     source "$HOME/.cargo/env"
   fi
 
+  export RUSTUP_TOOLCHAIN=stable
+  hash -r
+  assert_compatible_rust
+}
+
+current_rust_version() {
+  rustc --version 2>/dev/null | sed -nE 's/^rustc ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1
+}
+
+assert_compatible_rust() {
   if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
     warn 'Rust installation did not finish correctly. Please check rustup output and retry.'
     exit 1
   fi
+
+  local rust_version
+  rust_version="$(current_rust_version || true)"
+  if [[ -z "$rust_version" ]]; then
+    warn "Unable to determine the active rustc version. LingClaw requires rustc >= $MIN_RUST_VERSION."
+    exit 1
+  fi
+  if ! version_gte "$rust_version" "$MIN_RUST_VERSION"; then
+    warn "The active Rust compiler is $rust_version, but LingClaw requires rustc >= $MIN_RUST_VERSION. Run 'rustup update stable' and retry."
+    exit 1
+  fi
+
+  info "Compatible Rust environment ready: $(rustc --version)"
 }
 
 install_build_deps() {

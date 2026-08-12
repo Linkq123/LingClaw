@@ -14,6 +14,7 @@
     "dailyReflection": false,
     "enableStateDigest": true,
     "enableTaskPlan": false,
+    "enableGroups": false,
     "enableS3": true
   },
   "models": {

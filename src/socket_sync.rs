@@ -115,12 +115,28 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
     ws_send(tx, &view_state).await;
     ws_send(tx, &todos_state).await;
     ws_send(tx, &history).await;
-    match crate::build_group_list_payload() {
-        Ok(payload) => {
-            ws_send(tx, &payload).await;
+    // Serialize the initial discovery payload with Group feature transitions.
+    // The runtime Config can change while plan history is being attached, so
+    // consult the latest value while holding the shared feature gate.
+    let group_feature_guard = crate::session_group::group_feature_gate().read().await;
+    let groups_enabled = state.config().enable_groups;
+    ws_send(
+        tx,
+        &json!({
+            "type": "feature_status",
+            "features": { "groups": groups_enabled },
+        }),
+    )
+    .await;
+    if groups_enabled {
+        match crate::build_group_list_payload() {
+            Ok(payload) => {
+                ws_send(tx, &payload).await;
+            }
+            Err(_) => crate::send_storage_status(tx, state).await,
         }
-        Err(_) => crate::send_storage_status(tx, state).await,
     }
+    drop(group_feature_guard);
 }
 
 /// Build the session info payload including model capabilities.
@@ -276,7 +292,9 @@ pub(crate) fn build_session_usage_payload(session: &crate::Session) -> serde_jso
     })
 }
 
-pub(crate) fn build_session_list_payload(state: &AppState) -> Result<serde_json::Value, String> {
+pub(crate) async fn build_session_list_payload(
+    state: &AppState,
+) -> Result<serde_json::Value, String> {
     let config = state.config();
     let mut summaries = list_saved_session_summaries_result(&sessions_dir())?;
 
@@ -297,6 +315,7 @@ pub(crate) fn build_session_list_payload(state: &AppState) -> Result<serde_json:
 
     let mut seen_ids = std::collections::HashSet::new();
     let mut list = Vec::new();
+    let mut unique_summaries = Vec::new();
     for summary in summaries {
         let dedupe_id = if cfg!(windows) {
             summary.id.to_ascii_lowercase()
@@ -306,14 +325,25 @@ pub(crate) fn build_session_list_payload(state: &AppState) -> Result<serde_json:
         if !seen_ids.insert(dedupe_id) {
             continue;
         }
-        list.push(summary.to_json(&config, None));
+        unique_summaries.push(summary);
     }
+
+    list.extend(
+        futures::future::join_all(unique_summaries.into_iter().map(|summary| {
+            let config = config.clone();
+            async move {
+                let available = working_directory_available(&summary.working_directory).await;
+                summary.to_json(&config, None, available)
+            }
+        }))
+        .await,
+    );
 
     Ok(json!({"type":"session_list","sessions": list}))
 }
 
 pub(crate) async fn broadcast_session_list_payload(state: &AppState) {
-    let payload = match build_session_list_payload(state) {
+    let payload = match build_session_list_payload(state).await {
         Ok(payload) => payload,
         Err(_) => {
             #[cfg(not(test))]

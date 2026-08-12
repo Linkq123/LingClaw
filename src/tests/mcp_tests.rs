@@ -75,6 +75,7 @@ fn test_config_with_mcp() -> Config {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     }
 }
 
@@ -1038,7 +1039,16 @@ async fn spawn_timeout_sse_streamable_http_test_server() -> (
 }
 
 async fn clear_mcp_caches_for_test() {
-    reset_auth_file_path_for_test();
+    // Tests must never fall back to the developer's real ~/.lingclaw MCP auth
+    // file. The suite intentionally reuses common server names such as `http`,
+    // so a real token for that name can otherwise make local HTTP fixtures fail
+    // resource binding before they receive a request.
+    let isolated_auth_path = std::env::temp_dir().join(format!(
+        "lingclaw-mcp-test-auth-{}.json",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&isolated_auth_path);
+    set_auth_file_path_for_test(isolated_auth_path);
     if let Ok(mut cache) = tool_cache().lock() {
         cache.clear();
     }
@@ -1335,6 +1345,7 @@ fn runtime_tool_note_lists_enabled_servers() {
             enabled_tools: HashSet::from(["mcp__github__list_issues__abc12345".to_string()]),
             confirm_mutating_tools: false,
             client_capabilities: Default::default(),
+            cache_namespace: None,
         },
     )
     .expect("MCP session policy should save");
@@ -1577,6 +1588,62 @@ async fn cached_server_counts_for_policy_ignores_servers_without_enabled_tools()
 
     clear_mcp_caches_for_test().await;
     let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn policy_caches_are_isolated_by_private_session_home() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+    let working_directory = unique_temp_workspace("lingclaw-mcp-shared-project");
+    let session_home_a = unique_temp_workspace("lingclaw-mcp-session-home-a");
+    let session_home_b = unique_temp_workspace("lingclaw-mcp-session-home-b");
+    let config = test_config_with_mcp();
+    let server = config
+        .mcp_servers
+        .get("github")
+        .expect("github MCP server should exist");
+    let exposed_tool = build_exposed_name("github", "search");
+    let base_policy = McpSessionPolicy {
+        enabled_servers: HashSet::from(["github".to_string()]),
+        enabled_tools: HashSet::from([exposed_tool.clone()]),
+        ..Default::default()
+    };
+    save_session_policy(&session_home_a, &base_policy).expect("first policy should save");
+    save_session_policy(&session_home_b, &base_policy).expect("second policy should save");
+    let policy_a = load_session_policy(&session_home_a);
+    let policy_b = load_session_policy(&session_home_b);
+
+    let key_a = cache_key_for_policy("github", server, &working_directory, &config, &policy_a)
+        .expect("first scoped cache key should build");
+    let key_b = cache_key_for_policy("github", server, &working_directory, &config, &policy_b)
+        .expect("second scoped cache key should build");
+    assert_ne!(key_a, key_b);
+
+    tool_cache().lock().expect("tool cache lock").insert(
+        key_a,
+        CachedToolDescriptors {
+            descriptors: vec![McpToolDescriptor {
+                server_name: "github".to_string(),
+                raw_name: "search".to_string(),
+                exposed_name: exposed_tool,
+                description: "Search".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                annotations: Default::default(),
+            }],
+            loaded_at: Instant::now(),
+        },
+    );
+
+    assert_eq!(
+        cached_list_tools_for_policy(&config, &working_directory, &policy_a).len(),
+        1
+    );
+    assert!(cached_list_tools_for_policy(&config, &working_directory, &policy_b).is_empty());
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(working_directory);
+    let _ = fs::remove_dir_all(session_home_a);
+    let _ = fs::remove_dir_all(session_home_b);
 }
 
 #[tokio::test]
@@ -2800,6 +2867,49 @@ async fn catalog_snapshot_does_not_leave_cached_http_sessions() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn policy_aware_catalog_ignores_policy_files_in_the_working_directory() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let working_directory = unique_temp_workspace("lingclaw-mcp-project-policy-isolation");
+    let session_home = unique_temp_workspace("lingclaw-mcp-private-policy-isolation");
+    fs::create_dir_all(&working_directory).expect("working directory should exist");
+    fs::create_dir_all(&session_home).expect("private Session Home should exist");
+    let log_path = working_directory.join("mock.log");
+    let config = test_config_with_mock_server("default", &log_path);
+
+    save_session_policy(
+        &working_directory,
+        &McpSessionPolicy {
+            enabled_servers: HashSet::from(["mock".to_string()]),
+            client_capabilities: McpClientCapabilityPolicy {
+                roots: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("project policy fixture should save");
+    let private_policy = McpSessionPolicy {
+        cache_namespace: Some(session_home.clone()),
+        ..Default::default()
+    };
+
+    let snapshot = catalog_snapshot_for_policy(&config, &working_directory, &private_policy).await;
+
+    assert_eq!(snapshot.tools.len(), 1);
+    let log = fs::read_to_string(&log_path).expect("mock MCP log should read");
+    assert!(
+        !log.contains("\"roots\""),
+        "an external project policy must not enable private MCP capabilities"
+    );
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&working_directory);
+    let _ = fs::remove_dir_all(&session_home);
+}
+
 #[tokio::test]
 async fn catalog_snapshot_lists_resources_and_prompts_when_tools_list_fails() {
     let _guard = acquire_mcp_test_guard().await;
@@ -3133,6 +3243,7 @@ async fn policy_tool_listing_only_contacts_policy_enabled_servers() {
         enabled_tools: HashSet::from([tool_name.clone()]),
         confirm_mutating_tools: false,
         client_capabilities: Default::default(),
+        cache_namespace: None,
     };
 
     let tools = list_tools_for_policy(&config, &workspace, &policy).await;
@@ -3181,6 +3292,7 @@ async fn policy_tool_execution_does_not_probe_sanitized_colliding_disabled_serve
         enabled_tools: HashSet::from([tool_name.clone()]),
         confirm_mutating_tools: false,
         client_capabilities: Default::default(),
+        cache_namespace: None,
     };
 
     let outcome = execute_tool_for_policy(&tool_name, "{}", &config, &workspace, false, &policy)
@@ -4088,6 +4200,7 @@ async fn confirmation_policy_blocks_mutating_mcp_tools_before_execution() {
         enabled_tools: HashSet::from([tool_name.clone()]),
         confirm_mutating_tools: true,
         client_capabilities: Default::default(),
+        cache_namespace: None,
     };
 
     let outcome = execute_tool_for_policy(&tool_name, "{}", &config, &workspace, false, &policy)

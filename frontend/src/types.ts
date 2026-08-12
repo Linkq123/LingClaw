@@ -57,6 +57,12 @@ export interface SessionSummary {
   name: string;
   updated_at?: number;
   corrupt?: boolean;
+  workspace?: {
+    kind: 'managed' | 'directory';
+    path: string;
+    display_name?: string;
+    available: boolean;
+  };
 }
 
 export interface SessionGroupSummary {

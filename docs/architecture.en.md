@@ -2,27 +2,29 @@
 
 [简体中文](architecture.md) · [English](architecture.en.md) · [Back to README](../README.en.md)
 
-LingClaw is a single-process Rust runtime with a static browser frontend. Its design does not hide agent execution. It runs that execution inside an inspectable state machine, explicit tool boundaries, and a persistent data model.
+LingClaw is a single-process Rust runtime with a static browser frontend and a Ratatui terminal client. Both surfaces share the HTTP/WebSocket protocol. Its design does not hide agent execution; it runs execution inside an inspectable state machine, explicit tool boundaries, and a persistent data model.
 
 ## System overview
 
 ```mermaid
 flowchart TB
     Browser["Browser workspace"] <-->|"HTTP / WebSocket"| Server["Axum server"]
+    TUI["Ratatui terminal workspace"] <-->|"HTTP / WebSocket"| Server
     Server --> Sessions["Session and Group runtime"]
     Sessions --> Loop["Analyze → Act → Observe → Finish"]
     Loop --> Prompt["Prompt, Skills, Memory, Context"]
     Loop --> Providers["OpenAI / Anthropic / Gemini / Ollama"]
     Loop --> Tools["Built-ins / MCP / Sub-agents"]
     Sessions <--> SQLite["SQLite core storage"]
-    Sessions <--> Disk["Session workspace files"]
+    Sessions <--> Home["Private Session homes"]
+    Loop <--> Project["Selected working directories"]
     Tools --> Images["Optional S3 image pipeline"]
 ```
 
 Three responsibility layers:
 
 - **Skill** — Prompt construction, model routing, context pruning, reasoning controls, skills, and memory injection.
-- **CLI / Tools** — Files, shell, networking, todos, MCP, images, and safety checks.
+- **CLI / TUI / Tools** — Daemon management, the asynchronous terminal client, files, shell, networking, todos, MCP, images, and safety checks.
 - **Loop** — WebSocket session runtime, ReAct, slash commands, persistence, live replay, and background work.
 
 ## ReAct runtime
@@ -67,6 +69,7 @@ When historical data has no reliable start time, the frontend omits duration. A 
 | Module | Primary responsibility |
 |---|---|
 | `main.rs` | Axum routing, HTTP/WS security, shared state, config transactions, live replay |
+| `tui.rs` | Ratatui client, daemon discovery, directory-session selection, terminal events, and responsive layout |
 | `runtime_loop.rs` | Top-level Analyze/Act/Observe/Finish loop |
 | `agent.rs` | Phases, TaskIntent, WorkingState, Task Plan, finish decisions |
 | `providers.rs` | Provider conversion, requests, stream parsing, and usage |
@@ -166,13 +169,13 @@ The orchestrator validates a DAG, runs topological layers concurrently, propagat
     └── agents/
 ```
 
-`lingclaw.db` is the only persistent source for sessions, messages, todos, usage, sub-agent snapshots, and group data. Complex provider fields use JSON columns, while identity, order, time, and tool IDs remain queryable columns. Message saves fingerprint the common prefix and rewrite only the changed tail; multi-table session/group updates commit in one transaction. SQLite runs with WAL, `foreign_keys=ON`, `synchronous=NORMAL`, and a five-second busy timeout, with ownership and schema tracked through `application_id`, `schema_migrations`, and `user_version`.
+`lingclaw.db` is the only persistent source for sessions, messages, todos, usage, sub-agent snapshots, group data, and working-directory bindings. Schema v6 stores `workspace_kind`, canonical `working_directory`, and its platform comparison key in `sessions`, with an indexed lookup. Complex provider fields use JSON columns, while identity, order, time, and tool IDs remain queryable columns. Message saves fingerprint the common prefix and rewrite only the changed tail; multi-table session/group updates commit in one transaction. SQLite runs with WAL, `foreign_keys=ON`, `synchronous=NORMAL`, and a five-second busy timeout, with ownership and schema tracked through `application_id`, `schema_migrations`, and `user_version`.
 
 On the first launch that finds old `sessions/` or `groups/`, the runtime migrates before binding its listener. It applies primary/`.tmp` recovery, validates IDs, references, and hashes, atomically moves the directories to `backups/sqlite-migration-<timestamp>/`, then imports, verifies, and records completion in one SQLite transaction. A two-phase journal resumes interrupted migrations. Successful migration never reads or writes the JSON store again, and the backup is never deleted automatically. Schema upgrades create a consistent database backup first.
 
 A runtime SQLite I/O, corruption, or constraint error places the process in sticky `protected` mode. Active agent/group runs are cancelled and core database writes are rejected, while reads and independent `.lingclaw.json` saves remain available. HTTP returns stable `503 storage_protected` responses and WebSockets broadcast `storage_status`; restart after fixing the external problem.
 
-Workspace prompts, Markdown memory, Structured Memory, skills, and agents remain filesystem data. Session deletion commits the database transaction—including group membership and vote cleanup—before removing the workspace. A file-cleanup failure can leave an orphan directory but cannot resurrect the deleted database entity.
+Every session has two explicit boundaries. `session_home` stays at `~/.lingclaw/<id>/workspace/` for persona, memory, skills, agents, MCP policy, and caches. `working_directory` is the project root for file, shell, Git, image, Plan-evidence, and MCP-root operations. An external project contributes only a read-only root `AGENTS.md`/`AGENT.md` and cannot override LingClaw tool-safety policy. Session deletion commits its database transaction—including group membership and vote cleanup—then removes only the private Session Home; it never removes an external project.
 
 ### Bootstrap prompt
 
@@ -184,6 +187,7 @@ Workspace prompts, Markdown memory, Structured Memory, skills, and agents remain
 
 ### Group invariants
 
+- `settings.enableGroups` defaults to `false`. Protocol and model tools fail closed when disabled, stored Group data remains untouched, and hot-disable stops active Group runs before closing Group sockets.
 - Main is the implicit permanent owner and never a regular dispatch member.
 - Promoted admins live in `admins[]`. Admin member removal uses a two-thirds threshold over promoted admins; owner removal is direct.
 - Only `@session-id` participates in protocol routing. Display names are never parsed as targets.

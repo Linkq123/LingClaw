@@ -35,7 +35,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 
 脚本会：
 
-- 检查 Rust；缺失时通过 `winget` 安装 rustup。
+- 检查 Rust >= 1.90；缺失时通过 `winget` 安装 rustup，rustup 管理的旧工具链会在构建前自动升级 stable。
 - 使用最小 Rust 程序验证原生链接器；MSVC C++ Build Tools 缺失时，在正式构建前提供 `winget` 安装选项。
 - 检查 Node.js >= 20.19.0 与 npm；需要时安装 Node.js LTS。
 - 执行 `frontend\npm ci` 与 `npm run build`；无法准备 Node 时回退到仓库已有 `static/index.html`。
@@ -59,7 +59,7 @@ $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.c
 
 ### 手动构建
 
-手动构建同时需要 Microsoft C++ Build Tools 的“使用 C++ 的桌面开发”工作负载、Node.js >= 20.19.0 与 npm。使用 winget 安装 Build Tools、Rust 和 Node.js：
+手动构建同时需要 Rust >= 1.90、Microsoft C++ Build Tools 的“使用 C++ 的桌面开发”工作负载、Node.js >= 20.19.0 与 npm。使用 winget 安装 Build Tools、Rust 和 Node.js：
 
 ```powershell
 winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
@@ -114,7 +114,7 @@ bash scripts/install-linux.sh
 
 脚本支持 Ubuntu/Debian/Kali 与 CentOS/RHEL/Fedora/AlmaLinux/Rocky 的常见依赖路径，并会：
 
-- 安装或复用 Rust。
+- 安装或复用 Rust >= 1.90；rustup 管理的旧工具链会自动升级 stable。
 - 准备 OpenSSL 和 pkg-config 构建依赖。
 - 使用 Node.js >= 20.19.0 构建前端；必要时下载临时 Node runtime 或回退系统包。
 - 构建一次 release 二进制并复用该产物安装，同时部署 `static/`、系统 Skills 与系统 Sub-agents。
@@ -122,9 +122,10 @@ bash scripts/install-linux.sh
 
 ### 手动构建
 
-除下面的系统构建依赖外，还需要 Node.js >= 20.19.0 与 npm。发行版自带的 Node.js 可能低于要求，请在继续前确认版本：
+除下面的系统构建依赖外，还需要 Rust >= 1.90、Node.js >= 20.19.0 与 npm。发行版自带的 Rust/Node.js 可能低于要求，请在继续前确认版本：
 
 ```bash
+rustc --version
 node --version
 npm --version
 ```
@@ -207,12 +208,19 @@ lingclaw install        # 从当前源码目录安装
 lingclaw install -d DIR # 从指定源码目录安装
 lingclaw db status      # 只读检查 SQLite，不存在时不会创建
 lingclaw db backup      # 在线创建并校验一致的 SQLite 快照
+lingclaw tui [PATH]     # 从当前或指定项目目录打开终端工作台
 lingclaw --version
 ```
 
 `start` / `restart` 进行受限 MCP preflight；单个 MCP server 失败只产生警告，不阻止服务启动。`mcp-check` 使用运行时超时做更完整的握手和 catalog 诊断。
 
 服务启动后访问 [http://127.0.0.1:18989](http://127.0.0.1:18989)。
+
+### TUI 与工作目录
+
+`lingclaw tui [PATH]` 会先在终端内完成必要的首次模型配置，再检查同一端口的 `/api/health`；服务不存在时复用 daemon launcher 并轮询就绪，退出 TUI 不停止后台服务。PATH 默认为当前目录，必须是现存的绝对可规范化目录。目录可绑定多个 Session；可用 `--session ID` 指定其中一个，用 `--port`、`--lang` 和 `--theme` 覆盖终端选项。首次引导中的 API Key 使用隐藏输入；Raw JSON 在没有 `$VISUAL`/`$EDITOR` 时使用内置编辑器。
+
+私有提示、记忆、Skills、Agents、MCP policy 和缓存始终位于 `~/.lingclaw/<session-id>/workspace/`。外部工作目录只用于文件、Shell、Git、图片、Plan evidence 和 MCP roots。部署备份不能只依赖 `~/.lingclaw/`：如果 Session 绑定了外部项目，需要按项目自身策略另行备份。默认构建支持 Kitty/Sixel/iTerm2 检测；不支持图形协议时仍提供链接与系统查看器降级，使用 `--no-default-features` 可构建纯文本版本。
 
 ## systemd
 
@@ -366,7 +374,7 @@ lingclaw db backup
 lingclaw db backup /path/to/lingclaw-snapshot.db
 ```
 
-默认快照写入 `~/.lingclaw/backups/lingclaw-<timestamp>.db`。命令拒绝覆盖已有目标并在完成后执行完整性校验。它只备份 `lingclaw.db`，不包含配置、MCP OAuth 或 Workspace。
+默认快照写入 `~/.lingclaw/backups/lingclaw-<timestamp>.db`。命令拒绝覆盖已有目标并在完成后执行完整性校验。它只备份 `lingclaw.db`，不包含配置、MCP OAuth、私有 Session Home 或外部项目工作目录。
 
 停止服务后备份整个数据目录：
 
@@ -382,6 +390,8 @@ tar -czf lingclaw-backup.tar.gz "$HOME/.lingclaw"
 - `lingclaw.db`：Session、Group、消息、Todos、Usage 和 Sub-agent 快照
 - `backups/`：手工数据库快照、Schema 升级快照和永久旧 JSON 迁移备份
 - `<session-id>/workspace/`：提示、Skills、Agents 和记忆
+
+绑定到其他位置的项目工作目录不在上述归档中，且 Session 删除不会删除它们；请使用项目自身的版本控制或备份策略。
 
 本轮没有 `db restore` 命令。恢复时必须先停止 LingClaw，再还原完整用户目录或用已验证快照替换 `lingclaw.db`，保持相同用户目录权限；确认配置中的本地路径、MCP command 和 S3 identity 后再启动服务。
 

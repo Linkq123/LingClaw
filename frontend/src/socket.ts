@@ -57,6 +57,64 @@ function sessionWebSocketUrl(): string {
 
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+async function recoverDisabledGroupAfterClose(socket: WebSocket, onMessage): Promise<boolean> {
+  const closedGroupId = state.activeGroupId;
+  if (!closedGroupId) return false;
+
+  try {
+    const response = await fetch('/api/client-config', { cache: 'no-store' });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    if (payload?.features?.groups === true) return false;
+
+    // The Group socket may have been replaced while feature discovery was in
+    // flight. In that case its successor owns recovery and this stale close
+    // callback must not schedule another connection.
+    if (state.ws !== socket || state.activeGroupId !== closedGroupId) return true;
+
+    await Promise.resolve(
+      onMessage({
+        type: 'feature_status',
+        features: { groups: false },
+      }),
+    );
+    return state.ws !== socket || !state.activeGroupId || !state.groupsEnabled;
+  } catch {
+    // A failed feature probe is indistinguishable from an ordinary daemon or
+    // network outage, so preserve the existing reconnect behavior.
+    return false;
+  }
+}
+
+function scheduleReconnect(socket: WebSocket, onMessage): void {
+  if (state.ws !== socket) return;
+  if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    const delaySecs = Math.ceil(state.reconnectDelay / 1000);
+    setConnStatus('connecting', 'socket.reconnecting', {
+      seconds: delaySecs,
+      attempt: state.reconnectAttempts + 1,
+    });
+    if (state.reconnectAttempts === 0) {
+      addSystem(tr('socket.disconnectedReconnecting'));
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect(onMessage);
+    }, state.reconnectDelay);
+    state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000);
+    state.reconnectAttempts++;
+  } else {
+    completeComposerSessionTransition();
+    state.sessionSwitchInFlight = false;
+    state.composerSessionIdentityPending = false;
+    syncComposerAvailability();
+    updateAttachButton();
+    renderSessionDrawer();
+    setConnStatus('disconnected', 'common.offline');
+    addSystem(tr('socket.lostRefresh'), 'error');
+  }
+}
+
 function resetSessionScopedUiState(): void {
   finishAssistantStream({ discardIfEmpty: true });
   finishReasoningStream();
@@ -95,31 +153,13 @@ export function connect(onMessage) {
     if (state.ws !== socket) return;
     syncRestoredSessionCapabilities(restoreComposerSessionTransition());
     resetSessionScopedUiState();
-    if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      const delaySecs = Math.ceil(state.reconnectDelay / 1000);
-      setConnStatus('connecting', 'socket.reconnecting', {
-        seconds: delaySecs,
-        attempt: state.reconnectAttempts + 1,
+    if (state.activeGroupId) {
+      void recoverDisabledGroupAfterClose(socket, onMessage).then((recovered) => {
+        if (!recovered) scheduleReconnect(socket, onMessage);
       });
-      if (state.reconnectAttempts === 0) {
-        addSystem(tr('socket.disconnectedReconnecting'));
-      }
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connect(onMessage);
-      }, state.reconnectDelay);
-      state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000);
-      state.reconnectAttempts++;
-    } else {
-      completeComposerSessionTransition();
-      state.sessionSwitchInFlight = false;
-      state.composerSessionIdentityPending = false;
-      syncComposerAvailability();
-      updateAttachButton();
-      renderSessionDrawer();
-      setConnStatus('disconnected', 'common.offline');
-      addSystem(tr('socket.lostRefresh'), 'error');
+      return;
     }
+    scheduleReconnect(socket, onMessage);
   };
 
   socket.onerror = () => {

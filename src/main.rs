@@ -23,7 +23,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, mpsc, mpsc::error::TrySendError};
+use tokio::sync::{Mutex, mpsc, mpsc::error::TrySendError, watch};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
@@ -49,6 +49,7 @@ mod storage;
 mod subagents;
 mod todos;
 mod tools;
+mod tui;
 
 pub(crate) use config::{Config, DEFAULT_PORT, Provider, config_dir_path, config_file_path};
 pub(crate) use context::{
@@ -71,8 +72,9 @@ use runtime_loop::{
 #[cfg(test)]
 use session_store::load_session_from_disk;
 use session_store::{
-    SessionModelPreferences, SessionSummary, load_session_model_preferences_result,
-    refresh_session_system_prompt, save_session_to_disk_locked, session_persist_gate, sessions_dir,
+    SessionModelPreferences, SessionSummary, build_refreshed_session_system_prompt,
+    load_session_model_preferences_result, replace_session_system_prompt,
+    save_session_to_disk_locked, session_persist_gate, sessions_dir,
     update_session_think_level_locked,
 };
 use socket_sync::{
@@ -316,6 +318,31 @@ fn now_epoch() -> u64 {
 const SESSION_VERSION: u32 = 7;
 pub(crate) use plan::PendingPlan;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionWorkspaceKind {
+    #[default]
+    Managed,
+    Directory,
+}
+
+impl SessionWorkspaceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::Directory => "directory",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "managed" => Ok(Self::Managed),
+            "directory" => Ok(Self::Directory),
+            _ => Err(format!("Invalid Session workspace kind '{value}'")),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
     id: String,
@@ -378,7 +405,14 @@ struct Session {
     #[serde(default)]
     version: u32,
     #[serde(skip)]
+    /// LingClaw-owned private Session home. Persona, memory, Skills, Agents,
+    /// MCP policy and caches always remain under this directory.
     workspace: PathBuf,
+    #[serde(skip)]
+    /// Project directory used by file, shell, Git, image and Plan tools.
+    working_directory: PathBuf,
+    #[serde(skip)]
+    workspace_kind: SessionWorkspaceKind,
 }
 
 /// One day's aggregated token usage (stored in `usage_history`).
@@ -454,11 +488,141 @@ fn session_workspace_path(session_id: &str) -> PathBuf {
         .join("workspace")
 }
 
+fn display_working_directory(path: &Path) -> String {
+    let value = path.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = value.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    value
+}
+
+fn working_directory_key(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .ok_or_else(|| "Working directory must be valid UTF-8.".to_string())?;
+    // Canonical Windows paths use the internal `\\?\` / `\\?\UNC\`
+    // prefixes, while managed Session homes are often constructed as ordinary
+    // drive or UNC paths. Compare their user-facing forms so both spellings
+    // produce the same indexed key.
+    let value = display_working_directory(path);
+    Ok(if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
+    })
+}
+
+fn normalize_working_directory(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("Working directory must be an absolute path.".to_string());
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "Working directory '{}' is unavailable: {error}",
+            path.display()
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "Working directory '{}' is not a directory.",
+            canonical.display()
+        ));
+    }
+    canonical
+        .to_str()
+        .ok_or_else(|| "Working directory must be valid UTF-8.".to_string())?;
+    Ok(canonical)
+}
+
+fn path_is_same_or_descendant(path: &Path, root: &Path) -> Result<bool, String> {
+    let path = PathBuf::from(working_directory_key(path)?);
+    let root = PathBuf::from(working_directory_key(root)?);
+    Ok(path.starts_with(root))
+}
+
+fn normalize_external_working_directory(path: &Path) -> Result<PathBuf, String> {
+    let canonical = normalize_working_directory(path)?;
+    let private_root = config_dir_path().unwrap_or_else(|| PathBuf::from(".lingclaw"));
+    let private_root = if private_root.is_absolute() {
+        private_root
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                format!("Cannot resolve the LingClaw private data directory: {error}")
+            })?
+            .join(private_root)
+    };
+    let private_root = match std::fs::canonicalize(&private_root) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => private_root,
+        Err(error) => {
+            return Err(format!(
+                "LingClaw private data directory '{}' is unavailable: {error}",
+                private_root.display()
+            ));
+        }
+    };
+    if path_is_same_or_descendant(&canonical, &private_root)? {
+        return Err(
+            "Working directory must be outside the LingClaw private data directory.".to_string(),
+        );
+    }
+    Ok(canonical)
+}
+
+const WORKSPACE_FILESYSTEM_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn bounded_workspace_filesystem<T, F>(operation: String, task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    bounded_workspace_filesystem_with_timeout(operation, WORKSPACE_FILESYSTEM_TIMEOUT, task).await
+}
+
+async fn bounded_workspace_filesystem_with_timeout<T, F>(
+    operation: String,
+    timeout: Duration,
+    task: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(task)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("{operation} failed: {error}")),
+        Err(_) => Err(format!(
+            "{operation} timed out after {} milliseconds.",
+            timeout.as_millis()
+        )),
+    }
+}
+
+async fn normalize_working_directory_async(path: PathBuf) -> Result<PathBuf, String> {
+    let operation = format!("Working directory '{}' validation", path.display());
+    bounded_workspace_filesystem(operation, move || normalize_working_directory(&path)).await
+}
+
+async fn normalize_external_working_directory_async(path: PathBuf) -> Result<PathBuf, String> {
+    let operation = format!("External working directory '{}' validation", path.display());
+    bounded_workspace_filesystem(operation, move || {
+        normalize_external_working_directory(&path)
+    })
+    .await
+}
+
 impl Session {
     fn new_with_id(id: &str, name: &str) -> Self {
         let workspace = session_workspace_path(id);
         std::fs::create_dir_all(&workspace).ok();
         prompts::init_session_prompt_files(&workspace);
+        let working_directory = workspace.clone();
         Self {
             id: id.to_string(),
             name: name.to_string(),
@@ -489,7 +653,14 @@ impl Session {
             pending_plan: None,
             version: SESSION_VERSION,
             workspace,
+            working_directory,
+            workspace_kind: SessionWorkspaceKind::Managed,
         }
+    }
+
+    fn bind_managed_workspace(&mut self) {
+        self.workspace_kind = SessionWorkspaceKind::Managed;
+        self.working_directory = self.workspace.clone();
     }
 
     fn effective_model<'a>(&'a self, default: &'a str) -> &'a str {
@@ -950,6 +1121,7 @@ struct SessionClientBinding {
 struct GroupClientBinding {
     connection_id: u64,
     tx: WsTx,
+    terminal_tx: watch::Sender<Option<String>>,
     cancel: CancellationToken,
 }
 
@@ -1630,6 +1802,27 @@ pub(crate) async fn close_group_client(state: &AppState, group_id: &str) {
         clients.remove(group_id)
     };
     if let Some(binding) = binding {
+        binding.cancel.cancel();
+    }
+}
+
+pub(crate) async fn close_all_group_clients_with_event(
+    state: &AppState,
+    payload: serde_json::Value,
+) {
+    let bindings = {
+        let mut clients = state.group_clients.lock().await;
+        clients
+            .drain()
+            .map(|(_, binding)| binding)
+            .collect::<Vec<_>>()
+    };
+    let payload = payload.to_string();
+    for binding in bindings {
+        // Terminal control events must not compete with the bounded stream of ordinary
+        // group events. The socket writer prioritizes this one-shot channel, delivers the
+        // event, and then closes the connection.
+        binding.terminal_tx.send_replace(Some(payload.clone()));
         binding.cancel.cancel();
     }
 }
@@ -2903,6 +3096,12 @@ struct SessionQuery {
     session: Option<String>,
 }
 
+#[derive(Default, Deserialize)]
+struct SessionListQuery {
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct SessionModelUpdateRequest {
     model: String,
@@ -2966,9 +3165,31 @@ struct McpPromptGetRequest {
     arguments: serde_json::Value,
 }
 
+#[derive(Default, Deserialize)]
+struct SessionMutationRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    workspace: Option<SessionWorkspaceRequest>,
+}
+
+#[cfg(test)]
 #[derive(Deserialize)]
 struct SessionRenameRequest {
     name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SessionWorkspaceRequest {
+    Managed,
+    Directory { path: String },
+}
+
+#[derive(Deserialize)]
+struct WorkspaceBrowseQuery {
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2983,7 +3204,10 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(query): Query<WsSessionQuery>,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+) -> Response {
+    if query.group.is_some() && !state.config().enable_groups {
+        return session_control::group_feature_disabled_api_error().into_response();
+    }
     ws.on_upgrade(move |socket| async move {
         if let Some(group_id) = query.group {
             handle_group_socket(socket, state, group_id, query.session).await;
@@ -2991,6 +3215,7 @@ async fn ws_handler(
             handle_socket(socket, state, query.session).await;
         }
     })
+    .into_response()
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Option<String>) {
@@ -3210,14 +3435,34 @@ async fn handle_group_socket(
 ) {
     let (mut socket_tx, mut rx) = socket.split();
     let (tx, mut outbound_rx) = mpsc::channel::<String>(256);
+    let (terminal_tx, mut terminal_rx) = watch::channel::<Option<String>>(None);
     let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
     let connection_cancel = CancellationToken::new();
     let writer_cancel = connection_cancel.clone();
     let writer = tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            if socket_tx.send(WsMsg::Text(msg.into())).await.is_err() {
-                writer_cancel.cancel();
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                changed = terminal_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let terminal = terminal_rx.borrow_and_update().clone();
+                    if let Some(msg) = terminal {
+                        let _ = socket_tx.send(WsMsg::Text(msg.into())).await;
+                        writer_cancel.cancel();
+                        break;
+                    }
+                }
+                message = outbound_rx.recv() => {
+                    let Some(msg) = message else {
+                        break;
+                    };
+                    if socket_tx.send(WsMsg::Text(msg.into())).await.is_err() {
+                        writer_cancel.cancel();
+                        break;
+                    }
+                }
             }
         }
     });
@@ -3250,7 +3495,7 @@ async fn handle_group_socket(
             return;
         }
     };
-    let group = {
+    let (group, groups_disabled_during_registration) = {
         let gate = session_group::group_persist_gate(&group_id);
         let guard = gate.lock().await;
         let group = match session_group::load_group_from_storage_result(&group_id) {
@@ -3263,24 +3508,47 @@ async fn handle_group_socket(
                 return;
             }
         };
+        let mut groups_disabled = false;
         if group.is_some() {
             let mut clients = state.group_clients.lock().await;
-            // Cancel any prior connection bound to this group before replacing it, so a
-            // displaced socket (a second tab, or a reconnect racing teardown) is told to
-            // stop instead of lingering as a half-dead listener.
-            if let Some(previous) = clients.insert(
-                group_id.clone(),
-                GroupClientBinding {
-                    connection_id,
-                    tx: tx.clone(),
-                    cancel: connection_cancel.clone(),
-                },
-            ) {
-                previous.cancel.cancel();
+            // Pair the feature re-check with the registry lock used by hot
+            // disable. This closes the upgrade/config race: a connection is
+            // either registered before disable enumerates clients, or rejected
+            // after the runtime configuration has flipped off.
+            if !state.config().enable_groups {
+                groups_disabled = true;
+            } else {
+                // Cancel any prior connection bound to this group before replacing it, so a
+                // displaced socket (a second tab, or a reconnect racing teardown) is told to
+                // stop instead of lingering as a half-dead listener.
+                if let Some(previous) = clients.insert(
+                    group_id.clone(),
+                    GroupClientBinding {
+                        connection_id,
+                        tx: tx.clone(),
+                        terminal_tx: terminal_tx.clone(),
+                        cancel: connection_cancel.clone(),
+                    },
+                ) {
+                    previous.cancel.cancel();
+                }
             }
         }
-        group
+        (group, groups_disabled)
     };
+    if groups_disabled_during_registration {
+        let _ = ws_send(
+            &tx,
+            &json!({
+                "type": "feature_status",
+                "features": { "groups": false },
+            }),
+        )
+        .await;
+        drop(tx);
+        let _ = writer.await;
+        return;
+    }
     let Some(group) = group else {
         let _ = ws_send(
             &tx,
@@ -3309,7 +3577,7 @@ async fn handle_group_socket(
     if let Ok(group_list) = build_group_list_payload() {
         ws_send(&tx, &group_list).await;
     }
-    if let Ok(session_list) = socket_sync::build_session_list_payload(&state) {
+    if let Ok(session_list) = socket_sync::build_session_list_payload(&state).await {
         ws_send(&tx, &session_list).await;
     }
     send_storage_status(&tx, &state).await;
@@ -3328,6 +3596,17 @@ async fn handle_group_socket(
         let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        if !state.config().enable_groups {
+            let _ = ws_send(
+                &tx,
+                &json!({
+                    "type": "feature_status",
+                    "features": { "groups": false },
+                }),
+            )
+            .await;
+            break;
         }
         if !state.storage_is_writable() {
             send_storage_status(&tx, &state).await;
@@ -3609,6 +3888,7 @@ fn api_health_payload(state: &AppState, session_count: usize) -> serde_json::Val
     let config = state.config();
     let model = config.explicit_primary_model_ref();
     json!({
+        "service": "lingclaw",
         "status": "ok",
         "version": VERSION,
         "model": model,
@@ -3623,12 +3903,35 @@ async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(api_health_payload(&state, sessions.len()))
 }
 
+#[cfg(test)]
 async fn api_sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    api_sessions_with_filter(Query(SessionListQuery::default()), State(state)).await
+}
+
+async fn api_sessions_with_filter(
+    Query(query): Query<SessionListQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let workspace_filter = match query.workspace {
+        Some(path) => {
+            let normalized = normalize_working_directory_async(PathBuf::from(path))
+                .await
+                .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+            Some(
+                working_directory_key(&normalized)
+                    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?,
+            )
+        }
+        None => None,
+    };
     let persisted_summaries =
-        crate::session_store::list_saved_session_summaries_result(&sessions_dir())
-            .map_err(|_| storage_protected_api_error())?;
+        crate::session_store::list_saved_session_summaries_for_workspace_result(
+            &sessions_dir(),
+            workspace_filter.as_deref(),
+        )
+        .map_err(|_| storage_protected_api_error())?;
     let config = state.config();
     let mut list: Vec<serde_json::Value> = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -3648,7 +3951,16 @@ async fn api_sessions(
         }
     }
 
+    let mut unique_summaries = Vec::new();
     for summary in summaries {
+        if let Some(expected_key) = workspace_filter.as_deref()
+            && working_directory_key(&summary.working_directory)
+                .ok()
+                .as_deref()
+                != Some(expected_key)
+        {
+            continue;
+        }
         let dedupe_id = if cfg!(windows) {
             summary.id.to_ascii_lowercase()
         } else {
@@ -3657,11 +3969,103 @@ async fn api_sessions(
         if !seen_ids.insert(dedupe_id) {
             continue;
         }
-        list.push(summary.to_json(&config, None));
+        unique_summaries.push(summary);
     }
+
+    list.extend(
+        futures::future::join_all(unique_summaries.into_iter().map(|summary| {
+            let config = config.clone();
+            async move {
+                let available =
+                    crate::session_store::working_directory_available(&summary.working_directory)
+                        .await;
+                summary.to_json(&config, None, available)
+            }
+        }))
+        .await,
+    );
 
     sort_session_json_values(&mut list);
     Ok(Json(json!({"sessions": list})))
+}
+
+fn browse_root_paths() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        (b'A'..=b'Z')
+            .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![PathBuf::from("/")]
+    }
+}
+
+fn browse_home_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    home.and_then(|path| normalize_working_directory(&path).ok())
+}
+
+async fn api_workspaces_browse(
+    Query(query): Query<WorkspaceBrowseQuery>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let requested = query
+        .path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let operation = format!("Workspace directory '{}' browse", requested.display());
+    let payload = bounded_workspace_filesystem(operation, move || {
+        let current = normalize_working_directory(&requested)?;
+        let mut directories = std::fs::read_dir(&current)
+            .map_err(|error| format!("Cannot browse '{}': {error}", current.display()))?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_dir() {
+                    return None;
+                }
+                // Directory workspaces are required to have a lossless UTF-8
+                // representation. Do not advertise an entry that the create or
+                // rebind endpoint must then reject, and never substitute U+FFFD.
+                let name = entry.file_name().into_string().ok()?;
+                path.to_str()?;
+                Some(json!({
+                    "name": name,
+                    "path": display_working_directory(&path),
+                }))
+            })
+            .collect::<Vec<_>>();
+        directories.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .cmp(&b["name"].as_str().unwrap_or_default().to_lowercase())
+        });
+        let roots = browse_root_paths()
+            .into_iter()
+            .map(|path| display_working_directory(&path))
+            .collect::<Vec<_>>();
+        let home = browse_home_path().map(|path| display_working_directory(&path));
+        Ok::<_, String>(json!({
+            "current": display_working_directory(&current),
+            "parent": current.parent().map(display_working_directory),
+            "home": home,
+            "roots": roots,
+            "directories": directories,
+        }))
+    })
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    Ok(Json(payload))
 }
 
 async fn api_session_models(
@@ -3832,9 +4236,18 @@ async fn generate_available_session_id(
     ))
 }
 
+#[cfg(test)]
 async fn api_post_session(
     headers: HeaderMap,
+    state: State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    api_post_session_with_request(headers, state, None).await
+}
+
+async fn api_post_session_with_request(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
+    request: Option<Json<SessionMutationRequest>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
 
@@ -3862,19 +4275,49 @@ async fn api_post_session(
     }
 
     let config = state.config();
-    let session_name = format!("Session {session_id}");
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let session_name = request
+        .name
+        .as_deref()
+        .map(validate_session_display_name)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
+        .unwrap_or_else(|| format!("Session {session_id}"));
+    let requested_workspace = match request.workspace {
+        Some(SessionWorkspaceRequest::Managed) => Some((SessionWorkspaceKind::Managed, None)),
+        Some(SessionWorkspaceRequest::Directory { path }) => Some((
+            SessionWorkspaceKind::Directory,
+            Some(
+                normalize_external_working_directory_async(PathBuf::from(path))
+                    .await
+                    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?,
+            ),
+        )),
+        None => None,
+    };
     if !state.storage_is_writable() {
         return Err(storage_protected_api_error());
     }
     let cleanup_fresh_workspace = !session_workspace_path(&session_id).exists();
     let mut session = Session::new_with_id(&session_id, &session_name);
+    if let Some((kind, path)) = requested_workspace {
+        match kind {
+            SessionWorkspaceKind::Managed => session.bind_managed_workspace(),
+            SessionWorkspaceKind::Directory => {
+                session.workspace_kind = SessionWorkspaceKind::Directory;
+                session.working_directory = path.expect("validated directory path");
+            }
+        }
+    }
     let model = session.effective_model(&config.model).to_string();
-    let sys = prompts::build_system_prompt(
+    let sys = prompts::build_system_prompt_for_working_directory_async(
         &config,
         &session.workspace,
+        &session.working_directory,
         &model,
         &session.enabled_system_skills,
-    );
+    )
+    .await;
     session.messages.push(sys);
 
     if let Err(error) = save_session_to_disk_locked(&session).await {
@@ -3887,12 +4330,19 @@ async fn api_post_session(
         ));
     }
 
+    let workspace_available =
+        crate::session_store::working_directory_available(&session.working_directory).await;
+    let session_summary = SessionSummary::from_session(&session).to_json(
+        &config,
+        Some(&session),
+        workspace_available,
+    );
     let payload = {
         let mut sessions = state.sessions.lock().await;
         sessions.insert(session_id.clone(), session.clone());
         json!({
             "ok": true,
-            "session": SessionSummary::from_session(&session).to_json(&config, Some(&session)),
+            "session": session_summary,
         })
     };
 
@@ -3900,24 +4350,170 @@ async fn api_post_session(
     Ok(Json(payload))
 }
 
+#[cfg(test)]
 async fn api_put_session(
+    query: Query<SessionQuery>,
+    headers: HeaderMap,
+    state: State<Arc<AppState>>,
+    Json(request): Json<SessionRenameRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    api_put_session_mutation(
+        query,
+        headers,
+        state,
+        Json(SessionMutationRequest {
+            name: Some(request.name),
+            workspace: None,
+        }),
+    )
+    .await
+}
+
+async fn api_put_session_mutation(
     Query(query): Query<SessionQuery>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
-    Json(request): Json<SessionRenameRequest>,
+    Json(request): Json<SessionMutationRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
 
     let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
     let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
-    let name = validate_session_display_name(&request.name)
+    let workspace_was_supplied = request.workspace.is_some();
+    let name = request
+        .name
+        .as_deref()
+        .map(validate_session_display_name)
+        .transpose()
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    let current_workspace = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(&session_id).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+            )
+        })?;
+        (session.workspace_kind, session.working_directory.clone())
+    };
+    let requested_workspace = match request.workspace {
+        Some(SessionWorkspaceRequest::Managed)
+            if current_workspace.0 == SessionWorkspaceKind::Managed =>
+        {
+            None
+        }
+        Some(SessionWorkspaceRequest::Managed) => Some((SessionWorkspaceKind::Managed, None)),
+        Some(SessionWorkspaceRequest::Directory { path }) => {
+            let requested_path = Path::new(&path);
+            let current_directory_key = (current_workspace.0 == SessionWorkspaceKind::Directory)
+                .then(|| working_directory_key(&current_workspace.1))
+                .transpose()
+                .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+            let requested_directory_key = working_directory_key(requested_path)
+                .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+            if current_directory_key.as_deref() == Some(requested_directory_key.as_str()) {
+                None
+            } else {
+                let normalized =
+                    normalize_external_working_directory_async(requested_path.to_path_buf())
+                        .await
+                        .map_err(|error| {
+                            (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
+                        })?;
+                let normalized_key = working_directory_key(&normalized)
+                    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+                if current_directory_key.as_deref() == Some(normalized_key.as_str()) {
+                    None
+                } else {
+                    Some((SessionWorkspaceKind::Directory, Some(normalized)))
+                }
+            }
+        }
+        None => None,
+    };
+    if name.is_none() && !workspace_was_supplied {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Session update did not include a name or workspace." })),
+        ));
+    }
+    if name.is_none() && requested_workspace.is_none() {
+        let config = state.config();
+        let session = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(&session_id).cloned().ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+                )
+            })?
+        };
+        let workspace_available =
+            crate::session_store::working_directory_available(&session.working_directory).await;
+        return Ok(Json(json!({
+            "ok": true,
+            "session": SessionSummary::from_session(&session).to_json(
+                &config,
+                Some(&session),
+                workspace_available,
+            ),
+        })));
+    }
 
+    // Model preference updates take CONFIG_FILE_LOCK before active_runs. Keep
+    // workspace mutations in that same order so a config writer cannot wait
+    // for active_runs while a rebind holds active_runs and waits for config.
     let model_status_guard = CONFIG_FILE_LOCK.read().await;
+    // Workspace rebinding shares the delegated-run coordination gate and holds
+    // the direct-run registry until the new path is durable. A run therefore
+    // observes either the complete old workspace or the complete new one.
+    let workspace_control_lock = if requested_workspace.is_some() {
+        Some(session_control::session_control_lock(&state, &session_id).await)
+    } else {
+        None
+    };
+    let _workspace_control_guard = match workspace_control_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    let active_runs_guard = if requested_workspace.is_some() {
+        Some(state.active_runs.lock().await)
+    } else {
+        None
+    };
+
+    if requested_workspace.is_some() {
+        if active_runs_guard
+            .as_ref()
+            .is_some_and(|runs| runs.contains_key(&session_id))
+            || session_control::session_has_active_delegated_work(&session_id)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(
+                    json!({ "code": "session_busy", "error": "The Session workspace cannot be changed while work is active." }),
+                ),
+            ));
+        }
+        let sessions = state.sessions.lock().await;
+        if sessions
+            .get(&session_id)
+            .and_then(|session| session.pending_plan.as_ref())
+            .is_some_and(|plan| plan.status.blocks_workspace_rebind())
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(
+                    json!({ "code": "plan_active", "error": "Discard or finish the active plan before changing the workspace." }),
+                ),
+            ));
+        }
+    }
+
     let persist_gate = session_persist_gate(&session_id);
     let _persist_guard = persist_gate.lock().await;
 
-    let (session_to_save, old_session, payload, session_event) = {
+    let (mut session_to_save, old_session, session_event) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(&session_id) else {
             return Err((
@@ -3926,7 +4522,18 @@ async fn api_put_session(
             ));
         };
         let old_session = session.clone();
-        session.name = name.clone();
+        if let Some(name) = name.as_ref() {
+            session.name = name.clone();
+        }
+        if let Some((kind, path)) = requested_workspace.as_ref() {
+            match kind {
+                SessionWorkspaceKind::Managed => session.bind_managed_workspace(),
+                SessionWorkspaceKind::Directory => {
+                    session.workspace_kind = SessionWorkspaceKind::Directory;
+                    session.working_directory = path.clone().expect("validated directory path");
+                }
+            }
+        }
         session.updated_at = now_epoch();
 
         let (config, config_revision) = state.config_snapshot_with_revision();
@@ -3946,13 +4553,17 @@ async fn api_put_session(
             config_revision,
             usage,
         );
-        let payload = json!({
-            "ok": true,
-            "session": SessionSummary::from_session(session).to_json(&config, Some(session)),
-        });
-
-        (session.clone(), old_session, payload, session_event)
+        (session.clone(), old_session, session_event)
     };
+
+    if requested_workspace.is_some() {
+        let sys = build_refreshed_session_system_prompt(&state, &session_to_save).await;
+        replace_session_system_prompt(&mut session_to_save, sys.clone());
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            replace_session_system_prompt(session, sys);
+        }
+    }
 
     if let Err(error) = save_session_to_disk_locked(&session_to_save).await {
         let mut sessions = state.sessions.lock().await;
@@ -3961,15 +4572,60 @@ async fn api_put_session(
         }
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to save session name: {error}") })),
+            Json(json!({ "error": format!("Failed to save Session update: {error}") })),
         ));
     }
+
+    let config = state.config();
+    let workspace_available =
+        crate::session_store::working_directory_available(&session_to_save.working_directory).await;
+    let payload = json!({
+        "ok": true,
+        "session": SessionSummary::from_session(&session_to_save).to_json(
+            &config,
+            Some(&session_to_save),
+            workspace_available,
+        ),
+    });
 
     drop(model_status_guard);
     send_session_client_event(&state, &session_id, session_event).await;
     broadcast_session_list_payload(&state).await;
 
     Ok(Json(payload))
+}
+
+async fn api_delete_session(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let target = query.session.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing Session id" })),
+        )
+    })?;
+    let message = session_control::delete_session_with_safety_checks(&state, target, None)
+        .await
+        .map_err(|error| {
+            let status = if error.contains("active session")
+                || error.contains("running session")
+                || error.contains("active or queued")
+            {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(json!({ "error": error })))
+        })?;
+    broadcast_session_list_payload(&state).await;
+    Ok(Json(json!({
+        "ok": true,
+        "session_id": target,
+        "message": message,
+    })))
 }
 
 fn build_group_list_payload() -> Result<serde_json::Value, String> {
@@ -3981,6 +4637,9 @@ fn build_group_list_payload() -> Result<serde_json::Value, String> {
 }
 
 pub(crate) async fn broadcast_group_list_payload(state: &AppState) {
+    if !state.config().enable_groups {
+        return;
+    }
     let payload = match build_group_list_payload() {
         Ok(payload) => payload,
         Err(_) => {
@@ -4234,7 +4893,20 @@ async fn api_put_session_skills(
         .cloned()
         .collect::<HashSet<_>>();
 
-    let (session_to_save, response_payload) = {
+    let mut prompt_session = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(&session_id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+            ));
+        };
+        session.clone()
+    };
+    prompt_session.enabled_system_skills = enabled_system_skills.clone();
+    let sys = build_refreshed_session_system_prompt(&state, &prompt_session).await;
+
+    let (session_to_save, old_session, payload) = {
         let mut sessions = state.sessions.lock().await;
         let Some(session) = sessions.get_mut(&session_id) else {
             return Err((
@@ -4243,9 +4915,9 @@ async fn api_put_session_skills(
             ));
         };
         let old_session = session.clone();
-        session.enabled_system_skills = enabled_system_skills.clone();
+        session.enabled_system_skills = enabled_system_skills;
         session.updated_at = now_epoch();
-        refresh_session_system_prompt(&state, session);
+        replace_session_system_prompt(session, sys);
 
         let skills = build_session_skill_payloads(&workspace, &session.enabled_system_skills);
         let (enabled, disabled) =
@@ -4260,11 +4932,9 @@ async fn api_put_session_skills(
             "enabledSystemSkills": enabled,
             "disabledSystemSkills": disabled,
         });
-
-        (session.clone(), (old_session, payload))
+        (session.clone(), old_session, payload)
     };
 
-    let (old_session, payload) = response_payload;
     if let Err(error) = save_session_to_disk_locked(&session_to_save).await {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&session_id) {
@@ -4288,7 +4958,7 @@ async fn api_mcp_catalog(
 
     let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
     let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
-    let (session_name, workspace) = {
+    let (session_name, session_home, working_directory) = {
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(&session_id) else {
             return Err((
@@ -4296,12 +4966,17 @@ async fn api_mcp_catalog(
                 Json(json!({ "error": format!("Session '{}' not found", session_id) })),
             ));
         };
-        (session.name.clone(), session.workspace.clone())
+        (
+            session.name.clone(),
+            session.workspace.clone(),
+            session.working_directory.clone(),
+        )
     };
 
     let config = state.config();
-    let policy = tools::mcp::load_session_policy(&workspace);
-    let catalog = tools::mcp::catalog_snapshot(&config, &workspace).await;
+    let policy = tools::mcp::load_session_policy(&session_home);
+    let catalog =
+        tools::mcp::catalog_snapshot_for_policy(&config, &working_directory, &policy).await;
     let auth_state = tools::mcp::load_auth_state();
 
     let server_reports = catalog
@@ -4422,11 +5097,11 @@ async fn api_put_mcp_session_policy(
 
     let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
     let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
-    let workspace = {
+    let (session_home, working_directory) = {
         let sessions = state.sessions.lock().await;
         sessions
             .get(&session_id)
-            .map(|session| session.workspace.clone())
+            .map(|session| (session.workspace.clone(), session.working_directory.clone()))
             .ok_or_else(|| {
                 (
                     StatusCode::NOT_FOUND,
@@ -4436,7 +5111,7 @@ async fn api_put_mcp_session_policy(
     };
 
     let config = state.config();
-    let previous_policy = tools::mcp::load_session_policy(&workspace);
+    let previous_policy = tools::mcp::load_session_policy(&session_home);
     let known_servers = config
         .mcp_servers
         .iter()
@@ -4468,12 +5143,21 @@ async fn api_put_mcp_session_policy(
     let (known_tools, successful_tool_servers) = if servers_to_probe.is_empty() {
         (HashMap::new(), HashSet::new())
     } else {
-        let (tools, successful_servers) = tools::mcp::list_tools_for_servers_uncached_with_status(
-            &config,
-            &workspace,
-            &servers_to_probe,
-        )
-        .await;
+        let probe_policy = tools::mcp::McpSessionPolicy {
+            enabled_servers: enabled_servers.clone(),
+            enabled_tools: HashSet::new(),
+            confirm_mutating_tools: request.confirm_mutating_tools,
+            client_capabilities: request.client_capabilities.clone(),
+            cache_namespace: Some(session_home.clone()),
+        };
+        let (tools, successful_servers) =
+            tools::mcp::list_tools_for_servers_uncached_with_status_for_policy(
+                &config,
+                &working_directory,
+                &servers_to_probe,
+                &probe_policy,
+            )
+            .await;
         (
             tools
                 .into_iter()
@@ -4527,8 +5211,9 @@ async fn api_put_mcp_session_policy(
         enabled_tools,
         confirm_mutating_tools: request.confirm_mutating_tools,
         client_capabilities: request.client_capabilities,
+        cache_namespace: Some(session_home.clone()),
     };
-    tools::mcp::save_session_policy(&workspace, &policy).map_err(|error| {
+    tools::mcp::save_session_policy(&session_home, &policy).map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error })),
@@ -4678,11 +5363,11 @@ async fn api_mcp_resource_read(
     validate_local_request_headers(&headers)?;
     let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
     let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
-    let workspace = {
+    let (session_home, working_directory) = {
         let sessions = state.sessions.lock().await;
         sessions
             .get(&session_id)
-            .map(|session| session.workspace.clone())
+            .map(|session| (session.workspace.clone(), session.working_directory.clone()))
             .ok_or_else(|| {
                 (
                     StatusCode::NOT_FOUND,
@@ -4691,10 +5376,16 @@ async fn api_mcp_resource_read(
             })?
     };
     let config = state.config();
-    ensure_mcp_server_enabled_for_session(&config, &workspace, &request.server)?;
-    let result = tools::mcp::read_resource(&request.server, &request.uri, &config, &workspace)
-        .await
-        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    let policy = ensure_mcp_server_enabled_for_session(&config, &session_home, &request.server)?;
+    let result = tools::mcp::read_resource_for_policy(
+        &request.server,
+        &request.uri,
+        &config,
+        &working_directory,
+        &policy,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
     Ok(Json(json!({ "ok": true, "result": result })))
 }
 
@@ -4707,11 +5398,11 @@ async fn api_mcp_prompt_get(
     validate_local_request_headers(&headers)?;
     let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
     let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
-    let workspace = {
+    let (session_home, working_directory) = {
         let sessions = state.sessions.lock().await;
         sessions
             .get(&session_id)
-            .map(|session| session.workspace.clone())
+            .map(|session| (session.workspace.clone(), session.working_directory.clone()))
             .ok_or_else(|| {
                 (
                     StatusCode::NOT_FOUND,
@@ -4720,13 +5411,14 @@ async fn api_mcp_prompt_get(
             })?
     };
     let config = state.config();
-    ensure_mcp_server_enabled_for_session(&config, &workspace, &request.server)?;
-    let result = tools::mcp::get_prompt(
+    let policy = ensure_mcp_server_enabled_for_session(&config, &session_home, &request.server)?;
+    let result = tools::mcp::get_prompt_for_policy(
         &request.server,
         &request.name,
         request.arguments,
         &config,
-        &workspace,
+        &working_directory,
+        &policy,
     )
     .await
     .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
@@ -4735,9 +5427,9 @@ async fn api_mcp_prompt_get(
 
 fn ensure_mcp_server_enabled_for_session(
     config: &Config,
-    workspace: &Path,
+    session_home: &Path,
     server_name: &str,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<tools::mcp::McpSessionPolicy, (StatusCode, Json<serde_json::Value>)> {
     let Some(server) = config.mcp_servers.get(server_name) else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -4750,9 +5442,9 @@ fn ensure_mcp_server_enabled_for_session(
             Json(json!({ "error": format!("MCP server '{server_name}' is disabled") })),
         ));
     }
-    let policy = tools::mcp::load_session_policy(workspace);
+    let policy = tools::mcp::load_session_policy(session_home);
     if policy.enabled_servers.contains(server_name) {
-        Ok(())
+        Ok(policy)
     } else {
         Err((
             StatusCode::FORBIDDEN,
@@ -4816,6 +5508,9 @@ async fn api_client_config(
     Ok(Json(json!({
         "upload_token": state.upload_token,
         "s3_config_id": config.s3.as_ref().map(image_uploads::s3_config_id),
+        "features": {
+            "groups": config.enable_groups,
+        },
     })))
 }
 
@@ -5196,6 +5891,52 @@ async fn ensure_current_configured_s3_lifecycle(state: &AppState, requested_conf
     synchronize_s3_lifecycle(&state.http, s3_cfg).await;
 }
 
+async fn config_validation_working_directory(
+    state: &AppState,
+    body: &serde_json::Value,
+) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    let requested_session_id = match body.get("session") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(session_id)) if !session_id.trim().is_empty() => {
+            Some(session_id.trim())
+        }
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "session must be a non-empty Session ID" })),
+            ));
+        }
+    };
+
+    if requested_session_id.is_none() {
+        // Legacy clients do not send a Session context. Prefer the live Main
+        // binding so an externally bound Main validates against its actual
+        // project, while retaining the historical managed-home fallback during
+        // startup and isolated handler tests.
+        let sessions = state.sessions.lock().await;
+        return Ok(find_loaded_session_id(&sessions, MAIN_SESSION_ID)
+            .and_then(|session_id| sessions.get(&session_id))
+            .map(|session| session.working_directory.clone())
+            .unwrap_or_else(|| session_workspace_path(MAIN_SESSION_ID)));
+    }
+
+    let session_id = ensure_session_loaded_for_api(
+        state,
+        requested_session_id.expect("checked explicit Session context"),
+    )
+    .await?;
+    let sessions = state.sessions.lock().await;
+    sessions
+        .get(&session_id)
+        .map(|session| session.working_directory.clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+            )
+        })
+}
+
 /// PUT /api/config — validate and save the JSON config file.
 async fn api_put_config(
     headers: HeaderMap,
@@ -5257,10 +5998,10 @@ async fn api_put_config(
     if let Err(error) = config::validate_json_agent_model_refs(&parsed) {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
     }
-    if let Err(error) = config::Config::validate_json_mcp_servers_for_workspace(
-        &parsed,
-        &session_workspace_path(MAIN_SESSION_ID),
-    ) {
+    let mcp_validation_workspace = config_validation_working_directory(&state, &body).await?;
+    if let Err(error) =
+        config::Config::validate_json_mcp_servers_for_workspace(&parsed, &mcp_validation_workspace)
+    {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
     }
 
@@ -5276,6 +6017,11 @@ async fn api_put_config(
     let pretty =
         serde_json::to_string_pretty(&config_value).unwrap_or_else(|_| config_value.to_string());
 
+    // Feature transitions and Group operations use a single lock order:
+    // group feature gate first, then CONFIG_FILE_LOCK. Holding the write side
+    // across the runtime swap makes enableGroups linearizable with Group API,
+    // socket, and model-tool operations.
+    let group_feature_transition_guard = session_group::group_feature_gate().write().await;
     let _save_guard = CONFIG_FILE_LOCK.write().await;
     if let Some(base_etag) = base_config_file_etag {
         let current_content = read_config_file_snapshot_unlocked(&path).map_err(|error| {
@@ -5319,6 +6065,7 @@ async fn api_put_config(
 
     // Hot-reload: re-read the saved config into the runtime so that
     // model/MCP changes take effect without a restart.
+    let groups_were_enabled = state.config().enable_groups;
     let new_config = Config::load();
     let (applied_config, config_revision) = state.apply_runtime_config(new_config);
     if let Err(error) = normalize_session_model_efforts(&state, &applied_config).await {
@@ -5345,6 +6092,12 @@ async fn api_put_config(
     // send or slow storage/MCP I/O.
     drop(_save_guard);
 
+    if groups_were_enabled && !applied_config.enable_groups {
+        session_control::disable_group_feature_locked(&state, &group_feature_transition_guard)
+            .await;
+    }
+    drop(group_feature_transition_guard);
+
     // A first-run S3 configuration is hot-reloaded without restarting the
     // process. Ensure its lifecycle policy before the Settings save completes,
     // just as startup does, so newly enabled image tools do not depend on a
@@ -5359,6 +6112,21 @@ async fn api_put_config(
     // round sees config changes without probing session-disabled servers during
     // Settings Save.
     tools::mcp::invalidate_runtime_state_without_remote_shutdown().await;
+
+    let feature_payload = json!({
+        "type": "feature_status",
+        "features": { "groups": applied_config.enable_groups },
+    });
+    let session_ids = state
+        .session_clients
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for session_id in session_ids {
+        send_session_client_event(&state, &session_id, feature_payload.clone()).await;
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -5552,11 +6320,11 @@ async fn api_test_mcp(
 
     let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
     let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
-    let workspace = {
+    let (session_home, working_directory) = {
         let sessions = state.sessions.lock().await;
         sessions
             .get(&session_id)
-            .map(|session| session.workspace.clone())
+            .map(|session| (session.workspace.clone(), session.working_directory.clone()))
             .ok_or_else(|| {
                 (
                     StatusCode::NOT_FOUND,
@@ -5596,10 +6364,17 @@ async fn api_test_mcp(
     };
 
     let config = state.config();
+    let policy = tools::mcp::load_session_policy(&session_home);
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(config.tool_timeout.as_secs()));
     match tokio::time::timeout(
         timeout,
-        tools::mcp::test_mcp_server(server_name, &mcp_cfg, &workspace, config.tool_timeout),
+        tools::mcp::test_mcp_server_for_policy(
+            server_name,
+            &mcp_cfg,
+            &working_directory,
+            config.tool_timeout,
+            &policy,
+        ),
     )
     .await
     {
@@ -5774,7 +6549,7 @@ fn parse_serde_error_position(msg: &str) -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
-fn replace_file_from_temp(path: &Path, tmp_path: &Path) -> std::io::Result<()> {
+pub(crate) fn replace_file_from_temp(path: &Path, tmp_path: &Path) -> std::io::Result<()> {
     match std::fs::rename(tmp_path, path) {
         Ok(()) => Ok(()),
         Err(rename_err) => {
@@ -5845,6 +6620,21 @@ async fn main() {
 
     if args.get(1).map(String::as_str) == Some("db") {
         storage::handle_db_cli(&args[2..]);
+        return;
+    }
+
+    if args.get(1).map(String::as_str) == Some("tui") {
+        if args[2..]
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+        {
+            tui::print_help();
+            return;
+        }
+        if let Err(error) = tui::run(&args[2..]).await {
+            eprintln!("TUI failed: {error}");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -6070,8 +6860,14 @@ async fn main() {
         .route("/ws", get(ws_handler))
         .route("/api/health", get(api_health))
         .route("/api/client-config", get(api_client_config))
-        .route("/api/sessions", get(api_sessions))
-        .route("/api/session", post(api_post_session).put(api_put_session))
+        .route("/api/sessions", get(api_sessions_with_filter))
+        .route(
+            "/api/session",
+            post(api_post_session_with_request)
+                .put(api_put_session_mutation)
+                .delete(api_delete_session),
+        )
+        .route("/api/workspaces/browse", get(api_workspaces_browse))
         .route(
             "/api/session-models",
             get(api_session_models).put(api_put_session_models),

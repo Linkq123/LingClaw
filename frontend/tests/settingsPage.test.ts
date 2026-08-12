@@ -430,7 +430,7 @@ describe('SettingsPage shell layout and dirty state', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     ({ root } = await renderSettingsPage());
-    await openAndLoad();
+    await openAndLoad('project-session');
 
     const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
     expect(document.querySelector('[role="tablist"]')).not.toBeNull();
@@ -475,6 +475,7 @@ describe('SettingsPage shell layout and dirty state', () => {
 
     expect(savedBody).toEqual({
       config: { settings: { port: 19000 } },
+      session: 'project-session',
       baseConfigFileEtag: 'a'.repeat(64),
     });
     expect(save.disabled).toBe(true);

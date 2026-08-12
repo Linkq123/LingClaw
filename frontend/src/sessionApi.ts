@@ -6,6 +6,26 @@ import type {
   SessionSummary,
 } from './types.js';
 
+export type SessionWorkspaceInput = { kind: 'managed' } | { kind: 'directory'; path: string };
+
+export interface SessionMutationInput {
+  name?: string;
+  workspace?: SessionWorkspaceInput;
+}
+
+export interface WorkspaceBrowseEntry {
+  name: string;
+  path: string;
+}
+
+export interface WorkspaceBrowseResult {
+  current: string;
+  parent: string | null;
+  home: string | null;
+  roots: string[];
+  directories: WorkspaceBrowseEntry[];
+}
+
 function normalizeSessionSummary(session: unknown): SessionSummary {
   const raw = (session ?? {}) as Record<string, unknown>;
   const id = String(raw.id ?? '').trim();
@@ -17,16 +37,81 @@ function normalizeSessionSummary(session: unknown): SessionSummary {
     name: String(raw.name ?? id),
     updated_at: typeof raw.updated_at === 'number' ? raw.updated_at : Number(raw.updated_at ?? 0),
     corrupt: raw.corrupt === true,
+    workspace:
+      raw.workspace && typeof raw.workspace === 'object' && !Array.isArray(raw.workspace)
+        ? (() => {
+            const workspace = raw.workspace as Record<string, unknown>;
+            const kind = workspace.kind === 'directory' ? 'directory' : 'managed';
+            return {
+              kind,
+              path: String(workspace.path ?? ''),
+              display_name: String(workspace.display_name ?? ''),
+              available: workspace.available !== false,
+            };
+          })()
+        : undefined,
   };
 }
 
-export async function createSession(): Promise<SessionSummary> {
-  const response = await fetch('/api/session', { method: 'POST' });
+export async function createSession(input?: SessionMutationInput): Promise<SessionSummary> {
+  const response = await fetch('/api/session', {
+    method: 'POST',
+    ...(input
+      ? {
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(input),
+        }
+      : {}),
+  });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(String(payload?.error || `HTTP ${response.status}`));
   }
   return normalizeSessionSummary(payload?.session);
+}
+
+export async function updateSession(
+  sessionId: string,
+  input: SessionMutationInput,
+): Promise<SessionSummary> {
+  const response = await fetch(`/api/session?session=${encodeURIComponent(sessionId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(String(payload?.error || `HTTP ${response.status}`));
+    Object.assign(error, { code: String(payload?.code || '') });
+    throw error;
+  }
+  return normalizeSessionSummary(payload?.session);
+}
+
+export async function browseWorkspaces(path?: string): Promise<WorkspaceBrowseResult> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : '';
+  const response = await fetch(`/api/workspaces/browse${query}`, { cache: 'no-store' });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(String(payload?.error || `HTTP ${response.status}`));
+  }
+  return {
+    current: String(payload?.current ?? ''),
+    parent: payload?.parent == null ? null : String(payload.parent),
+    home: payload?.home == null ? null : String(payload.home),
+    roots: Array.isArray(payload?.roots) ? payload.roots.map(String) : [],
+    directories: Array.isArray(payload?.directories)
+      ? payload.directories
+          .map((entry: unknown) => {
+            const raw = (entry ?? {}) as Record<string, unknown>;
+            const entryPath = String(raw.path ?? '');
+            return entryPath ? { name: String(raw.name ?? entryPath), path: entryPath } : null;
+          })
+          .filter(
+            (entry: WorkspaceBrowseEntry | null): entry is WorkspaceBrowseEntry => entry != null,
+          )
+      : [],
+  };
 }
 
 function normalizeGroupSummary(group: unknown): SessionGroupSummary {

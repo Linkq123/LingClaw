@@ -86,6 +86,9 @@ describe('socket session binding', () => {
     stateModule.state.sessionDrawerExpanded = true;
     stateModule.state.sessions = [];
     stateModule.state.sessionGroups = [];
+    // Group-specific legacy coverage opts in explicitly now that the product
+    // default is feature-disabled.
+    stateModule.state.groupsEnabled = true;
 
     (globalThis as unknown as { WebSocket: unknown }).WebSocket =
       mockWebSocket as unknown as typeof WebSocket;
@@ -94,6 +97,7 @@ describe('socket session binding', () => {
 
   afterEach(() => {
     sessionsRendererModule.disposeSessionDrawer();
+    vi.unstubAllGlobals();
   });
 
   it('connects to default websocket path when no active session is selected', async () => {
@@ -169,6 +173,56 @@ describe('socket session binding', () => {
     expect(mockWebSocket).toHaveBeenCalledWith(
       'ws://localhost:3000/ws?group=review-group&session=main',
     );
+  });
+
+  it('falls back to the Session socket when a rejected Group reconnect discovers Groups are disabled', async () => {
+    const sockets: Array<{
+      close: ReturnType<typeof vi.fn>;
+      onclose?: (() => void) | null;
+      onerror?: (() => void) | null;
+      onmessage?: ((event: { data: string }) => void) | null;
+    }> = [];
+    mockWebSocket.mockImplementation(() => {
+      const socket = {
+        close: vi.fn(),
+        onopen: undefined,
+        onclose: undefined,
+        onerror: undefined,
+        onmessage: undefined,
+        send: vi.fn(),
+        readyState: 3,
+      };
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ features: { groups: false } }),
+      }),
+    );
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.activeGroupId = 'review-group';
+
+    const socketModule = await import('../src/socket.js');
+    const onMessage = vi.fn(async (message) => {
+      if (message?.type !== 'feature_status') return;
+      stateModule.state.groupsEnabled = false;
+      stateModule.state.activeGroupId = '';
+      socketModule.reconnectToActiveSession(onMessage);
+    });
+
+    socketModule.connect(onMessage);
+    sockets[0].onclose?.();
+
+    await vi.waitFor(() => expect(mockWebSocket).toHaveBeenCalledTimes(2));
+    expect(fetch).toHaveBeenCalledWith('/api/client-config', { cache: 'no-store' });
+    expect(onMessage).toHaveBeenCalledWith({
+      type: 'feature_status',
+      features: { groups: false },
+    });
+    expect(mockWebSocket).toHaveBeenLastCalledWith('ws://localhost:3000/ws?session=main');
   });
 
   it('keeps only a non-current non-main pending delete target', async () => {
@@ -592,6 +646,25 @@ describe('socket session binding', () => {
     expect(onSwitchGroup).toHaveBeenCalledWith('review-group');
     expect(onRenameGroup).toHaveBeenCalledWith('review-group');
     expect(onDeleteGroup).toHaveBeenCalledWith('review-group');
+  });
+
+  it('omits every Group navigation surface unless the feature is enabled', () => {
+    stateModule.state.groupsEnabled = false;
+    stateModule.state.sessions = [{ id: 'main', name: 'Main' }];
+    stateModule.state.sessionGroups = [
+      { id: 'hidden-group', name: 'Hidden group', members: 2, updated_at: 10 },
+    ];
+    const onCreateGroup = vi.fn();
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onCreateGroup,
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+    });
+
+    expect(document.querySelector('[data-group-id="hidden-group"]')).toBeNull();
+    expect(stateModule.dom.sessionDrawerList?.textContent).not.toContain('Groups');
+    expect(onCreateGroup).not.toHaveBeenCalled();
   });
 
   it('allows deleting a corrupt inactive session but does not switch into it', async () => {

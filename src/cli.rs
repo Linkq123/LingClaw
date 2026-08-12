@@ -1439,6 +1439,72 @@ fn probe_health(port: u16) -> Result<String, String> {
     }
 }
 
+pub(crate) fn start_daemon_for_tui(port_override: Option<u16>) -> Result<u16, String> {
+    let config = Config::load();
+    #[cfg(not(target_os = "windows"))]
+    if systemd_service_installed() {
+        if port_override.is_some_and(|requested| requested != config.port) {
+            return Err(format!(
+                "--port cannot launch the installed systemd service on a different port (configured: {}, requested: {}). Update the LingClaw configuration or connect to an already-running daemon on the requested port.",
+                config.port,
+                port_override.unwrap_or(config.port)
+            ));
+        }
+        return match run_systemctl(&["start", SYSTEMD_SERVICE_NAME]) {
+            Ok(true) => Ok(config.port),
+            Ok(false) => Err(format!("Failed to start {SYSTEMD_SERVICE_NAME}")),
+            Err(error) => Err(format!("Failed to start {SYSTEMD_SERVICE_NAME}: {error}")),
+        };
+    }
+
+    let effective_port = port_override.unwrap_or(config.port);
+    let exe = effective_install_exe_path()
+        .ok_or_else(|| "Failed to resolve the current LingClaw executable".to_string())?;
+    let mut extra_args = vec!["--serve".to_string()];
+    if let Some(port) = port_override {
+        extra_args.push("--port".to_string());
+        extra_args.push(port.to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args(&extra_args)
+            .creation_flags(0x00000008)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(parent) = exe.parent() {
+            command.current_dir(parent);
+        }
+        command
+            .spawn()
+            .map_err(|error| format!("Failed to start LingClaw daemon: {error}"))?;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut nohup_args: Vec<std::ffi::OsString> = vec![exe.clone().into()];
+        nohup_args.extend(extra_args.iter().map(Into::into));
+        let mut command = std::process::Command::new("nohup");
+        command
+            .args(&nohup_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(parent) = exe.parent() {
+            command.current_dir(parent);
+        }
+        command
+            .spawn()
+            .map_err(|error| format!("Failed to start LingClaw daemon: {error}"))?;
+    }
+
+    Ok(effective_port)
+}
+
 fn handle_health_command(port_override: Option<u16>) -> bool {
     let config = Config::load();
     let port = port_override.unwrap_or(config.port);
@@ -1855,8 +1921,8 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
 
 // ── Doctor ───────────────────────────────────────────────────────────────────
 
-/// Minimum Rust version required for edition 2024.
-const MIN_RUSTC_VERSION: (u32, u32, u32) = (1, 85, 0);
+/// Minimum Rust version required by the default dependency graph, including TUI images.
+const MIN_RUSTC_VERSION: (u32, u32, u32) = (1, 90, 0);
 
 fn parse_version_triple(s: &str) -> Option<(u32, u32, u32)> {
     let mut parts = s.split('.');
@@ -1875,7 +1941,7 @@ fn detect_rustc_version() -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    // "rustc 1.85.0 (..." → "1.85.0"
+    // "rustc 1.90.0 (..." → "1.90.0"
     text.split_whitespace().nth(1).map(|v| v.to_string())
 }
 
@@ -2246,6 +2312,7 @@ fn handle_help_command() -> bool {
     println!();
     println!("Commands:");
     println!("  start              Start the daemon");
+    println!("  tui [PATH]         Open the terminal workspace (defaults to current directory)");
     println!("  stop               Stop the daemon");
     println!("  restart            Restart the daemon");
     println!("  mcp-check          Check MCP servers with runtime timeouts");

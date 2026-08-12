@@ -57,6 +57,20 @@ impl PlanStatus {
         )
     }
 
+    /// Whether the plan can still continue or be revised and therefore keeps
+    /// ownership of the Session's current working directory.
+    pub(crate) fn blocks_workspace_rebind(self) -> bool {
+        matches!(
+            self,
+            Self::Planning
+                | Self::NeedsInput
+                | Self::Ready
+                | Self::Executing
+                | Self::Failed
+                | Self::Stopped
+        )
+    }
+
     pub(crate) fn can_receive_feedback(self) -> bool {
         matches!(
             self,

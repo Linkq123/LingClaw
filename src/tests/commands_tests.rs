@@ -56,6 +56,7 @@ fn test_config() -> crate::Config {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     }
 }
 
@@ -141,6 +142,8 @@ async fn think_command_waits_for_session_persist_gate_before_mutating_session() 
             todos: crate::todos::TodoSnapshot::default(),
             pending_plan: None,
             version: 4,
+            working_directory: (workspace.clone()).clone(),
+            workspace_kind: crate::SessionWorkspaceKind::Managed,
             workspace: workspace.clone(),
         },
     );
@@ -313,6 +316,7 @@ async fn status_command_reports_runtime_request_estimate() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -360,6 +364,8 @@ async fn status_command_reports_runtime_request_estimate() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -462,6 +468,7 @@ async fn status_command_uses_runtime_auto_policy_for_idle_auto_sessions() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -509,6 +516,8 @@ async fn status_command_uses_runtime_auto_policy_for_idle_auto_sessions() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -608,6 +617,7 @@ async fn status_command_reports_compression_recorded_before_start_event() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -655,6 +665,8 @@ async fn status_command_reports_compression_recorded_before_start_event() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -764,6 +776,7 @@ async fn status_command_reports_prune_only_state() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -811,6 +824,8 @@ async fn status_command_reports_prune_only_state() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -915,6 +930,7 @@ async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -962,6 +978,8 @@ async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -1072,6 +1090,7 @@ async fn status_command_reports_latest_compression_outcome() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1119,6 +1138,8 @@ async fn status_command_reports_latest_compression_outcome() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -1230,6 +1251,7 @@ async fn status_command_prefers_live_round_effective_think() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1277,6 +1299,8 @@ async fn status_command_prefers_live_round_effective_think() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -1389,6 +1413,7 @@ async fn status_command_prefers_live_round_effective_think_for_manual_sessions()
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1436,6 +1461,8 @@ async fn status_command_prefers_live_round_effective_think_for_manual_sessions()
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -1550,6 +1577,7 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1597,6 +1625,8 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -1730,6 +1760,7 @@ async fn status_command_reports_latest_auto_trace_summary() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1777,6 +1808,8 @@ async fn status_command_reports_latest_auto_trace_summary() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -1934,6 +1967,7 @@ async fn status_command_reports_live_runtime_provider_for_cross_provider_fast_mo
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1981,6 +2015,8 @@ async fn status_command_reports_live_runtime_provider_for_cross_provider_fast_mo
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -2092,6 +2128,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -2139,6 +2176,8 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -2579,6 +2618,7 @@ async fn switch_command_creates_or_switches_session() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -2655,6 +2695,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -2702,6 +2743,8 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -2779,6 +2822,7 @@ async fn memory_command_rejects_unknown_subcommand() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -2826,6 +2870,8 @@ async fn memory_command_rejects_unknown_subcommand() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -2923,6 +2969,7 @@ async fn reflection_command_disabled_shows_hint() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -2970,6 +3017,8 @@ async fn reflection_command_disabled_shows_hint() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -3064,6 +3113,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         s3: None,
         enable_state_digest: true,
         enable_task_plan: true,
+        enable_groups: true,
     };
 
     let state = AppState {
@@ -3114,6 +3164,8 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -3250,6 +3302,7 @@ async fn reflection_command_disabled_allows_read_today() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -3297,6 +3350,8 @@ async fn reflection_command_disabled_allows_read_today() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -3392,6 +3447,7 @@ async fn reflection_command_enabled_shows_status() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -3439,6 +3495,8 @@ async fn reflection_command_enabled_shows_status() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -3546,6 +3604,7 @@ async fn reflection_command_today_shows_content() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -3593,6 +3652,8 @@ async fn reflection_command_today_shows_content() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -3706,6 +3767,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -3753,6 +3815,8 @@ async fn reflection_command_today_filters_out_new_summaries() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -3869,6 +3933,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -3916,6 +3981,8 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -4035,6 +4102,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -4082,6 +4150,8 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();
@@ -4178,6 +4248,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
             s3: None,
             enable_state_digest: true,
             enable_task_plan: true,
+            enable_groups: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -4225,6 +4296,8 @@ async fn reflection_command_invalid_arg_shows_usage() {
         todos: crate::todos::TodoSnapshot::default(),
         pending_plan: None,
         version: 4,
+        working_directory: (workspace.clone()).clone(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
         workspace: workspace.clone(),
     };
     let config = state.config();

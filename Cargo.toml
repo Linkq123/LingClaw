@@ -1,7 +1,8 @@
 [package]
 name = "lingclaw"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
+rust-version = "1.90"
 description = "A Rust personal AI assistant"
 license = "MIT"
 
@@ -10,8 +11,13 @@ axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["stream", "json"] }
+reqwest = { version = "0.12", features = ["stream", "json", "multipart"] }
 futures = "0.3"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11.0.6", optional = true, default-features = false, features = ["crossterm"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png"] }
+tokio-tungstenite = "0.30.0"
 regex = "1"
 scraper = "0.24"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
@@ -26,8 +32,19 @@ rpassword = "7"
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 tokio-rusqlite = { version = "0.7", features = ["bundled", "backup"] }
 
+[features]
+default = ["tui-images"]
+tui-images = ["dep:image", "dep:ratatui-image"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
