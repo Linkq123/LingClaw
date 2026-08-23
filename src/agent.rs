@@ -142,6 +142,20 @@ impl AgentLoopCtx {
         self.finish_reason = Some(reason);
         self.phase = AgentPhase::Finish;
     }
+
+    /// Transition: Act → Finish for a runtime-owned terminal tool such as
+    /// `submit_plan`. The tool result has already been recorded, so another
+    /// model Analyze cycle is neither required nor desirable.
+    pub(crate) fn transition_to_finish_after_act(
+        &mut self,
+        tool_count: usize,
+        reason: FinishReason,
+    ) {
+        debug_assert_eq!(self.phase, AgentPhase::Act, "Act finish requires Act");
+        self.tool_calls += tool_count;
+        self.finish_reason = Some(reason);
+        self.phase = AgentPhase::Finish;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -254,10 +254,10 @@ Sub-agent 有独立消息历史、工具集和 ReAct loop。为防止递归与�
 
 ## Plan Mode、自动执行提纲与思考
 
-- **Plan Mode**：在当前 Session 内运行 `planning → needs_input → ready → executing → completed/failed/stopped/discarded` 状态机。计划卡展示目标、摘要、revision、步骤、假设、风险、验收标准与验证方式。
+- **Plan Mode**：在当前 Session 内运行 `planning → needs_input → ready → executing → completed/failed/stopped/discarded` 状态机。计划卡展示目标、摘要、revision、步骤、假设、风险、验收标准、验证方式与服务端完成检查。
 - **提问与修订**：只有会实质改变方案的阻塞决策才进入 `needs_input`。回答问题或提交修订会在同一个 `plan_id` 下生成新 revision；旧 revision 在历史中折叠为只读内容，过期页面不能修改或批准新版本。
 - **批准与证据**：规划时读取的本地文件和目录会保存相对路径与 SHA-256 指纹；受限 `git_inspect` 查询会保存查询参数和结果指纹，因此工作树、索引或提交变化也能按实际查询触发过期提示。批准前若证据变化，必须选择“刷新计划”或“仍然执行”；确认操作与当时实际读取到的证据快照绑定，警告后内容再次变化会要求重新确认，成功覆盖时会记录对应路径。MCP/HTTP 外部数据不会伪装成可重新验证证据。
-- **执行进度**：批准不生成额外用户气泡。完整 revision 会注入每个 Agent cycle；Agent 通过内部 `update_plan` 更新既有步骤或带偏离原因追加适应性步骤。运行结束后仍未报告的步骤保持可见，不会被自动伪造为完成。
+- **执行进度**：批准不生成额外用户气泡。完整 revision 与明确的执行/恢复指令会注入 Agent；Agent 通过内部 `update_plan` 更新既有步骤或带偏离原因追加适应性步骤。“仍然执行”只允许在已提示的过期证据环境中执行，不会把新证据解释成已批准修订。全部步骤完成或明确跳过只是必要条件；Finish 还会按批准 revision 验证最终文件/目录、批准时证据或精确工具调用。进度检查可以增加门禁，但 Agent 自报状态不能单独充当验收证据。检查缺失、失败或冲突时，原步骤会进入 `blocked`，真实适应步骤与偏离原因仍保留，计划进入可修订/继续的失败状态。
 - **恢复与边界**：只有已批准且已经开始执行的 `failed`/`stopped` 计划才能继续剩余步骤；规划阶段被停止或因进程重启而中断时，只能修订或丢弃，不能绕过批准直接执行。模型尚未生成新 revision 时，已提交的回答或修订会恢复到计划卡中，供用户检查并重新提交。LingClaw 启动时会把遗留的 `planning`/`executing` 进程态恢复为 `stopped`。计划待审批时，普通执行消息必须先执行或丢弃当前计划。Group 当前不支持 Plan Mode。
 - **自动执行提纲**：配置键仍为 `enableTaskPlan`，仅为没有批准计划的普通 Execute run 生成运行期软指导；Plan-only 和已批准计划执行期间会抑制它，避免形成第二套计划。
 - **Think level**：控制支持推理模型的 effort。`auto` 根据任务信号选择级别，Auto Debug 只在本地展示最近一条决策轨迹。

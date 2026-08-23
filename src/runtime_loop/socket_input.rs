@@ -770,7 +770,16 @@ pub(super) async fn handle_plan_action(
                 .await;
                 return IdleSocketInputAction::Continue;
             }
-            (AgentRunMode::Execute, false, None, None)
+            let prompt = match action.action {
+                PlanActionKind::Execute => {
+                    "The user approved this exact plan revision. Execute it now: perform the required side effects, use update_plan to report progress, and do not merely restate or revise the plan. Finish only after every step is completed or explicitly skipped with a note."
+                }
+                PlanActionKind::Resume => {
+                    "The user asked to resume this exact approved plan revision. Continue its remaining steps now: perform the required side effects, use update_plan to report progress, and do not merely restate the plan. Finish only after every step is completed or explicitly skipped with a note."
+                }
+                _ => unreachable!(),
+            };
+            (AgentRunMode::Execute, false, Some(prompt.to_string()), None)
         }
         PlanActionKind::Discard => unreachable!(),
     };

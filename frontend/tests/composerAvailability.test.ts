@@ -28,15 +28,20 @@ describe('composer model availability', () => {
     vi.restoreAllMocks();
     document.body.innerHTML = `
       <div id="input-area">
-        <textarea id="input"></textarea>
-        <button id="send"></button>
+        <textarea id="input" aria-describedby="composer-availability-detail"></textarea>
+        <button id="send" aria-describedby="composer-availability-detail"></button>
         <button id="stop"></button>
         <p id="composer-availability-status">
           <span id="composer-availability-message"></span>
           <button id="composer-availability-action"></button>
           <button id="composer-availability-retry"></button>
         </p>
-        <span id="composer-availability-detail"></span>
+        <span
+          id="composer-availability-detail"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >Checking model configuration...</span>
       </div>
     `;
     initDomRefs();
@@ -57,6 +62,7 @@ describe('composer model availability', () => {
     state.composerSessionModelRevision = null;
     state.composerGroupModelRevision = null;
     state.sessions = [];
+    state.activeSessionId = 'main';
     state.activeGroupId = '';
     state.activeGroupMembers = [];
     state.activeGroupMemberDetails = [];
@@ -64,6 +70,78 @@ describe('composer model availability', () => {
     state.groupTargetMode = 'all';
     state.groupSelectedTargets = [];
     setLanguage('en');
+  });
+
+  function expectAvailabilityDescription(reason: string): void {
+    const detail = document.getElementById('composer-availability-detail');
+    expect(dom.input?.getAttribute('aria-describedby')).toContain('composer-availability-detail');
+    expect(dom.sendBtn?.getAttribute('aria-describedby')).toContain('composer-availability-detail');
+    expect(detail?.hidden).toBe(false);
+    expect(detail?.getAttribute('role')).toBe('status');
+    expect(detail?.getAttribute('aria-live')).toBe('polite');
+    expect(detail?.textContent).toBe(reason);
+  }
+
+  function expectNoAvailabilityDescription(): void {
+    const detail = document.getElementById('composer-availability-detail');
+    expect(dom.input?.hasAttribute('aria-describedby')).toBe(false);
+    expect(dom.sendBtn?.hasAttribute('aria-describedby')).toBe(false);
+    expect(detail?.hidden).toBe(true);
+    expect(detail?.textContent).toBe('');
+    expect(detail?.hasAttribute('role')).toBe(false);
+    expect(detail?.hasAttribute('aria-live')).toBe(false);
+    expect(detail?.hasAttribute('aria-atomic')).toBe(false);
+  }
+
+  it('mounts the localized description only for checking or unavailable states', () => {
+    syncComposerAvailability();
+    expectAvailabilityDescription('Checking model configuration...');
+
+    applyComposerConfig({}, true, 10);
+    setComposerExplicitPrimaryModelConfigured(true, 10);
+    setComposerSessionModelConfigured(false, false, true, 10);
+    expect(dom.sendBtn?.disabled).toBe(false);
+    expectNoAvailabilityDescription();
+
+    state.composerModelSwitchInFlight = true;
+    syncComposerAvailability();
+    expectAvailabilityDescription('Saving model selection...');
+
+    state.composerModelSwitchInFlight = false;
+    syncComposerAvailability();
+    expectNoAvailabilityDescription();
+  });
+
+  it('does not retain Checking across rapid Session identity changes', () => {
+    applyComposerConfig({}, true, 20);
+    setComposerExplicitPrimaryModelConfigured(true, 20);
+    setComposerSessionModelConfigured(false, false, true, 20);
+    expectNoAvailabilityDescription();
+
+    beginComposerSessionTransition(false, 'first-target');
+    beginComposerSessionTransition(false, 'second-target');
+    expectAvailabilityDescription('Checking model configuration...');
+
+    state.activeSessionId = 'second-target';
+    setComposerSessionModelConfigured(false, false, true, 20);
+    expect(dom.sendBtn?.disabled).toBe(false);
+    expectNoAvailabilityDescription();
+  });
+
+  it('restores and then removes the description during a daemon reconnect handshake', () => {
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => {})));
+    applyComposerConfig({}, true, 30);
+    setComposerExplicitPrimaryModelConfigured(true, 30);
+    setComposerSessionModelConfigured(false, false, true, 30);
+    expectNoAvailabilityDescription();
+
+    beginComposerRevisionHandshake();
+    expectAvailabilityDescription('Checking model configuration...');
+
+    expect(acceptComposerSocketModelPayloadRevision(30)).toBe(true);
+    setComposerSessionModelConfigured(false, false, true, 30);
+    expect(dom.sendBtn?.disabled).toBe(false);
+    expectNoAvailabilityDescription();
   });
 
   it('disables all composer writes while local storage is protected', () => {
@@ -688,6 +766,7 @@ describe('composer model availability', () => {
 
     expect(state.composerModelAvailability).toBe('config-unavailable');
     expect(dom.composerAvailabilityRetry?.hidden).toBe(false);
+    expectAvailabilityDescription('Model configuration is unavailable. Check Settings and retry.');
   });
 
   it('enables model-independent slash commands but keeps /new disabled', () => {

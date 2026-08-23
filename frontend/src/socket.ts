@@ -12,6 +12,7 @@ import { syncRestoredSessionCapabilities, updateAttachButton } from './images.js
 import {
   beginComposerRevisionHandshake,
   completeComposerSessionTransition,
+  invalidateComposerSessionModelRecovery,
   restoreComposerSessionTransition,
   syncComposerAvailability,
 } from './composerAvailability.js';
@@ -135,6 +136,7 @@ export function cancelReconnect(): void {
 }
 
 export function connect(onMessage) {
+  invalidateComposerSessionModelRecovery();
   setConnStatus('connecting', 'common.connecting');
   const socket = new WebSocket(sessionWebSocketUrl());
   state.ws = socket;
@@ -151,6 +153,7 @@ export function connect(onMessage) {
 
   socket.onclose = () => {
     if (state.ws !== socket) return;
+    invalidateComposerSessionModelRecovery();
     syncRestoredSessionCapabilities(restoreComposerSessionTransition());
     resetSessionScopedUiState();
     if (state.activeGroupId) {

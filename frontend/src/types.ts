@@ -428,6 +428,25 @@ export interface PlanQuestion {
   options?: PlanQuestionOption[];
 }
 
+export interface PlanCompletionCheck {
+  id: string;
+  step_id: string;
+  covers: Array<{
+    section: 'verification' | 'acceptance_criteria';
+    index: number;
+  }>;
+  kind: 'workspace_path' | 'approved_evidence_unchanged' | 'plan_progress' | 'tool_call_success';
+  path?: string;
+  expected_path_type?: 'file' | 'directory' | 'absent';
+  exact_content?: string;
+  size_bytes?: number;
+  sha256?: string;
+  evidence_kind?: 'file' | 'directory' | 'directory_tree';
+  required_step_ids?: string[];
+  tool_name?: string;
+  arguments?: Record<string, unknown>;
+}
+
 export interface PlanArtifact {
   schema_version?: number;
   title: string;
@@ -443,6 +462,7 @@ export interface PlanArtifact {
   risks?: string[];
   verification?: string[];
   acceptance_criteria?: string[];
+  completion_checks?: PlanCompletionCheck[];
   questions?: PlanQuestion[];
   legacy_markdown?: string;
 }

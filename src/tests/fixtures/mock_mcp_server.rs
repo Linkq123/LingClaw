@@ -1,7 +1,8 @@
 use std::{
     env,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{self, BufRead, Write},
+    path::PathBuf,
     thread,
     time::Duration,
 };
@@ -76,6 +77,31 @@ fn tools_call_response(id: &str, label: &str) -> String {
     )
 }
 
+fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let encoded = uri.strip_prefix("file://")?;
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let mut path = String::from_utf8(decoded).ok()?;
+    if cfg!(windows)
+        && path.starts_with('/')
+        && path.as_bytes().get(2).copied() == Some(b':')
+    {
+        path.remove(0);
+    }
+    Some(PathBuf::from(path))
+}
+
 fn resources_list_response(id: &str) -> String {
     format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"resources\":[]}}}}",
@@ -114,6 +140,21 @@ fn main() {
 
         let method = extract_string_field(trimmed, "method");
         let id = extract_number_field(trimmed, "id");
+
+        if mode == "verify-roots-capability"
+            && method.is_none()
+            && id.as_deref() == Some("9100")
+        {
+            let identity = extract_string_field(trimmed, "uri")
+                .and_then(|uri| file_uri_path(&uri))
+                .and_then(|root| fs::read_to_string(root.join("identity.txt")).ok())
+                .unwrap_or_else(|| "unavailable".to_string());
+            append_log(
+                log_path.as_deref(),
+                &format!("roots-identity:{}", identity.trim()),
+            );
+            continue;
+        }
 
         match method.as_deref() {
             Some("initialize") => {
@@ -161,6 +202,14 @@ fn main() {
                 }
             }
             Some("tools/call") => {
+                if mode == "delayed-roots" {
+                    thread::sleep(Duration::from_millis(200));
+                    append_log(log_path.as_deref(), "send:roots/list");
+                    write_line(
+                        &mut stdout,
+                        "{\"jsonrpc\":\"2.0\",\"id\":9001,\"method\":\"roots/list\",\"params\":{}}",
+                    );
+                }
                 if mode == "concurrent" {
                     thread::sleep(Duration::from_millis(50));
                 }

@@ -301,6 +301,48 @@ struct AgentRunCtx<'a> {
     run_cancel: &'a CancellationToken,
 }
 
+#[derive(Default)]
+struct PlanCompletionRunEvidence {
+    tool_epochs: std::collections::BTreeMap<String, u64>,
+    mutation_epoch: u64,
+    #[cfg(test)]
+    verifier_gate: Option<Arc<CompletionVerifierTestGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CompletionVerifierTestGate {
+    started: AtomicBool,
+    release: AtomicBool,
+    stopped: AtomicBool,
+}
+
+#[cfg(test)]
+impl CompletionVerifierTestGate {
+    fn wait(
+        &self,
+        deadline: std::time::Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<(), crate::plan::PlanCompletionVerificationError> {
+        self.started.store(true, Ordering::Relaxed);
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                self.stopped.store(true, Ordering::Relaxed);
+                return Err(crate::plan::PlanCompletionVerificationError::Cancelled);
+            }
+            if std::time::Instant::now() >= deadline {
+                self.stopped.store(true, Ordering::Relaxed);
+                return Err(crate::plan::PlanCompletionVerificationError::TimedOut);
+            }
+            if self.release.load(Ordering::Relaxed) {
+                self.stopped.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 struct AgentPhaseState {
     round: usize,
     pending_tool_calls: Vec<ToolCall>,
@@ -353,6 +395,9 @@ struct AgentPhaseState {
     replace_plan_evidence: bool,
     /// Immutable approved revision injected into every execution cycle.
     approved_plan: Option<crate::PendingPlan>,
+    /// Server-recorded completion evidence for this execution attempt. Exact
+    /// successful check calls remain valid only until an unverified mutation.
+    completion_evidence: PlanCompletionRunEvidence,
     /// Ephemeral control context for actions such as refresh. This is never
     /// persisted as a user message.
     plan_action_prompt: Option<String>,
@@ -360,6 +405,7 @@ struct AgentPhaseState {
 
 /// Minimum interval between observe-phase incremental saves.
 const OBSERVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+const PLAN_COMPLETION_VERIFICATION_MAX_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTO_TOOL_HISTORY_CAP: usize = 12;
 const DYNAMIC_PROMPT_OPTIONAL_SECTIONS_CHAR_BUDGET: usize = 4_000;
 const DYNAMIC_PROMPT_TRUNCATION_MARKER: &str = "\n*(additional dynamic context truncated)*";
@@ -785,7 +831,7 @@ fn append_plan_action_user_context(messages: &mut Vec<ChatMessage>, prompt: Opti
     };
     messages.push(ChatMessage {
         role: "user".to_string(),
-        content: Some(format!("Plan revision request from the user:\n\n{prompt}")),
+        content: Some(format!("Current plan action from the user:\n\n{prompt}")),
         images: None,
         thinking: None,
         anthropic_thinking_blocks: None,
@@ -1279,7 +1325,7 @@ async fn build_cycle_tools(
         definitions.push(crate::plan::tool_definition(
             resolved.provider,
             crate::plan::TOOL_NAME_SUBMIT_PLAN,
-            "Finish the current planning revision. Use needs_input only for decisions that materially change the plan; otherwise submit a ready, executable plan.",
+            "Finish the current planning revision. Use needs_input only for decisions that materially change the plan; otherwise submit a ready, executable plan. Prefer workspace-relative paths in string fields. Arguments must be valid JSON: escape every backslash in Windows paths and encode literal line breaks as \\n.",
             crate::plan::submit_plan_tool_parameters(),
         ));
     } else if phase_state.approved_plan.is_some() {
@@ -2507,6 +2553,15 @@ fn plan_tool_outcome(output: impl Into<String>, is_error: bool) -> tools::ToolOu
     }
 }
 
+fn submit_plan_retry_guidance(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("invalid escape") || error.contains("control character") {
+        " Prefer workspace-relative paths. If a Windows path is unavoidable, escape each JSON backslash as `\\\\`; encode literal line breaks as `\\n` instead of placing raw newlines inside a string."
+    } else {
+        ""
+    }
+}
+
 async fn execute_internal_plan_tool(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -2528,12 +2583,15 @@ async fn execute_internal_plan_tool(
                         false,
                     )
                 }
-                Err(error) => plan_tool_outcome(
-                    format!(
-                        "submit_plan validation failed: {error}. Correct the arguments and call submit_plan again."
-                    ),
-                    true,
-                ),
+                Err(error) => {
+                    let guidance = submit_plan_retry_guidance(&error);
+                    plan_tool_outcome(
+                        format!(
+                            "submit_plan validation failed: {error}. Correct the arguments and call submit_plan again.{guidance}"
+                        ),
+                        true,
+                    )
+                }
             },
         );
     }
@@ -3276,6 +3334,13 @@ async fn record_materialized_tool_result(
         .map(crate::image_uploads::public_image_payload)
         .collect::<Vec<_>>();
 
+    record_plan_completion_tool_outcome(
+        phase_state,
+        &tc.function.name,
+        effective_args,
+        result.is_error,
+    );
+
     let live_event =
         if !tools::is_todos_tool(&tc.function.name) && !is_internal_plan_tool(&tc.function.name) {
             let mut event = json!({
@@ -3375,6 +3440,43 @@ async fn record_materialized_tool_result(
     }
 }
 
+fn record_plan_completion_tool_outcome(
+    phase_state: &mut AgentPhaseState,
+    tool_name: &str,
+    effective_args: Option<&str>,
+    is_error: bool,
+) {
+    let Some(plan) = phase_state.approved_plan.as_ref() else {
+        return;
+    };
+    let arguments =
+        effective_args.and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok());
+    let matching_checks = arguments
+        .as_ref()
+        .map(|arguments| {
+            crate::plan::matching_tool_completion_check_ids(plan, tool_name, arguments)
+        })
+        .unwrap_or_default();
+    let unverified_mutation = !tools::is_read_only_tool(tool_name)
+        && !is_internal_plan_tool(tool_name)
+        && (matching_checks.is_empty() || is_error);
+    if unverified_mutation {
+        phase_state.completion_evidence.mutation_epoch = phase_state
+            .completion_evidence
+            .mutation_epoch
+            .saturating_add(1);
+    }
+    if is_error {
+        return;
+    }
+    for check_id in matching_checks {
+        phase_state
+            .completion_evidence
+            .tool_epochs
+            .insert(check_id, phase_state.completion_evidence.mutation_epoch);
+    }
+}
+
 #[cfg(test)]
 fn summarize_effective_tool_args(tool_name: &str, effective_args: Option<&str>) -> Option<String> {
     tools::build_tool_execution_trace(tool_name, effective_args)
@@ -3385,7 +3487,7 @@ async fn finish_act_phase(live_tx: &LiveTx, phase_state: &mut AgentPhaseState, t
     if phase_state.run_mode.is_plan_only() && phase_state.plan_submission.is_some() {
         phase_state
             .react_ctx
-            .transition_to_finish(agent::FinishReason::Complete);
+            .transition_to_finish_after_act(tc_count, agent::FinishReason::Complete);
         send_react_phase_event(live_tx, &phase_state.react_ctx, "finish").await;
     } else {
         phase_state.react_ctx.transition_to_observe(tc_count);
@@ -3454,7 +3556,7 @@ async fn update_working_state(
         );
     }
 
-    if !agent::should_trigger_state_digest(&phase_state.collected_results) {
+    if !should_run_working_state_digest(&phase_state.collected_results) {
         return;
     }
 
@@ -3481,6 +3583,13 @@ async fn update_working_state(
             agent::merge_state_digest_delta(&mut phase_state.working_state, delta);
         }
     }
+}
+
+fn should_run_working_state_digest(results: &[agent::ToolResultEntry]) -> bool {
+    agent::should_trigger_state_digest(results)
+        && !results
+            .iter()
+            .all(|result| is_internal_plan_tool(&result.name))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4835,6 +4944,108 @@ async fn fail_plan_before_agent_phase(
     .await;
 }
 
+enum PlanCompletionVerifierOutcome {
+    Completed(crate::plan::PlanCompletionReport),
+    Cancelled,
+    TimedOut,
+}
+
+async fn verify_plan_completion_contract(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &AgentPhaseState,
+    plan: crate::PendingPlan,
+) -> PlanCompletionVerifierOutcome {
+    let workspace = phase_state.cycle_workspace.clone();
+    let tool_evidence_epochs = phase_state.completion_evidence.tool_epochs.clone();
+    let mutation_epoch = phase_state.completion_evidence.mutation_epoch;
+    let timeout = ctx
+        .config
+        .tool_timeout
+        .min(PLAN_COMPLETION_VERIFICATION_MAX_TIMEOUT);
+    if timeout.is_zero() {
+        return PlanCompletionVerifierOutcome::TimedOut;
+    }
+    let now = std::time::Instant::now();
+    let deadline = now.checked_add(timeout).unwrap_or(now);
+    let worker_cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&worker_cancelled);
+    #[cfg(test)]
+    let verifier_gate = phase_state.completion_evidence.verifier_gate.clone();
+    // The blocking worker receives only immutable snapshots and can never
+    // write plan state or emit events. `spawn_blocking` cannot preempt an OS
+    // filesystem call, so the shared flag stops it at the next chunk/entry
+    // checkpoint while Finish safely discards every late result.
+    let mut worker = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(gate) = verifier_gate {
+            gate.wait(deadline, &worker_cancel)?;
+        }
+        crate::plan::evaluate_completion_contract_until(
+            &plan,
+            &workspace,
+            &tool_evidence_epochs,
+            mutation_epoch,
+            deadline,
+            &worker_cancel,
+        )
+    });
+
+    let result = tokio::select! {
+        biased;
+        _ = ctx.run_cancel.cancelled() => {
+            worker_cancelled.store(true, Ordering::Relaxed);
+            worker.abort();
+            return PlanCompletionVerifierOutcome::Cancelled;
+        }
+        _ = wait_for_active_run_stop_request(ctx.state, ctx.current_session_id) => {
+            worker_cancelled.store(true, Ordering::Relaxed);
+            ctx.run_cancel.cancel();
+            worker.abort();
+            return PlanCompletionVerifierOutcome::Cancelled;
+        }
+        result = tokio::time::timeout(timeout, &mut worker) => result,
+    };
+
+    match result {
+        Ok(Ok(Ok(report))) => PlanCompletionVerifierOutcome::Completed(report),
+        Ok(Ok(Err(crate::plan::PlanCompletionVerificationError::Cancelled))) => {
+            PlanCompletionVerifierOutcome::Cancelled
+        }
+        Ok(Ok(Err(crate::plan::PlanCompletionVerificationError::TimedOut))) => {
+            PlanCompletionVerifierOutcome::TimedOut
+        }
+        Ok(Err(error)) => {
+            let step_id = phase_state
+                .approved_plan
+                .as_ref()
+                .and_then(|plan| plan.artifact.steps.first())
+                .map(|step| step.id.clone())
+                .unwrap_or_else(|| "approved-plan".to_string());
+            PlanCompletionVerifierOutcome::Completed(crate::plan::PlanCompletionReport {
+                plan_id: phase_state
+                    .approved_plan
+                    .as_ref()
+                    .map(|plan| plan.id.clone())
+                    .unwrap_or_default(),
+                revision: phase_state
+                    .approved_plan
+                    .as_ref()
+                    .map_or(0, |plan| plan.revision),
+                failures: vec![crate::plan::PlanCompletionFailure {
+                    check_id: "completion-contract-runtime".to_string(),
+                    step_id,
+                    reason: format!("completion verification worker failed: {error}"),
+                }],
+            })
+        }
+        Err(_) => {
+            worker_cancelled.store(true, Ordering::Relaxed);
+            worker.abort();
+            PlanCompletionVerifierOutcome::TimedOut
+        }
+    }
+}
+
 async fn run_finish_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -4863,8 +5074,93 @@ async fn run_finish_phase(
         phase_state.run_failed = true;
         plan_events.push(json!({"type":"plan_state", "plan": plan.to_live_value()}));
     }
+    let execution_plan_snapshot = if phase_state.run_mode.is_plan_only() {
+        None
+    } else {
+        let sessions = ctx.state.sessions.lock().await;
+        sessions.get(ctx.current_session_id).and_then(|session| {
+            let plan = session.pending_plan.as_ref()?;
+            let approved = phase_state.approved_plan.as_ref()?;
+            (plan.id == approved.id
+                && plan.revision == approved.revision
+                && plan.status == crate::plan::PlanStatus::Executing)
+                .then(|| plan.clone())
+        })
+    };
+    let reported_steps_incomplete = execution_plan_snapshot
+        .as_ref()
+        .is_some_and(|plan| plan.unfinished_step_count() > 0);
+    let completion_report = if let Some(plan) = execution_plan_snapshot.clone() {
+        let report_plan_id = plan.id.clone();
+        let report_revision = plan.revision;
+        let report_step_id = plan
+            .artifact
+            .steps
+            .first()
+            .map(|step| step.id.clone())
+            .unwrap_or_else(|| "approved-plan".to_string());
+        match verify_plan_completion_contract(ctx, phase_state, plan).await {
+            PlanCompletionVerifierOutcome::Completed(report) => Some(report),
+            PlanCompletionVerifierOutcome::Cancelled => {
+                apply_run_cancel_outcome(ctx, phase_state).await;
+                return AgentPhaseControl::Break;
+            }
+            PlanCompletionVerifierOutcome::TimedOut => Some(crate::plan::PlanCompletionReport {
+                plan_id: report_plan_id,
+                revision: report_revision,
+                failures: vec![crate::plan::PlanCompletionFailure {
+                    check_id: "completion-contract-timeout".to_string(),
+                    step_id: report_step_id,
+                    reason: "completion verification exceeded its hard deadline".to_string(),
+                }],
+            }),
+        }
+    } else {
+        None
+    };
+    let completion_failed = completion_report
+        .as_ref()
+        .is_some_and(|report| !report.passed());
+    let completion_contract_rollback =
+        if let Some(report) = completion_report.as_ref().filter(|report| !report.passed()) {
+            let mut sessions = ctx.state.sessions.lock().await;
+            sessions
+                .get_mut(ctx.current_session_id)
+                .and_then(|session| {
+                    let previous_session_updated_at = session.updated_at;
+                    let plan = session.pending_plan.as_mut()?;
+                    let approved = phase_state.approved_plan.as_ref()?;
+                    if plan.id != approved.id
+                        || plan.revision != approved.revision
+                        || plan.status != crate::plan::PlanStatus::Executing
+                    {
+                        return None;
+                    }
+                    let rollback = (plan.clone(), previous_session_updated_at);
+                    if let Err(error) = crate::plan::apply_completion_failures(plan, report) {
+                        eprintln!(
+                            "ERROR: failed to bind completion failures to plan progress: {error}"
+                        );
+                    }
+                    let now = now_epoch();
+                    plan.updated_at = now;
+                    session.updated_at = now;
+                    Some(rollback)
+                })
+        } else {
+            None
+        };
+    let execution_incomplete = reported_steps_incomplete || completion_failed;
+    let execution_terminal_status = if execution_incomplete {
+        phase_state.run_failed = true;
+        crate::plan::PlanStatus::Failed
+    } else {
+        crate::plan::PlanStatus::Completed
+    };
     let completion_rollback = if phase_state.run_mode.is_plan_only() {
         None
+    } else if completion_contract_rollback.is_some() {
+        completion_contract_rollback
     } else {
         let sessions = ctx.state.sessions.lock().await;
         sessions.get(ctx.current_session_id).and_then(|session| {
@@ -4876,14 +5172,14 @@ async fn run_finish_phase(
                 .then(|| (plan.clone(), session.updated_at))
         })
     };
-    let completed_plan = if phase_state.run_mode.is_plan_only() {
+    let terminal_plan = if phase_state.run_mode.is_plan_only() {
         None
     } else {
         mark_execution_plan_terminal(
             ctx.state,
             ctx.current_session_id,
             phase_state.approved_plan.as_ref(),
-            crate::plan::PlanStatus::Completed,
+            execution_terminal_status,
         )
         .await
     };
@@ -4896,16 +5192,16 @@ async fn run_finish_phase(
             if let Some(session) = sessions.get_mut(ctx.current_session_id) {
                 *session = previous_session;
             }
-        } else if let (Some(completed), Some((previous_plan, previous_session_updated_at))) =
-            (completed_plan.as_ref(), completion_rollback)
+        } else if let (Some(terminal), Some((previous_plan, previous_session_updated_at))) =
+            (terminal_plan.as_ref(), completion_rollback)
         {
             let mut sessions = ctx.state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(ctx.current_session_id)
                 && session.pending_plan.as_ref().is_some_and(|plan| {
-                    plan.id == completed.id
-                        && plan.revision == completed.revision
-                        && plan.status == crate::plan::PlanStatus::Completed
-                        && plan.finished_at == completed.finished_at
+                    plan.id == terminal.id
+                        && plan.revision == terminal.revision
+                        && plan.status == execution_terminal_status
+                        && plan.finished_at == terminal.finished_at
                 })
             {
                 session.pending_plan = Some(previous_plan);
@@ -4954,11 +5250,50 @@ async fn run_finish_phase(
     for event in plan_events {
         let _ = live_send(ctx.live_tx, event).await;
     }
-    if let Some(plan) = completed_plan {
+    if let Some(plan) = terminal_plan {
         phase_state.approved_plan = Some(plan.clone());
         let _ = live_send(
             ctx.live_tx,
             json!({"type":"plan_state", "plan": plan.to_live_value()}),
+        )
+        .await;
+    }
+    if completion_failed {
+        if let Some(report) = completion_report.as_ref() {
+            let checks = report
+                .failures
+                .iter()
+                .map(|failure| {
+                    json!({
+                        "check_id": failure.check_id,
+                        "step_id": failure.step_id,
+                        "reason": failure.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let _ = live_send(
+                ctx.live_tx,
+                json!({
+                    "type":"error",
+                    "code":"plan_completion_contract_failed",
+                    "plan_id":report.plan_id,
+                    "revision":report.revision,
+                    "checks":checks,
+                    "content":"The final workspace or execution evidence did not satisfy the immutable approved revision. The plan was marked failed and can be revised or resumed.",
+                    "dismissible":true,
+                }),
+            )
+            .await;
+        }
+    } else if reported_steps_incomplete {
+        let _ = live_send(
+            ctx.live_tx,
+            json!({
+                "type":"error",
+                "code":"plan_execution_incomplete",
+                "content":"The Agent ended before every approved plan step was reported completed or skipped. The plan was marked failed and can be resumed.",
+                "dismissible":true,
+            }),
         )
         .await;
     }
@@ -4967,6 +5302,7 @@ async fn run_finish_phase(
     // Pre-filter messages to avoid cloning the full session history.
     let memory_queue = ctx.state.memory_queue();
     if !phase_state.run_mode.is_plan_only()
+        && !phase_state.run_failed
         && config.structured_memory
         && let (Some(queue), Some(session)) = (memory_queue.as_ref(), &snapshot)
     {
@@ -4988,6 +5324,7 @@ async fn run_finish_phase(
     // CAS has a side-effect; if it fires but the session is gone, nobody
     // would roll back the cooldown slot.
     if !phase_state.run_mode.is_plan_only()
+        && !phase_state.run_failed
         && reflection_run_snapshot_is_enabled(&config)
         && let Some(ref session) = snapshot
         && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
@@ -5061,11 +5398,22 @@ async fn run_finish_phase(
         }
     }
 
-    let finish_label = phase_state
-        .react_ctx
-        .finish_reason
-        .map(|reason| reason.label())
-        .unwrap_or("complete");
+    let finish_label = if completion_failed {
+        "completion_contract_failed"
+    } else if execution_incomplete {
+        "incomplete_plan"
+    } else {
+        phase_state
+            .react_ctx
+            .finish_reason
+            .map(|reason| reason.label())
+            .unwrap_or("complete")
+    };
+    let finish_phase = if execution_incomplete {
+        "failed"
+    } else {
+        "finish"
+    };
 
     let usage = build_done_usage(
         ctx.state,
@@ -5077,7 +5425,7 @@ async fn run_finish_phase(
 
     let mut done_event = json!({
         "type":"done",
-        "phase":"finish",
+        "phase":finish_phase,
         "reason": finish_label,
         "cycles": phase_state.react_ctx.cycles,
         "tool_calls": phase_state.react_ctx.tool_calls,
@@ -5343,6 +5691,7 @@ pub(crate) async fn run_agent_session(
         plan_evidence_truncated: initial_evidence_truncated,
         replace_plan_evidence: reset_plan_evidence,
         approved_plan,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt,
     };
 

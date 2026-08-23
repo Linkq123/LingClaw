@@ -440,12 +440,11 @@ fn resolve_home_for_user(user: &str) -> String {
         return passwd_home_dir(user).unwrap_or_else(|| format!("/home/{user}"));
     }
 
-    if std::env::var("USER").ok().as_deref() == Some(user) {
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() {
-                return home;
-            }
-        }
+    if std::env::var("USER").ok().as_deref() == Some(user)
+        && let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return home;
     }
 
     passwd_home_dir(user).unwrap_or_else(|| {

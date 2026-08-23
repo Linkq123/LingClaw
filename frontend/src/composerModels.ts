@@ -3,7 +3,12 @@ import { createIcon } from './icons.js';
 import { updateAttachButton } from './images.js';
 import { renderSessionDrawer } from './renderers/sessions.js';
 import {
+  COMPOSER_SESSION_MODEL_RECOVERY_INVALIDATED_EVENT,
   applyComposerHttpSessionModelState,
+  beginComposerSessionModelRecovery,
+  failComposerSessionModelRecovery,
+  getComposerConnectionGeneration,
+  getComposerSessionIdentityGeneration,
   syncComposerAvailability,
 } from './composerAvailability.js';
 import { closeComposerPopovers, registerComposerPopover } from './composerPopovers.js';
@@ -37,11 +42,36 @@ interface SessionModelsResponse {
   error?: string;
 }
 
+type CatalogLoadResult = 'applied' | 'superseded' | 'cancelled';
+
+interface CatalogRequestIdentity {
+  sessionId: string;
+  groupId: string;
+  connectionGeneration: number;
+  sessionIdentityGeneration: number;
+  socket: WebSocket | null;
+  requireOpenSocket: boolean;
+}
+
+export type SessionModelRecoveryResult = 'applied' | 'failed' | 'cancelled';
+
+interface ActiveSessionModelRecovery {
+  identity: CatalogRequestIdentity;
+  identityController: AbortController;
+  attemptController: AbortController | null;
+  promise: Promise<SessionModelRecoveryResult> | null;
+}
+
 let catalogRevision: number | null = null;
 let catalog: ComposerModelCatalogEntry[] = [];
 let selectedModel: ComposerModelCatalogEntry | null = null;
 let requestSequence = 0;
 let initialized = false;
+let activeSessionModelRecovery: ActiveSessionModelRecovery | null = null;
+
+const SESSION_MODEL_RECOVERY_ATTEMPTS = 2;
+const SESSION_MODEL_RECOVERY_RETRY_DELAY_MS = 50;
+const SESSION_MODEL_RECOVERY_REQUEST_TIMEOUT_MS = 1_000;
 
 function normalizedRevision(value: unknown): number | null {
   const revision = Number(value);
@@ -212,28 +242,127 @@ function safeCatalog(value: unknown): ComposerModelCatalogEntry[] {
     .filter((entry): entry is ComposerModelCatalogEntry => entry !== null);
 }
 
-async function loadCatalog(staleRetriesRemaining = 1): Promise<void> {
-  const activeSessionId = state.activeSessionId || 'main';
+function captureCatalogRequestIdentity(
+  expectedSessionId = state.activeSessionId || 'main',
+  requireOpenSocket = false,
+): CatalogRequestIdentity | null {
+  const sessionId = expectedSessionId.trim();
+  const groupId = state.activeGroupId;
+  const socket = state.ws;
+  if (
+    !sessionId ||
+    (state.activeSessionId || 'main') !== sessionId ||
+    state.sessionSwitchInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending ||
+    (requireOpenSocket && (!socket || socket.readyState !== WebSocket.OPEN))
+  ) {
+    return null;
+  }
+  return {
+    sessionId,
+    groupId,
+    connectionGeneration: getComposerConnectionGeneration(),
+    sessionIdentityGeneration: getComposerSessionIdentityGeneration(),
+    socket,
+    requireOpenSocket,
+  };
+}
+
+function catalogRequestIdentityMatches(identity: CatalogRequestIdentity): boolean {
+  return (
+    (state.activeSessionId || 'main') === identity.sessionId &&
+    state.activeGroupId === identity.groupId &&
+    state.ws === identity.socket &&
+    getComposerConnectionGeneration() === identity.connectionGeneration &&
+    getComposerSessionIdentityGeneration() === identity.sessionIdentityGeneration &&
+    !state.sessionSwitchInFlight &&
+    !state.composerSessionTransitionPending &&
+    !state.composerSessionIdentityPending &&
+    (!identity.requireOpenSocket ||
+      (identity.socket !== null && identity.socket.readyState === WebSocket.OPEN))
+  );
+}
+
+function sameCatalogRequestIdentity(
+  left: CatalogRequestIdentity,
+  right: CatalogRequestIdentity,
+): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.groupId === right.groupId &&
+    left.connectionGeneration === right.connectionGeneration &&
+    left.sessionIdentityGeneration === right.sessionIdentityGeneration &&
+    left.socket === right.socket
+  );
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('Session model recovery cancelled', 'AbortError');
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      callback();
+    };
+    const onAbort = (): void => finish(() => rejectPromise(abortError(signal)));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => finish(() => resolvePromise(value)),
+      (error) => finish(() => rejectPromise(error)),
+    );
+  });
+}
+
+async function loadCatalog(
+  staleRetriesRemaining = 1,
+  forceRefresh = false,
+  requestIdentity?: CatalogRequestIdentity,
+  signal?: AbortSignal,
+): Promise<CatalogLoadResult> {
+  const identity = requestIdentity ?? captureCatalogRequestIdentity();
+  if (!identity || !catalogRequestIdentityMatches(identity)) return 'cancelled';
+  const activeSessionId = identity.sessionId;
   const revisionMatches =
     catalog.length > 0 &&
     catalogRevision !== null &&
     catalogRevision === state.composerConfigRevision;
-  if (revisionMatches && state.composerCurrentModel) return;
+  if (!forceRefresh && revisionMatches && state.composerCurrentModel) return 'applied';
 
   const sequence = ++requestSequence;
-  const response = await fetch(
-    `/api/session-models?session=${encodeURIComponent(activeSessionId)}`,
-    { cache: 'no-store' },
-  );
-  const payload = (await response.json().catch(() => ({}))) as SessionModelsResponse;
+  const request = fetch(`/api/session-models?session=${encodeURIComponent(activeSessionId)}`, {
+    cache: 'no-store',
+    ...(signal ? { signal } : {}),
+  });
+  const response = signal ? await awaitWithAbort(request, signal) : await request;
+  if (!catalogRequestIdentityMatches(identity)) return 'cancelled';
+  let payload: SessionModelsResponse;
+  try {
+    const body = response.json() as Promise<SessionModelsResponse>;
+    payload = signal ? await awaitWithAbort(body, signal) : await body;
+  } catch {
+    if (signal?.aborted) throw abortError(signal);
+    throw new Error(tr('composer.modelCatalogChanged'));
+  }
+  if (!catalogRequestIdentityMatches(identity)) return 'cancelled';
+  if (sequence !== requestSequence) return 'superseded';
   if (!response.ok) throw new Error(localizedApiError(payload, response.status));
-  if (sequence !== requestSequence || (state.activeSessionId || 'main') !== activeSessionId) return;
+  if (String(payload.session?.id || '').trim() !== activeSessionId) {
+    throw new Error(tr('composer.modelCatalogChanged'));
+  }
 
   const responseRevision = normalizedRevision(payload.configRevision);
   if (revisionIsStale(responseRevision)) {
     if (staleRetriesRemaining > 0) {
-      await loadCatalog(staleRetriesRemaining - 1);
-      return;
+      return loadCatalog(staleRetriesRemaining - 1, forceRefresh, identity, signal);
     }
     throw new Error(tr('composer.modelCatalogChanged'));
   }
@@ -258,6 +387,7 @@ async function loadCatalog(staleRetriesRemaining = 1): Promise<void> {
     updateAttachButton();
   }
   syncComposerModelControls();
+  return 'applied';
 }
 
 function capabilityBadge(label: string): HTMLElement {
@@ -535,7 +665,8 @@ export async function openComposerModelPicker(forceReload = false): Promise<void
   dom.composerModelBtn.setAttribute('aria-expanded', 'true');
   renderLoading();
   try {
-    await loadCatalog();
+    const result = await loadCatalog();
+    if (result !== 'applied') return;
     if (dom.composerModelPopup.hidden) return;
     renderModelList();
   } catch (error) {
@@ -558,12 +689,153 @@ export function refreshComposerModelCatalog(): void {
     return;
   }
   void loadCatalog()
-    .then(() => {
-      if (!dom.composerModelPopup?.hidden) renderModelList();
+    .then((result) => {
+      if (result === 'applied' && !dom.composerModelPopup?.hidden) renderModelList();
     })
     .catch((error) => {
       if (!dom.composerModelPopup?.hidden) renderError(error);
     });
+}
+
+/**
+ * Recover the active Session's model snapshot when an authoritative full
+ * socket payload was older than an already accepted global revision. The
+ * endpoint returns a same-snapshot Session status and catalog, so this closes
+ * the revision gap without requiring a model save or a new protocol event.
+ */
+async function waitForSessionModelRecoveryRetry(
+  identity: CatalogRequestIdentity,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (signal.aborted) return false;
+  return new Promise<boolean>((resolvePromise) => {
+    let settled = false;
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      signal.removeEventListener('abort', onAbort);
+      resolvePromise(value);
+    };
+    const onAbort = (): void => finish(false);
+    const timeoutId = setTimeout(
+      () => finish(catalogRequestIdentityMatches(identity)),
+      SESSION_MODEL_RECOVERY_RETRY_DELAY_MS,
+    );
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function runSessionModelRecoveryAttempt(
+  recovery: ActiveSessionModelRecovery,
+): Promise<CatalogLoadResult> {
+  const controller = new AbortController();
+  recovery.attemptController = controller;
+  const cancelForIdentity = (): void => controller.abort();
+  if (recovery.identityController.signal.aborted) {
+    controller.abort();
+  } else {
+    recovery.identityController.signal.addEventListener('abort', cancelForIdentity, {
+      once: true,
+    });
+  }
+  const timeoutId = setTimeout(() => controller.abort(), SESSION_MODEL_RECOVERY_REQUEST_TIMEOUT_MS);
+  try {
+    return await loadCatalog(0, true, recovery.identity, controller.signal);
+  } finally {
+    clearTimeout(timeoutId);
+    recovery.identityController.signal.removeEventListener('abort', cancelForIdentity);
+    if (recovery.attemptController === controller) recovery.attemptController = null;
+  }
+}
+
+async function runActiveComposerSessionModelRecovery(
+  recovery: ActiveSessionModelRecovery,
+): Promise<SessionModelRecoveryResult> {
+  const { identity } = recovery;
+  beginComposerSessionModelRecovery();
+  for (let attempt = 0; attempt < SESSION_MODEL_RECOVERY_ATTEMPTS; attempt += 1) {
+    if (recovery.identityController.signal.aborted || !catalogRequestIdentityMatches(identity)) {
+      return 'cancelled';
+    }
+    try {
+      const result = await runSessionModelRecoveryAttempt(recovery);
+      if (result === 'applied') return 'applied';
+      if (result === 'cancelled') return 'cancelled';
+    } catch {
+      // The same bounded retry path handles transport, HTTP, and stale
+      // revision failures without weakening the response validation.
+    }
+    if (recovery.identityController.signal.aborted || !catalogRequestIdentityMatches(identity)) {
+      return 'cancelled';
+    }
+    if (
+      state.composerEffectiveModelConfigured !== null &&
+      state.composerSessionModelRevision === state.composerConfigRevision
+    ) {
+      return 'applied';
+    }
+    if (
+      attempt + 1 < SESSION_MODEL_RECOVERY_ATTEMPTS &&
+      !(await waitForSessionModelRecoveryRetry(identity, recovery.identityController.signal))
+    ) {
+      return 'cancelled';
+    }
+  }
+  if (recovery.identityController.signal.aborted || !catalogRequestIdentityMatches(identity)) {
+    return 'cancelled';
+  }
+  failComposerSessionModelRecovery();
+  return 'failed';
+}
+
+function cancelActiveComposerSessionModelRecovery(): void {
+  const recovery = activeSessionModelRecovery;
+  if (!recovery) return;
+  recovery.identityController.abort();
+  recovery.attemptController?.abort();
+}
+
+document.addEventListener(
+  COMPOSER_SESSION_MODEL_RECOVERY_INVALIDATED_EVENT,
+  cancelActiveComposerSessionModelRecovery,
+);
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    document.removeEventListener(
+      COMPOSER_SESSION_MODEL_RECOVERY_INVALIDATED_EVENT,
+      cancelActiveComposerSessionModelRecovery,
+    );
+    cancelActiveComposerSessionModelRecovery();
+  });
+}
+
+export function refreshActiveComposerSessionModelState(
+  sessionId: string,
+): Promise<SessionModelRecoveryResult> {
+  const expectedSessionId = sessionId.trim();
+  const identity = captureCatalogRequestIdentity(expectedSessionId, true);
+  if (!identity || identity.groupId) return Promise.resolve('cancelled');
+  if (
+    activeSessionModelRecovery &&
+    sameCatalogRequestIdentity(activeSessionModelRecovery.identity, identity) &&
+    activeSessionModelRecovery.promise
+  ) {
+    return activeSessionModelRecovery.promise;
+  }
+  cancelActiveComposerSessionModelRecovery();
+  const recovery: ActiveSessionModelRecovery = {
+    identity,
+    identityController: new AbortController(),
+    attemptController: null,
+    promise: null,
+  };
+  activeSessionModelRecovery = recovery;
+  const promise = runActiveComposerSessionModelRecovery(recovery).finally(() => {
+    if (activeSessionModelRecovery === recovery) activeSessionModelRecovery = null;
+  });
+  recovery.promise = promise;
+  return promise;
 }
 
 export function initComposerModelPicker(): void {

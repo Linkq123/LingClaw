@@ -69,6 +69,18 @@ fn invalid_finish_from_act() {
 }
 
 #[test]
+fn terminal_internal_tool_can_finish_from_act_and_counts_the_tool() {
+    let mut ctx = AgentLoopCtx::new(false);
+    ctx.transition_to_act();
+    ctx.transition_to_finish_after_act(1, FinishReason::Complete);
+
+    assert_eq!(ctx.phase(), AgentPhase::Finish);
+    assert_eq!(ctx.finish_reason, Some(FinishReason::Complete));
+    assert_eq!(ctx.tool_calls, 1);
+    assert_eq!(ctx.cycles, 0);
+}
+
+#[test]
 fn observation_annotation_short() {
     let short = "ok";
     assert_eq!(maybe_annotate_observation("exec", short), "ok");

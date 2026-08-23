@@ -84,26 +84,34 @@ fn render_git_output(
 }
 
 pub(crate) async fn tool_git_inspect(args: &Value, config: &Config, workspace: &Path) -> String {
-    let command_args = match build_git_command_args(args, workspace) {
-        Ok(args) => args,
+    let plan = match build_git_command_args(args, workspace) {
+        Ok(plan) => plan,
+        Err(error) => return format!("git_inspect error: {error}"),
+    };
+    let cwd = match plan.cwd.process_cwd() {
+        Ok(cwd) => cwd,
         Err(error) => return format!("git_inspect error: {error}"),
     };
 
     let mut command = Command::new("git");
     command
         .args(SAFE_GIT_GLOBAL_ARGS)
-        .args(&command_args)
-        .current_dir(workspace)
+        .args(&plan.args)
+        .current_dir(cwd.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
 
+    if let Err(error) = cwd.validate() {
+        return format!("git_inspect error: {error}");
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return format!("git_inspect error: {error}"),
     };
+    drop(cwd);
     let Some(stdout) = child.stdout.take() else {
         return "git_inspect error: stdout pipe was unavailable".to_string();
     };
@@ -153,18 +161,21 @@ fn inspection_fingerprint_with_control(
     timeout: Duration,
     cancelled: Option<&AtomicBool>,
 ) -> Result<String, String> {
-    let command_args = build_git_command_args(args, workspace)?;
+    let plan = build_git_command_args(args, workspace)?;
+    let cwd = plan.cwd.process_cwd()?;
     let mut command = std::process::Command::new("git");
     command
         .args(SAFE_GIT_GLOBAL_ARGS)
-        .args(&command_args)
-        .current_dir(workspace)
+        .args(&plan.args)
+        .current_dir(cwd.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
 
+    cwd.validate()?;
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    drop(cwd);
     let stdout = child
         .stdout
         .take()
@@ -236,7 +247,37 @@ fn fingerprint_stream(mut stream: impl Read) -> std::io::Result<(u64, [u8; 32])>
     Ok((length, digest.finalize().into()))
 }
 
-fn build_git_command_args(args: &Value, workspace: &Path) -> Result<Vec<String>, String> {
+#[derive(Debug)]
+struct GitCommandPlan {
+    args: Vec<String>,
+    cwd: crate::tools::safety::CheckedWorkspacePath,
+    _path_capability: crate::tools::safety::CheckedWorkspacePath,
+}
+
+impl std::ops::Deref for GitCommandPlan {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.args
+    }
+}
+
+impl PartialEq for GitCommandPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.args == other.args
+    }
+}
+
+impl<const N: usize> PartialEq<[&str; N]> for GitCommandPlan {
+    fn eq(&self, other: &[&str; N]) -> bool {
+        self.args
+            .iter()
+            .map(String::as_str)
+            .eq(other.iter().copied())
+    }
+}
+
+fn build_git_command_args(args: &Value, workspace: &Path) -> Result<GitCommandPlan, String> {
     let operation = args
         .get("operation")
         .and_then(Value::as_str)
@@ -318,21 +359,27 @@ fn build_git_command_args(args: &Value, workspace: &Path) -> Result<Vec<String>,
     // history to Plan Mode.
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let resolved = crate::tools::safety::resolve_path_checked(path, workspace)?;
-    let root = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let relative = match resolved.strip_prefix(&root) {
-        Ok(path) => path.to_string_lossy().replace('\\', "/"),
-        Err(_) => return Err("path is outside the workspace".to_string()),
+    let entry = resolved.open_entry()?;
+    let (cwd, pathspec) = if entry.as_ref().is_some_and(|entry| entry.metadata.is_dir())
+        || resolved.relative_path().as_os_str().is_empty()
+    {
+        (resolved.clone(), ".".to_string())
+    } else {
+        let name = resolved
+            .file_name()
+            .ok_or_else(|| "Git path has no final component".to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        (resolved.parent()?, name)
     };
     command_args.push("--".to_string());
-    command_args.push(if relative.is_empty() {
-        ".".to_string()
-    } else {
-        relative
-    });
+    command_args.push(pathspec);
 
-    Ok(command_args)
+    Ok(GitCommandPlan {
+        args: command_args,
+        cwd,
+        _path_capability: resolved,
+    })
 }
 
 #[cfg(test)]
@@ -456,6 +503,63 @@ mod tests {
             assert!(args.iter().any(|arg| arg == "--no-textconv"));
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn git_cwd_capability_does_not_follow_an_intermediate_replacement_before_spawn() {
+        let root = workspace("cwd-race");
+        let subtree = root.join("subtree");
+        let original = root.join("subtree-original");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&subtree).expect("create Git subtree");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        std::fs::write(subtree.join("identity.txt"), "inside").expect("seed inside identity");
+        std::fs::write(outside.join("identity.txt"), "outside").expect("seed outside identity");
+        let plan = build_git_command_args(
+            &serde_json::json!({"operation": "status", "path": "subtree"}),
+            &root,
+        )
+        .expect("build checked Git command");
+        if let Err(error) = std::fs::rename(&subtree, &original) {
+            #[cfg(windows)]
+            {
+                assert!(
+                    error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32)
+                );
+                drop(plan);
+                std::fs::remove_dir_all(root).expect("clean locked Git cwd fixture");
+                return;
+            }
+            #[cfg(not(windows))]
+            panic!("rename checked Git subtree: {error}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &subtree).expect("create Git cwd replacement symlink");
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .arg("/c")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&subtree)
+                .arg(&outside)
+                .output()
+                .expect("run junction command");
+            assert!(output.status.success());
+        }
+
+        let result = plan.cwd.process_cwd();
+
+        #[cfg(unix)]
+        std::fs::remove_file(&subtree).expect("remove replacement symlink");
+        #[cfg(windows)]
+        std::fs::remove_dir(&subtree).expect("remove replacement junction");
+        assert!(result.is_err(), "moved Git cwd must fail closed");
+        drop(result);
+        drop(plan);
+        std::fs::remove_dir_all(root).expect("clean Git cwd fixture");
     }
 
     #[tokio::test]

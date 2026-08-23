@@ -1,7 +1,6 @@
-use std::path::Path;
+use std::{io::Read as _, path::Path};
 
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
 
 use super::{
     ToolImageOutput,
@@ -55,15 +54,16 @@ pub(super) async fn tool_view_image_with_budget(
         .filter(|path| !path.is_empty())
         .ok_or_else(|| "missing required parameter 'path'".to_string())?;
     let resolved = resolve_path_checked(path, workspace)?;
-    let workspace_root = workspace
-        .canonicalize()
-        .map_err(|error| format!("cannot verify workspace '{}': {error}", workspace.display()))?;
     let open_path = resolved.clone();
-    let open_root = workspace_root.clone();
     let (file, file_len) =
-        tokio::task::spawn_blocking(move || open_checked_workspace_file(&open_path, &open_root))
+        tokio::task::spawn_blocking(move || open_checked_workspace_file(&open_path))
             .await
-            .map_err(|error| format!("cannot open '{}': {error}", resolved.display()))??;
+            .map_err(|error| {
+                format!(
+                    "cannot open '{}': {error}",
+                    resolved.display_path().display()
+                )
+            })??;
     if file_len > crate::image_uploads::MAX_IMAGE_UPLOAD_BYTES as u64 {
         return Err(format!(
             "image exceeds the {} byte limit",
@@ -86,12 +86,16 @@ pub(super) async fn tool_view_image_with_budget(
         None
     };
 
-    let mut data = Vec::with_capacity(file_len as usize);
-    let file = tokio::fs::File::from_std(file);
-    file.take(crate::image_uploads::MAX_IMAGE_UPLOAD_BYTES as u64 + 1)
-        .read_to_end(&mut data)
-        .await
-        .map_err(|error| format!("cannot read '{}': {error}", resolved.display()))?;
+    let display_path = resolved.display_path().to_path_buf();
+    let data = tokio::task::spawn_blocking(move || {
+        let mut data = Vec::with_capacity(file_len as usize);
+        file.take(crate::image_uploads::MAX_IMAGE_UPLOAD_BYTES as u64 + 1)
+            .read_to_end(&mut data)?;
+        Ok::<_, std::io::Error>(data)
+    })
+    .await
+    .map_err(|error| format!("cannot read '{}': {error}", display_path.display()))?
+    .map_err(|error| format!("cannot read '{}': {error}", display_path.display()))?;
     if data.len() > crate::image_uploads::MAX_IMAGE_UPLOAD_BYTES {
         return Err(format!(
             "image exceeds the {} byte limit",
@@ -280,10 +284,12 @@ mod tests {
         }
         link_result.expect("directory symlink should be created");
 
-        let root = workspace.canonicalize().unwrap();
-        let error = open_checked_workspace_file(&link.join("pixel.png"), &root).unwrap_err();
+        let error = resolve_path_checked("linked-dir/pixel.png", &workspace).unwrap_err();
 
-        assert!(error.contains("outside"));
+        assert!(
+            error.contains("link") || error.contains("reparse") || error.contains("outside"),
+            "unexpected no-follow rejection: {error}"
+        );
         #[cfg(unix)]
         let _ = std::fs::remove_file(&link);
         #[cfg(windows)]

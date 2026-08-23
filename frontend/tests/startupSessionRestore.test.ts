@@ -151,6 +151,10 @@ function expectNoSessionCreate(events: string[]): void {
   expect(events).not.toContain('fetch:POST:/api/session');
 }
 
+function expectNoGroupDiscovery(events: string[]): void {
+  expect(events).not.toContain('fetch:GET:/api/session-groups');
+}
+
 describe('startup Session restoration', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -269,6 +273,22 @@ describe('startup Session restoration', () => {
     expect(socketUrl.searchParams.get('group')).toBeNull();
     expect(socketUrl.searchParams.get('session')).toBe('main');
     expectSessionRestoreBeforeGroupAndSocket(events);
+    expectNoSessionCreate(events);
+  });
+
+  it('makes zero Group discovery requests when Groups are disabled', async () => {
+    const { events, socketUrl, stateModule } = await startWorkspace({
+      persistedSessionId: 'main',
+      sessions: [{ id: 'main', name: 'Main' }],
+      persistedGroupId: 'old-disabled-group',
+      groupsEnabled: false,
+    });
+
+    expect(stateModule.state.groupsEnabled).toBe(false);
+    expect(stateModule.state.activeGroupId).toBe('');
+    expect(socketUrl.searchParams.get('group')).toBeNull();
+    expect(socketUrl.searchParams.get('session')).toBe('main');
+    expectNoGroupDiscovery(events);
     expectNoSessionCreate(events);
   });
 });

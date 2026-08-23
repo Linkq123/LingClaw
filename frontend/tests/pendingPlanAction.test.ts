@@ -14,6 +14,7 @@ import {
   renderPendingPlanAction,
   renderPlanHistory,
   renderPlanState,
+  refreshPlan,
   refreshPlanLanguage,
   refreshPlanMounts,
   resumePlan,
@@ -613,6 +614,21 @@ describe('pending plan action', () => {
         risks: ['Migration can fail'],
         acceptance_criteria: ['Feedback survives restart'],
         verification: ['Run storage tests'],
+        completion_checks: [
+          {
+            id: 'result-bytes',
+            step_id: 'implement',
+            covers: [
+              { section: 'acceptance_criteria', index: 0 },
+              { section: 'verification', index: 0 },
+            ],
+            kind: 'workspace_path',
+            path: 'result.txt',
+            expected_path_type: 'file',
+            exact_content: 'ROUND2-V2-REFRESH',
+            size_bytes: 17,
+          },
+        ],
         questions: [
           {
             id: 'strategy',
@@ -624,6 +640,13 @@ describe('pending plan action', () => {
       progress: [{ id: 'implement', title: 'Implement', status: 'pending' }],
     });
 
+    expect(document.querySelector('.plan-artifact-card')?.textContent).toContain(
+      'Server completion checks',
+    );
+    expect(document.querySelector('.plan-artifact-card')?.textContent).toContain(
+      'ROUND2-V2-REFRESH',
+    );
+
     await copyPlan();
 
     const copied = String(writeText.mock.calls[0]?.[0]);
@@ -633,6 +656,9 @@ describe('pending plan action', () => {
     expect(copied).toContain('Migration can fail');
     expect(copied).toContain('Feedback survives restart');
     expect(copied).toContain('Run storage tests');
+    expect(copied).toContain('Server completion checks');
+    expect(copied).toContain('result-bytes → implement');
+    expect(copied).toContain('ROUND2-V2-REFRESH');
     expect(copied).toContain('Which strategy?');
     expect(copied).toContain('Prefer compatibility');
   });
@@ -711,6 +737,85 @@ describe('pending plan action', () => {
     expect(document.querySelector('.plan-stale-notice code')?.textContent).toBe('src/main.rs');
     expect(document.querySelector('[data-action="plan-refresh"]')).not.toBeNull();
     expect(document.querySelector('[data-action="plan-execute-stale"]')).not.toBeNull();
+  });
+
+  it('uses the refreshed revision and latest stale token before showing an incomplete run as failed', () => {
+    const revisionTwo = {
+      plan_id: 'plan_refresh_then_stale',
+      revision: 2,
+      status: 'ready' as const,
+      message_index: 2,
+      created_at: 1710000000,
+      updated_at: 1710000001,
+      artifact: {
+        title: 'Revision two',
+        goal: 'Create result.txt',
+        steps: [{ id: 'write-result', title: 'Write result.txt' }],
+      },
+      progress: [{ id: 'write-result', title: 'Write result.txt', status: 'pending' as const }],
+    };
+    renderPlanState(revisionTwo);
+    executePendingPlan(document.querySelector<HTMLButtonElement>('[data-action="execute-plan"]'));
+    handlePlanStale({
+      plan_id: revisionTwo.plan_id,
+      revision: 2,
+      paths: ['spec.txt'],
+      confirmation_token: 'revision-two-token',
+    });
+
+    refreshPlan();
+    expect(state.ws?.send).toHaveBeenLastCalledWith(
+      JSON.stringify({
+        plan_action: {
+          action: 'refresh',
+          plan_id: revisionTwo.plan_id,
+          revision: 2,
+        },
+      }),
+    );
+
+    state.busy = false;
+    renderPlanState({
+      ...revisionTwo,
+      revision: 3,
+      updated_at: 1710000003,
+      artifact: { ...revisionTwo.artifact, title: 'Revision three' },
+    });
+    expect(state.planStaleConfirmationToken).toBe('');
+    executePendingPlan(document.querySelector<HTMLButtonElement>('[data-action="execute-plan"]'));
+    handlePlanStale({
+      plan_id: revisionTwo.plan_id,
+      revision: 3,
+      paths: ['spec.txt'],
+      confirmation_token: 'revision-three-token',
+    });
+    executeStalePlan();
+
+    expect(state.ws?.send).toHaveBeenLastCalledWith(
+      JSON.stringify({
+        plan_action: {
+          action: 'execute',
+          plan_id: revisionTwo.plan_id,
+          revision: 3,
+          allow_stale: true,
+          stale_confirmation_token: 'revision-three-token',
+        },
+      }),
+    );
+
+    renderPlanState({
+      ...revisionTwo,
+      revision: 3,
+      status: 'failed',
+      updated_at: 1710000004,
+      approved_at: 1710000003,
+      finished_at: 1710000004,
+      execution_attempt: 1,
+      unfinished_steps: 1,
+      run_finished_with_unreported_steps: false,
+    });
+    expect(document.querySelector('[data-action="plan-resume"]')).not.toBeNull();
+    expect(document.querySelector('.plan-unreported-warning')).toBeNull();
   });
 
   it('requires an explicit choice when plan evidence is incomplete', () => {

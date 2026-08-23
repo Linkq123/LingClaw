@@ -1072,3 +1072,64 @@ fn external_workspace_rules_do_not_follow_symlinks() {
     assert!(project_rules.is_empty());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(any(unix, windows))]
+#[test]
+fn external_workspace_rules_reject_a_replaced_root_before_filename_probes() {
+    let root = std::env::temp_dir().join(format!(
+        "lingclaw-project-rules-root-replacement-{}",
+        std::process::id()
+    ));
+    let session_home = root.join("private");
+    let project = root.join("project");
+    let original = root.join("project-original");
+    let outside_with_rules = root.join("outside-with-rules");
+    let outside_without_rules = root.join("outside-without-rules");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&session_home).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&outside_with_rules).unwrap();
+    fs::create_dir_all(&outside_without_rules).unwrap();
+    fs::write(
+        outside_with_rules.join("AGENTS.md"),
+        "outside rule must never be probed or read",
+    )
+    .unwrap();
+    fs::rename(&project, &original).unwrap();
+
+    fn create_link(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .arg("/c")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+    }
+
+    fn remove_link(link: &Path) {
+        #[cfg(unix)]
+        fs::remove_file(link).unwrap();
+        #[cfg(windows)]
+        fs::remove_dir(link).unwrap();
+    }
+
+    create_link(&project, &outside_with_rules);
+    let with_outside_file = load_project_rules(&project, &session_home);
+    remove_link(&project);
+    create_link(&project, &outside_without_rules);
+    let without_outside_file = load_project_rules(&project, &session_home);
+    remove_link(&project);
+
+    assert_eq!(with_outside_file, without_outside_file);
+    assert!(with_outside_file.contains("could not be opened without following links"));
+    assert!(!with_outside_file.contains("outside rule"));
+    fs::remove_dir_all(root).unwrap();
+}

@@ -1,5 +1,10 @@
 import { dom, state } from '../state.js';
-import type { PlanReadyPayload, PlanStatePayload, PlanStatus } from '../types.js';
+import type {
+  PlanCompletionCheck,
+  PlanReadyPayload,
+  PlanStatePayload,
+  PlanStatus,
+} from '../types.js';
 import { invalidateChatScrollCache, scrollDown } from '../scroll.js';
 import { setBusy } from './chat.js';
 import { isComposerModelReady, syncComposerAvailability } from '../composerAvailability.js';
@@ -237,6 +242,36 @@ function appendTextSection(
   });
   section.appendChild(list);
   card.appendChild(section);
+}
+
+function completionCheckText(check: PlanCompletionCheck): string {
+  let detail: string;
+  if (check.kind === 'workspace_path') {
+    const expectation = tr(`plan.completion.path.${check.expected_path_type || 'file'}`);
+    const constraints = [
+      tr('plan.completion.workspacePath', { path: check.path || '', expectation }),
+    ];
+    if (typeof check.size_bytes === 'number') {
+      constraints.push(tr('plan.completion.size', { size: check.size_bytes }));
+    }
+    if (check.exact_content !== undefined) {
+      constraints.push(
+        tr('plan.completion.content', { content: JSON.stringify(check.exact_content) }),
+      );
+    }
+    if (check.sha256) constraints.push(tr('plan.completion.sha256', { hash: check.sha256 }));
+    detail = constraints.join('; ');
+  } else if (check.kind === 'approved_evidence_unchanged') {
+    detail = tr('plan.completion.evidence', {
+      kind: check.evidence_kind || 'file',
+      path: check.path || '',
+    });
+  } else if (check.kind === 'plan_progress') {
+    detail = tr('plan.completion.progress', { steps: (check.required_step_ids || []).join(', ') });
+  } else {
+    detail = tr('plan.completion.tool', { tool: check.tool_name || '' });
+  }
+  return `${check.id} → ${check.step_id}: ${detail}`;
 }
 
 function buildPlanSteps(plan: PlanStatePayload): HTMLElement {
@@ -511,6 +546,11 @@ function buildPlanCard(plan: PlanStatePayload, historical = false): HTMLElement 
   appendTextSection(card, tr('plan.risks'), plan.artifact.risks, 'is-risk');
   appendTextSection(card, tr('plan.acceptance'), plan.artifact.acceptance_criteria);
   appendTextSection(card, tr('plan.verification'), plan.artifact.verification);
+  appendTextSection(
+    card,
+    tr('plan.completionChecks'),
+    plan.artifact.completion_checks?.map(completionCheckText),
+  );
   const questions = buildQuestions(plan, historical);
   if (questions) card.appendChild(questions);
   if (!historical) {
@@ -891,6 +931,10 @@ export async function copyPlan(): Promise<void> {
   appendSection(tr('plan.risks'), plan.artifact.risks);
   appendSection(tr('plan.acceptance'), plan.artifact.acceptance_criteria);
   appendSection(tr('plan.verification'), plan.artifact.verification);
+  appendSection(
+    tr('plan.completionChecks'),
+    plan.artifact.completion_checks?.map(completionCheckText),
+  );
   if (plan.artifact.questions?.length) {
     lines.push('', `## ${tr('plan.questions')}`);
     plan.artifact.questions.forEach((question) => {

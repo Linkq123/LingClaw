@@ -116,6 +116,7 @@ import {
 import {
   applyComposerModelPayload,
   initComposerModelPicker,
+  refreshActiveComposerSessionModelState,
   refreshComposerModelCatalog,
   refreshLocalizedComposerModelPicker,
 } from './composerModels.js';
@@ -186,6 +187,7 @@ import { appendWorkspacePortal, isConsoleSurfaceActive } from './workspacePortal
 import { publishStorageStatus } from './storageStatus.js';
 import {
   CONFIG_SAVED_EVENT,
+  COMPOSER_SESSION_MODEL_RECOVERY_EVENT,
   acceptComposerHttpModelPayloadRevision,
   acceptComposerSocketModelPayloadRevision,
   beginComposerSessionTransition,
@@ -193,6 +195,7 @@ import {
   captureComposerSessionTransitionTargetCapabilitiesBaseline,
   completeComposerSessionTransition,
   composerAvailabilityResolution,
+  composerSessionModelRecoveryNeedsRetry,
   composerSessionPayloadMatchesTransition,
   getComposerConnectionGeneration,
   groupModelRosterMatches,
@@ -1795,6 +1798,30 @@ function applySessionModelConfiguration(data): boolean {
   return sessionModelPayloadTargetsActiveSession(data) && applySessionModelFields(data, false);
 }
 
+function recoverActiveComposerSessionModelState(): void {
+  const sessionId = String(state.activeSessionId || 'main').trim();
+  if (
+    !sessionId ||
+    state.activeGroupId ||
+    state.sessionSwitchInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending ||
+    (state.composerEffectiveModelConfigured !== null &&
+      state.composerSessionModelRevision === state.composerConfigRevision)
+  ) {
+    return;
+  }
+  void refreshActiveComposerSessionModelState(sessionId);
+}
+
+function retryComposerConfiguration(): void {
+  if (composerSessionModelRecoveryNeedsRetry()) {
+    recoverActiveComposerSessionModelState();
+    return;
+  }
+  void refreshComposerAvailability();
+}
+
 async function promoteGroupMember(sessionId: string) {
   if (storageWriteBlocked() || !state.activeGroupId || sessionId === 'main') return;
   try {
@@ -2467,12 +2494,12 @@ function handleMessage(data) {
       applySessionModelConfiguration(data);
       break;
 
-    case 'session':
+    case 'session': {
       if (!sessionModelPayloadTargetsActiveSession(data, true)) break;
       clearPlanStateForSessionTransition(String(data.id || 'main'));
       invalidatePendingHistoryRender();
       state.composerSessionIdentityPending = false;
-      applySessionModelFields(data, false);
+      const sessionModelFieldsApplied = applySessionModelFields(data, false);
       completeComposerSessionTransition();
       clearCompressionOutcome();
       state.activeGroupId = '';
@@ -2486,6 +2513,13 @@ function handleMessage(data) {
       state.sessionSwitchInFlight = false;
       syncComposerAvailability();
       updateAttachButton();
+      if (
+        !sessionModelFieldsApplied &&
+        (state.composerEffectiveModelConfigured === null ||
+          state.composerSessionModelRevision !== state.composerConfigRevision)
+      ) {
+        recoverActiveComposerSessionModelState();
+      }
       dom.sessionNameEl.textContent = data.name || tr('common.main');
       dom.sessionIdEl.textContent = data.id.slice(0, 12);
       renderSessionDrawer();
@@ -2499,6 +2533,7 @@ function handleMessage(data) {
       applyViewState(data);
       void refreshSessionsList();
       break;
+    }
 
     case 'todos_state':
       applyTodosState(data);
@@ -3018,7 +3053,7 @@ const actionHandlers = {
   'plan-submit-feedback': (el) => submitPlanFeedback(el),
   'plan-copy': () => void copyPlan(),
   'plan-jump': () => jumpToPlan(),
-  'retry-composer-config': () => void refreshComposerAvailability(),
+  'retry-composer-config': () => retryComposerConfiguration(),
   'open-group-members': (el) => {
     if (!state.activeGroupId) return;
     openGroupMemberDrawer(el instanceof HTMLElement ? el : null);
@@ -3364,6 +3399,10 @@ function installChatResizeObserver(): void {
 document.addEventListener('click', handleDocumentClick);
 window.addEventListener(CONFIG_SAVED_EVENT, handleComposerConfigSaved);
 window.addEventListener(CONFIG_SAVED_EVENT, refreshComposerModelCatalog);
+document.addEventListener(
+  COMPOSER_SESSION_MODEL_RECOVERY_EVENT,
+  recoverActiveComposerSessionModelState,
+);
 const unsubscribeLanguageChange = subscribeLanguageChange(refreshLocalizedUi);
 
 // ── Init ──
@@ -3423,6 +3462,10 @@ void bootstrapWorkspace();
 // accumulate duplicate handlers in the dev build. No-op in production.
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
+    document.removeEventListener(
+      COMPOSER_SESSION_MODEL_RECOVERY_EVENT,
+      recoverActiveComposerSessionModelState,
+    );
     if (scrollSyncRafId) {
       cancelAnimationFrame(scrollSyncRafId);
       scrollSyncRafId = 0;

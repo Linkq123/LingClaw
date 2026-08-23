@@ -278,6 +278,96 @@ async fn recv_json_with_timeout(rx: &mut tokio::sync::mpsc::Receiver<String>) ->
     serde_json::from_str(&payload).expect("payload json")
 }
 
+type QueuedSseState = (
+    Arc<Mutex<VecDeque<String>>>,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+);
+
+struct QueuedSseServerGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for QueuedSseServerGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn queued_openai_sse_handler(
+    State((responses, requests)): State<QueuedSseState>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    requests.lock().await.push(request);
+    let response = responses.lock().await.pop_front();
+    match response {
+        Some(body) => (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+            .into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn spawn_queued_openai_sse_server(
+    responses: Vec<String>,
+) -> (
+    String,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    QueuedSseServerGuard,
+) {
+    let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/chat/completions",
+            axum::routing::post(queued_openai_sse_handler),
+        )
+        .with_state((Arc::clone(&responses), Arc::clone(&requests)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("queued SSE listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("queued SSE listener should expose its address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (
+        format!("http://{address}"),
+        requests,
+        QueuedSseServerGuard { handle },
+    )
+}
+
+fn openai_tool_call_sse(id: &str, name: &str, arguments: serde_json::Value) -> String {
+    let arguments = serde_json::to_string(&arguments).expect("tool arguments should encode");
+    let event = json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!("data: {event}\n\ndata: [DONE]\n\n")
+}
+
+fn openai_text_sse(content: &str) -> String {
+    let event = json!({
+        "choices": [{
+            "delta": {"content": content},
+            "finish_reason": "stop"
+        }]
+    });
+    format!("data: {event}\n\ndata: [DONE]\n\n")
+}
+
 #[tokio::test]
 async fn initial_session_sync_omits_group_discovery_when_groups_are_disabled() {
     let mut config = test_config();
@@ -863,13 +953,20 @@ async fn handle_idle_socket_input_executes_matching_pending_plan() {
     )
     .await;
 
-    assert!(matches!(
-        action,
+    match &action {
         IdleSocketInputAction::StartAgent {
             run_mode: AgentRunMode::Execute,
+            reservation,
             ..
-        }
-    ));
+        } => assert!(
+            reservation
+                .plan_action_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.contains("Execute it now")),
+            "approved execution needs an explicit ephemeral action prompt"
+        ),
+        _ => panic!("a matching approved plan should start execution"),
+    }
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&session_id).expect("session should exist");
     let active_plan = session
@@ -1226,9 +1323,55 @@ fn plan_action_context_is_an_ephemeral_user_message() {
     assert_eq!(messages[1].role, "user");
     assert_eq!(
         messages[1].content.as_deref(),
-        Some("Plan revision request from the user:\n\nUse SQLite")
+        Some("Current plan action from the user:\n\nUse SQLite")
     );
     assert!(messages[1].timestamp.is_none());
+}
+
+#[test]
+fn submit_plan_escape_errors_return_actionable_retry_guidance() {
+    let guidance =
+        submit_plan_retry_guidance("invalid plan JSON: invalid escape at line 1 column 868");
+    assert!(guidance.contains("workspace-relative"));
+    assert!(guidance.contains("Windows path"));
+    assert!(guidance.contains("raw newlines"));
+    assert!(submit_plan_retry_guidance("steps must not be empty").is_empty());
+}
+
+#[test]
+fn internal_plan_tool_results_do_not_trigger_an_auxiliary_state_digest() {
+    let internal_error = agent::ToolResultEntry {
+        id: "submit-plan".into(),
+        name: crate::plan::TOOL_NAME_SUBMIT_PLAN.into(),
+        result: "submit_plan validation failed: invalid escape".into(),
+        duration_ms: 0,
+        is_error: true,
+        call_summary: None,
+        trace: None,
+    };
+    assert!(agent::should_trigger_state_digest(std::slice::from_ref(
+        &internal_error
+    )));
+    assert!(!should_run_working_state_digest(std::slice::from_ref(
+        &internal_error
+    )));
+
+    let workspace_error = agent::ToolResultEntry {
+        id: "read-file".into(),
+        name: crate::tools::TOOL_NAME_READ_FILE.into(),
+        result: "read_file error: unavailable".into(),
+        duration_ms: 1,
+        is_error: true,
+        call_summary: None,
+        trace: None,
+    };
+    assert!(should_run_working_state_digest(std::slice::from_ref(
+        &workspace_error
+    )));
+    assert!(should_run_working_state_digest(&[
+        workspace_error,
+        internal_error
+    ]));
 }
 
 #[tokio::test]
@@ -1672,12 +1815,815 @@ async fn handle_idle_socket_input_reports_changed_plan_evidence_before_execution
         .expect("plan should remain available");
     assert_eq!(plan.status, crate::plan::PlanStatus::Executing);
     assert_eq!(plan.stale_override_paths, vec!["evidence.txt"]);
+    assert!(
+        reservation
+            .plan_action_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("Execute it now"))
+    );
     release_agent_run_reservation(&state, &session_id, &reservation).await;
 
     let _ = std::fs::remove_file(
         crate::session_store::sessions_dir().join(format!("{session_id}.json")),
     );
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn refreshed_stale_override_runs_tools_and_completes_only_reported_steps() {
+    let responses = vec![
+        openai_tool_call_sse(
+            "refresh-read-spec",
+            crate::tools::TOOL_NAME_READ_FILE,
+            json!({"path":"spec.txt"}),
+        ),
+        openai_tool_call_sse(
+            "refresh-submit-plan",
+            crate::plan::TOOL_NAME_SUBMIT_PLAN,
+            json!({
+                "state": "ready",
+                "title": "Refreshed result plan",
+                "goal": "Create result.txt from the refreshed specification",
+                "summary": "Use the latest spec.txt evidence before writing the result.",
+                "steps": [{
+                    "id": "write-result",
+                    "title": "Write and verify result.txt",
+                    "description": "Create the requested file in the workspace.",
+                    "affected_areas": ["result.txt"]
+                }],
+                "verification": ["Read result.txt and verify its content."],
+                "acceptance_criteria": ["result.txt exists with the requested content."],
+                "completion_checks": [{
+                    "id": "result-file",
+                    "step_id": "write-result",
+                    "covers": [
+                        {"section": "verification", "index": 0},
+                        {"section": "acceptance_criteria", "index": 0}
+                    ],
+                    "kind": "workspace_path",
+                    "path": "result.txt",
+                    "expected_path_type": "file",
+                    "exact_content": "executed revision 3",
+                    "size_bytes": 19
+                }]
+            }),
+        ),
+        openai_tool_call_sse(
+            "write-result",
+            crate::tools::TOOL_NAME_WRITE_FILE,
+            json!({"path":"result.txt", "content":"executed revision 3"}),
+        ),
+        openai_tool_call_sse(
+            "complete-and-adapt",
+            crate::plan::TOOL_NAME_UPDATE_PLAN,
+            json!({
+                "base_revision": 3,
+                "updates": [{
+                    "id": "write-result",
+                    "status": "completed",
+                    "note": "Created and verified result.txt"
+                }],
+                "append_steps": [{
+                    "id": "adapt-readback",
+                    "title": "Read the final file once more",
+                    "note": "Add a harmless final-state check",
+                    "deviation_reason": "A final readback strengthens verification without changing the approved output"
+                }]
+            }),
+        ),
+        openai_tool_call_sse(
+            "readback-result",
+            crate::tools::TOOL_NAME_READ_FILE,
+            json!({"path":"result.txt"}),
+        ),
+        openai_tool_call_sse(
+            "complete-adaptation",
+            crate::plan::TOOL_NAME_UPDATE_PLAN,
+            json!({
+                "base_revision": 3,
+                "updates": [{
+                    "id": "adapt-readback",
+                    "status": "completed",
+                    "note": "Readback preserved the approved exact content"
+                }]
+            }),
+        ),
+        openai_text_sse("The approved revision was executed and verified."),
+    ];
+    let (api_base, requests, _server) = spawn_queued_openai_sse_server(responses).await;
+    let mut config = test_config();
+    config.api_base = api_base;
+    let state = Arc::new(test_app_state_with_config(config));
+    let session_id = format!(
+        "refreshed-stale-execution-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("refreshed-stale-execution");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+    std::fs::write(workspace.join("spec.txt"), "revision two")
+        .expect("initial evidence should be written");
+    let revision_two_evidence = crate::plan::capture_tool_evidence(
+        crate::tools::TOOL_NAME_READ_FILE,
+        r#"{"path":"spec.txt"}"#,
+        &workspace,
+    );
+    let artifact = crate::plan::PlanArtifact {
+        title: "Create the result".into(),
+        goal: "Create result.txt from the approved specification".into(),
+        steps: vec![crate::plan::PlanStep {
+            id: "write-result".into(),
+            title: "Write and verify result.txt".into(),
+            description: "Create the requested file in the workspace.".into(),
+            affected_areas: vec!["result.txt".into()],
+        }],
+        verification: vec!["Read result.txt and verify its content.".into()],
+        acceptance_criteria: vec!["result.txt exists with the requested content.".into()],
+        ..Default::default()
+    };
+    let progress = vec![crate::plan::PlanProgressStep {
+        id: "write-result".into(),
+        title: "Write and verify result.txt".into(),
+        ..Default::default()
+    }];
+    let mut session = test_session(&session_id, "Refreshed stale execution", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Create result.txt according to spec.txt.".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some("Plan revision two".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_refreshed_stale".into(),
+        revision: 2,
+        status: crate::plan::PlanStatus::Ready,
+        artifact: artifact.clone(),
+        progress: progress.clone(),
+        evidence: revision_two_evidence,
+        created_at: 10,
+        updated_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    std::fs::write(workspace.join("spec.txt"), "revision three")
+        .expect("the specification should change before the refresh run");
+
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut current_session_id = session_id.clone();
+    let refresh_action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"refresh","plan_id":"plan_refreshed_stale","revision":2}}"#
+            .into(),
+        &mut current_session_id,
+        &current_session_ref,
+        7,
+        &state,
+        &refresh_tx,
+        &live_tx,
+        &cancel,
+        &stop_requested,
+    )
+    .await;
+    let (refresh_reservation, refresh_model_snapshot) = match refresh_action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::PlanOnly,
+            reservation,
+            model_snapshot,
+            ..
+        } => (reservation, model_snapshot),
+        _ => panic!("refresh should start a PlanOnly revision run"),
+    };
+    assert!(refresh_reservation.reset_plan_evidence);
+    assert!(
+        refresh_reservation
+            .plan_action_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("Refresh this plan"))
+    );
+    let (_refresh_inbound_tx, mut refresh_inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
+    let refresh_outcome = run_agent_session(
+        &state,
+        &session_id,
+        7,
+        &cancel,
+        &live_tx,
+        &mut refresh_inbound_rx,
+        &stop_requested,
+        AgentRunMode::PlanOnly,
+        Some(refresh_reservation),
+        Some(refresh_model_snapshot),
+    )
+    .await;
+    assert!(!refresh_outcome.run_failed);
+
+    let refreshed_plan = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("the Provider-submitted refresh should register a plan");
+    assert_eq!(refreshed_plan.id, "plan_refreshed_stale");
+    assert_eq!(refreshed_plan.revision, 3);
+    assert_eq!(refreshed_plan.status, crate::plan::PlanStatus::Ready);
+    assert_eq!(refreshed_plan.artifact.title, "Refreshed result plan");
+    assert_eq!(refreshed_plan.progress.len(), 1);
+    assert_eq!(refreshed_plan.evidence.len(), 1);
+    assert!(crate::plan::verify_evidence(&workspace, &refreshed_plan.evidence).is_empty());
+    let persisted: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+        )
+        .expect("the refreshed Session snapshot should be persisted"),
+    )
+    .expect("the refreshed Session snapshot should remain valid JSON");
+    assert_eq!(persisted["pending_plan"]["revision"], 3);
+    assert_eq!(persisted["pending_plan"]["status"], "ready");
+    assert_eq!(
+        persisted["pending_plan"]["artifact"]["title"],
+        "Refreshed result plan"
+    );
+
+    {
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2, "refresh should use two model cycles");
+        let refresh_messages = requests[0]["messages"]
+            .as_array()
+            .expect("refresh request should contain messages");
+        assert!(refresh_messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Refresh this plan"))
+        }));
+        assert!(requests[0]["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == crate::plan::TOOL_NAME_SUBMIT_PLAN)
+        }));
+    }
+
+    std::fs::write(workspace.join("spec.txt"), "stale after revision three")
+        .expect("the refreshed evidence should become stale");
+    assert_eq!(
+        crate::plan::verify_evidence(&workspace, &refreshed_plan.evidence),
+        vec!["spec.txt"]
+    );
+
+    let (stale_tx, mut stale_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let stale_action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"execute","plan_id":"plan_refreshed_stale","revision":3}}"#
+            .into(),
+        &mut current_session_id,
+        &current_session_ref,
+        7,
+        &state,
+        &stale_tx,
+        &live_tx,
+        &cancel,
+        &stop_requested,
+    )
+    .await;
+    assert!(matches!(stale_action, IdleSocketInputAction::Continue));
+    let stale_event = recv_json_with_timeout(&mut stale_rx).await;
+    assert_eq!(stale_event["type"], "plan_stale");
+    assert_eq!(stale_event["revision"], 3);
+    let confirmation_token = stale_event["confirmation_token"]
+        .as_str()
+        .expect("stale revision should provide a confirmation token")
+        .to_string();
+
+    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let approval_action = handle_idle_socket_input(
+        json!({
+            "plan_action": {
+                "action": "execute",
+                "plan_id": "plan_refreshed_stale",
+                "revision": 3,
+                "allow_stale": true,
+                "stale_confirmation_token": confirmation_token,
+            }
+        })
+        .to_string(),
+        &mut current_session_id,
+        &current_session_ref,
+        7,
+        &state,
+        &approval_tx,
+        &live_tx,
+        &cancel,
+        &stop_requested,
+    )
+    .await;
+    let (reservation, model_snapshot) = match approval_action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::Execute,
+            reservation,
+            model_snapshot,
+        } => (reservation, model_snapshot),
+        _ => panic!("confirmed current stale snapshot should start execution"),
+    };
+
+    let (_inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        7,
+        &cancel,
+        &live_tx,
+        &mut inbound_rx,
+        &stop_requested,
+        AgentRunMode::Execute,
+        Some(reservation),
+        Some(model_snapshot),
+    )
+    .await;
+
+    if outcome.run_failed {
+        let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+        panic!("refreshed stale execution failed unexpectedly: {events:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("result.txt"))
+            .expect("approved execution should create its target artifact"),
+        "executed revision 3"
+    );
+    let plan = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("completed plan should remain visible");
+    assert_eq!(plan.revision, 3);
+    assert_eq!(plan.status, crate::plan::PlanStatus::Completed);
+    assert_eq!(plan.unfinished_step_count(), 0);
+    assert_eq!(plan.progress.len(), 2);
+    assert_eq!(
+        plan.progress[0].status,
+        crate::plan::PlanStepStatus::Completed
+    );
+    assert_eq!(plan.progress[1].id, "adapt-readback");
+    assert_eq!(
+        plan.progress[1].status,
+        crate::plan::PlanStepStatus::Completed
+    );
+    assert!(plan.stale_override_confirmed_at.is_some());
+
+    let requests = requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        7,
+        "refresh and adaptive execution should use seven cycles"
+    );
+    let first_messages = requests[2]["messages"]
+        .as_array()
+        .expect("OpenAI request should contain messages");
+    assert!(first_messages.iter().any(|message| {
+        message["role"] == "system"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("## Approved Execution Plan"))
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Revision: 3"))
+    }));
+    assert!(first_messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Execute it now"))
+    }));
+    drop(requests);
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "plan_state" && event["plan"]["status"] == "completed"
+        })
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["type"] == "error" && event["code"] == "plan_execution_incomplete"
+        })
+    );
+}
+
+#[tokio::test]
+async fn stale_override_cannot_complete_against_a_reinterpreted_refresh_contract() {
+    let responses = vec![
+        openai_tool_call_sse(
+            "refresh-v2-read-spec",
+            crate::tools::TOOL_NAME_READ_FILE,
+            json!({"path":"spec.txt"}),
+        ),
+        openai_tool_call_sse(
+            "refresh-v2-submit-plan",
+            crate::plan::TOOL_NAME_SUBMIT_PLAN,
+            json!({
+                "state": "ready",
+                "title": "Create the exact revision-two result",
+                "goal": "Create result.txt with exactly ROUND2-V2-REFRESH and no trailing newline.",
+                "steps": [
+                    {
+                        "id": "step1-create-result",
+                        "title": "Write the approved revision-two content",
+                        "description": "Write exactly ROUND2-V2-REFRESH to result.txt.",
+                        "affected_areas": ["result.txt"]
+                    },
+                    {
+                        "id": "step2-verify-result",
+                        "title": "Verify the approved exact bytes",
+                        "description": "Verify the final file is exactly 17 bytes and has no trailing newline.",
+                        "affected_areas": ["result.txt"]
+                    },
+                    {
+                        "id": "step3-report-progress",
+                        "title": "Report the immutable revision progress"
+                    }
+                ],
+                "assumptions": ["Use the current spec.txt value when execution begins."],
+                "verification": ["result.txt is exactly 17 bytes with content ROUND2-V2-REFRESH."],
+                "acceptance_criteria": ["result.txt contains exactly ROUND2-V2-REFRESH without a trailing newline."],
+                "completion_checks": [{
+                    "id": "approved-result-bytes",
+                    "step_id": "step2-verify-result",
+                    "covers": [
+                        {"section": "verification", "index": 0},
+                        {"section": "acceptance_criteria", "index": 0}
+                    ],
+                    "kind": "workspace_path",
+                    "path": "result.txt",
+                    "expected_path_type": "file",
+                    "exact_content": "ROUND2-V2-REFRESH",
+                    "size_bytes": 17
+                }]
+            }),
+        ),
+        openai_tool_call_sse(
+            "write-approved-v2",
+            crate::tools::TOOL_NAME_WRITE_FILE,
+            json!({"path":"result.txt", "content":"ROUND2-V2-REFRESH"}),
+        ),
+        openai_tool_call_sse(
+            "read-stale-v3",
+            crate::tools::TOOL_NAME_READ_FILE,
+            json!({"path":"spec.txt"}),
+        ),
+        openai_tool_call_sse(
+            "append-v3-adaptation",
+            crate::plan::TOOL_NAME_UPDATE_PLAN,
+            json!({
+                "base_revision": 2,
+                "updates": [{
+                    "id": "step1-create-result",
+                    "status": "completed",
+                    "note": "Wrote the approved ROUND2-V2-REFRESH value first."
+                }],
+                "append_steps": [{
+                    "id": "step4-adapt-v3-override",
+                    "title": "Replace the approved output with the new spec value",
+                    "note": "Treat the stale input as a refreshed requirement.",
+                    "deviation_reason": "spec.txt now says ROUND2-V3-OVERRIDE, so reinterpret the broad current-value assumption."
+                }]
+            }),
+        ),
+        openai_tool_call_sse(
+            "rewrite-unapproved-v3",
+            crate::tools::TOOL_NAME_WRITE_FILE,
+            json!({"path":"result.txt", "content":"ROUND2-V3-OVERRIDE"}),
+        ),
+        openai_tool_call_sse(
+            "claim-v3-complete",
+            crate::plan::TOOL_NAME_UPDATE_PLAN,
+            json!({
+                "base_revision": 2,
+                "updates": [
+                    {
+                        "id": "step2-verify-result",
+                        "status": "completed",
+                        "note": "Verified the reinterpreted 18-byte V3 output."
+                    },
+                    {
+                        "id": "step3-report-progress",
+                        "status": "completed",
+                        "note": "All original and adaptive work is reported complete."
+                    },
+                    {
+                        "id": "step4-adapt-v3-override",
+                        "status": "completed",
+                        "note": "Replaced result.txt with ROUND2-V3-OVERRIDE."
+                    }
+                ]
+            }),
+        ),
+        openai_text_sse("The current specification was applied and every step is complete."),
+    ];
+    let (api_base, requests, _server) = spawn_queued_openai_sse_server(responses).await;
+    let mut config = test_config();
+    config.api_base = api_base;
+    let state = Arc::new(test_app_state_with_config(config));
+    let session_id = format!(
+        "stale-contract-rejection-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("stale-contract-rejection");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+    std::fs::write(workspace.join("spec.txt"), "ROUND2-V1")
+        .expect("revision-one evidence should be written");
+    let revision_one_evidence = crate::plan::capture_tool_evidence(
+        crate::tools::TOOL_NAME_READ_FILE,
+        r#"{"path":"spec.txt"}"#,
+        &workspace,
+    );
+    let mut session = test_session(&session_id, "Stale contract rejection", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Create result.txt according to spec.txt.".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some("Plan revision one".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_stale_contract".into(),
+        revision: 1,
+        status: crate::plan::PlanStatus::Ready,
+        artifact: crate::plan::PlanArtifact {
+            title: "Create the initial result".into(),
+            goal: "Create result.txt from revision one".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "write-result".into(),
+                title: "Write result.txt".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        progress: vec![crate::plan::PlanProgressStep {
+            id: "write-result".into(),
+            title: "Write result.txt".into(),
+            ..Default::default()
+        }],
+        evidence: revision_one_evidence,
+        created_at: 10,
+        updated_at: 10,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    std::fs::write(workspace.join("spec.txt"), "ROUND2-V2-REFRESH")
+        .expect("the source should change before refresh");
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let (socket_tx, _socket_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut current_session_id = session_id.clone();
+    let refresh_action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"refresh","plan_id":"plan_stale_contract","revision":1}}"#
+            .into(),
+        &mut current_session_id,
+        &current_session_ref,
+        11,
+        &state,
+        &socket_tx,
+        &live_tx,
+        &cancel,
+        &stop_requested,
+    )
+    .await;
+    let (refresh_reservation, refresh_model_snapshot) = match refresh_action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::PlanOnly,
+            reservation,
+            model_snapshot,
+            ..
+        } => (reservation, model_snapshot),
+        _ => panic!("refresh should start a real PlanOnly Provider run"),
+    };
+    let (_refresh_input_tx, mut refresh_input_rx) = tokio::sync::mpsc::channel::<String>(4);
+    let refresh_outcome = run_agent_session(
+        &state,
+        &session_id,
+        11,
+        &cancel,
+        &live_tx,
+        &mut refresh_input_rx,
+        &stop_requested,
+        AgentRunMode::PlanOnly,
+        Some(refresh_reservation),
+        Some(refresh_model_snapshot),
+    )
+    .await;
+    assert!(!refresh_outcome.run_failed);
+    let refreshed = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("Provider refresh should persist revision two");
+    assert_eq!(refreshed.revision, 2);
+    assert_eq!(refreshed.artifact.completion_checks.len(), 1);
+
+    std::fs::write(workspace.join("spec.txt"), "ROUND2-V3-OVERRIDE")
+        .expect("revision-two evidence should become stale again");
+    let (stale_tx, mut stale_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let stale_action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"execute","plan_id":"plan_stale_contract","revision":2}}"#
+            .into(),
+        &mut current_session_id,
+        &current_session_ref,
+        11,
+        &state,
+        &stale_tx,
+        &live_tx,
+        &cancel,
+        &stop_requested,
+    )
+    .await;
+    assert!(matches!(stale_action, IdleSocketInputAction::Continue));
+    let stale_event = recv_json_with_timeout(&mut stale_rx).await;
+    assert_eq!(stale_event["type"], "plan_stale");
+    let confirmation_token = stale_event["confirmation_token"]
+        .as_str()
+        .expect("stale evidence should issue a revision-bound token")
+        .to_string();
+
+    let approval_action = handle_idle_socket_input(
+        json!({
+            "plan_action": {
+                "action": "execute",
+                "plan_id": "plan_stale_contract",
+                "revision": 2,
+                "allow_stale": true,
+                "stale_confirmation_token": confirmation_token,
+            }
+        })
+        .to_string(),
+        &mut current_session_id,
+        &current_session_ref,
+        11,
+        &state,
+        &stale_tx,
+        &live_tx,
+        &cancel,
+        &stop_requested,
+    )
+    .await;
+    let (reservation, model_snapshot) = match approval_action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::Execute,
+            reservation,
+            model_snapshot,
+        } => (reservation, model_snapshot),
+        _ => panic!("the confirmed stale snapshot should start execution"),
+    };
+    let (_input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(4);
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        11,
+        &cancel,
+        &live_tx,
+        &mut input_rx,
+        &stop_requested,
+        AgentRunMode::Execute,
+        Some(reservation),
+        Some(model_snapshot),
+    )
+    .await;
+
+    assert!(outcome.run_failed);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("result.txt"))
+            .expect("the attempted unapproved output should remain as truthful evidence"),
+        "ROUND2-V3-OVERRIDE"
+    );
+    let session = state.sessions.lock().await[&session_id].clone();
+    let plan = session
+        .pending_plan
+        .as_ref()
+        .expect("failed contract should remain available for revision or Resume");
+    assert_eq!(plan.id, "plan_stale_contract");
+    assert_eq!(plan.revision, 2);
+    assert_eq!(plan.status, crate::plan::PlanStatus::Failed);
+    assert_eq!(plan.execution_attempt, 1);
+    assert!(plan.approved_at.is_some());
+    assert!(plan.finished_at.is_some());
+    assert!(plan.stale_override_confirmed_at.is_some());
+    assert!(plan.artifact.goal.contains("ROUND2-V2-REFRESH"));
+    assert_eq!(
+        plan.artifact.completion_checks[0].exact_content.as_deref(),
+        Some("ROUND2-V2-REFRESH")
+    );
+    assert_eq!(plan.progress.len(), 4);
+    assert_eq!(
+        plan.progress[0].status,
+        crate::plan::PlanStepStatus::Completed
+    );
+    assert_eq!(
+        plan.progress[1].status,
+        crate::plan::PlanStepStatus::Blocked
+    );
+    assert!(plan.progress[1].note.contains("approved-result-bytes"));
+    assert_eq!(
+        plan.progress[2].status,
+        crate::plan::PlanStepStatus::Completed
+    );
+    assert_eq!(plan.progress[3].id, "step4-adapt-v3-override");
+    assert_eq!(
+        plan.progress[3].status,
+        crate::plan::PlanStepStatus::Completed
+    );
+    assert!(plan.progress[3].deviation_reason.is_some());
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .count(),
+        1,
+        "refresh, approval, and stale override must remain ephemeral control context"
+    );
+
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    let contract_error = events
+        .iter()
+        .find(|event| {
+            event["type"] == "error" && event["code"] == "plan_completion_contract_failed"
+        })
+        .expect("the immutable completion gate should report its failed check");
+    assert_eq!(contract_error["plan_id"], "plan_stale_contract");
+    assert_eq!(contract_error["revision"], 2);
+    assert_eq!(
+        contract_error["checks"][0]["check_id"],
+        "approved-result-bytes"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "plan_state" && event["plan"]["status"] == "failed" })
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["type"] == "plan_state" && event["plan"]["status"] == "completed"
+        })
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 8);
+    let execution_messages = requests[2]["messages"]
+        .as_array()
+        .expect("execution should include the approved contract");
+    assert!(execution_messages.iter().any(|message| {
+        message["role"] == "system"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("ROUND2-V2-REFRESH"))
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("does not approve a refresh"))
+    }));
 }
 
 #[tokio::test]
@@ -3641,6 +4587,7 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -3773,6 +4720,119 @@ fn temp_workspace(label: &str) -> PathBuf {
     std::env::temp_dir().join(unique)
 }
 
+fn completion_verifier_test_plan(id: &str) -> crate::PendingPlan {
+    crate::PendingPlan {
+        id: id.into(),
+        revision: 2,
+        status: crate::plan::PlanStatus::Executing,
+        artifact: crate::plan::PlanArtifact {
+            title: "Verify completion safely".into(),
+            goal: "Finish only after bounded verification".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "verify".into(),
+                title: "Verify the approved result".into(),
+                ..Default::default()
+            }],
+            verification: vec!["The approved workspace remains available.".into()],
+            acceptance_criteria: vec!["The approved workspace remains available.".into()],
+            completion_checks: vec![crate::plan::PlanCompletionCheck {
+                id: "verify-workspace".into(),
+                step_id: "verify".into(),
+                covers: vec![
+                    crate::plan::PlanContractClauseRef {
+                        section: crate::plan::PlanContractSection::Verification,
+                        index: 0,
+                    },
+                    crate::plan::PlanContractClauseRef {
+                        section: crate::plan::PlanContractSection::AcceptanceCriteria,
+                        index: 0,
+                    },
+                ],
+                kind: crate::plan::PlanCompletionCheckKind::WorkspacePath,
+                path: Some(".".into()),
+                expected_path_type: Some(crate::plan::PlanExpectedPathType::Directory),
+                exact_content: None,
+                size_bytes: None,
+                sha256: None,
+                evidence_kind: None,
+                required_step_ids: Vec::new(),
+                tool_name: None,
+                arguments: None,
+            }],
+            ..Default::default()
+        },
+        progress: vec![crate::plan::PlanProgressStep {
+            id: "verify".into(),
+            title: "Verify the approved result".into(),
+            status: crate::plan::PlanStepStatus::Completed,
+            note: "Verified".into(),
+            deviation_reason: None,
+        }],
+        approved_at: Some(20),
+        execution_attempt: 1,
+        created_at: 10,
+        updated_at: 20,
+        ..Default::default()
+    }
+}
+
+async fn wait_for_completion_verifier_gate(gate: &CompletionVerifierTestGate) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !gate.started.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completion verifier should start");
+}
+
+async fn wait_for_completion_verifier_stop(gate: &CompletionVerifierTestGate) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !gate.stopped.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completion verifier should stop cooperatively");
+}
+
+struct RuntimeLoopTestArtifactsGuard {
+    session_id: String,
+    workspace: PathBuf,
+}
+
+impl RuntimeLoopTestArtifactsGuard {
+    fn new(session_id: &str, workspace: &Path) -> Self {
+        assert!(
+            workspace.starts_with(std::env::temp_dir()),
+            "runtime loop test workspaces must stay under the process temp directory"
+        );
+        Self {
+            session_id: session_id.to_string(),
+            workspace: workspace.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for RuntimeLoopTestArtifactsGuard {
+    fn drop(&mut self) {
+        let session_path =
+            crate::session_store::sessions_dir().join(format!("{}.json", self.session_id));
+        for path in [
+            session_path.clone(),
+            session_path.with_extension("json.tmp"),
+            session_path.with_extension("json.lingclaw-save-backup"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_dir_all(&self.workspace);
+        if let Some(managed_session_dir) = crate::session_workspace_path(&self.session_id).parent()
+        {
+            let _ = std::fs::remove_dir_all(managed_session_dir);
+        }
+    }
+}
+
 fn phase_state_for_analyze_test() -> AgentPhaseState {
     AgentPhaseState {
         round: 0,
@@ -3816,6 +4876,7 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     }
 }
@@ -5056,7 +6117,9 @@ async fn refreshed_revision_replaces_evidence_only_when_submission_succeeds() {
                 "state":"ready",
                 "title":"Refreshed plan",
                 "goal":"Use current evidence",
-                "steps":[{"id":"verify","title":"Verify current state"}]
+                "steps":[{"id":"verify","title":"Verify current state"}],
+                "acceptance_criteria":["The approved workspace remains available."],
+                "completion_checks":[{"id":"verify-workspace","step_id":"verify","covers":[{"section":"acceptance_criteria","index":0}],"kind":"workspace_path","path":".","expected_path_type":"directory"}]
             }"#,
         )
         .expect("submission should validate"),
@@ -5145,7 +6208,9 @@ async fn pruned_plan_message_anchors_do_not_reuse_an_existing_revision() {
                 "state":"ready",
                 "title":"Revised plan",
                 "goal":"Preserve optimistic concurrency",
-                "steps":[{"id":"implement","title":"Implement safely"}]
+                "steps":[{"id":"implement","title":"Implement safely"}],
+                "acceptance_criteria":["The approved workspace remains available."],
+                "completion_checks":[{"id":"implement-workspace","step_id":"implement","covers":[{"section":"acceptance_criteria","index":0}],"kind":"workspace_path","path":".","expected_path_type":"directory"}]
             }"#,
         )
         .expect("submission should validate"),
@@ -5530,7 +6595,9 @@ async fn structured_plan_reuses_the_submit_plan_assistant_message() {
                 "state":"ready",
                 "title":"Canonical plan",
                 "goal":"Keep one visible plan representation",
-                "steps":[{"id":"implement","title":"Implement the change"}]
+                "steps":[{"id":"implement","title":"Implement the change"}],
+                "acceptance_criteria":["The approved workspace remains available."],
+                "completion_checks":[{"id":"implement-workspace","step_id":"implement","covers":[{"section":"acceptance_criteria","index":0}],"kind":"workspace_path","path":".","expected_path_type":"directory"}]
             }"#,
         )
         .expect("submission should validate"),
@@ -5744,6 +6811,435 @@ async fn run_finish_phase_does_not_report_completion_when_persistence_fails() {
 }
 
 #[tokio::test]
+async fn run_finish_phase_marks_unreported_execution_steps_failed() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "finish-unreported-plan-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Unreported execution", None);
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some("The plan is complete.".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    let executing_plan = crate::PendingPlan {
+        id: "plan_unreported_execution".into(),
+        revision: 3,
+        status: crate::plan::PlanStatus::Executing,
+        artifact: crate::plan::PlanArtifact {
+            title: "Create an artifact".into(),
+            goal: "Create result.txt".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "write-result".into(),
+                title: "Write result.txt".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        progress: vec![crate::plan::PlanProgressStep {
+            id: "write-result".into(),
+            title: "Write result.txt".into(),
+            status: crate::plan::PlanStepStatus::Pending,
+            ..Default::default()
+        }],
+        approved_at: Some(20),
+        execution_attempt: 1,
+        created_at: 10,
+        updated_at: 20,
+        ..Default::default()
+    };
+    session.pending_plan = Some(executing_plan.clone());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.approved_plan = Some(executing_plan);
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let control = run_finish_phase(&ctx, &mut phase_state).await;
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(phase_state.run_failed);
+    let plan = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("failed approved plan should remain resumable");
+    assert_eq!(plan.status, crate::plan::PlanStatus::Failed);
+    assert_eq!(plan.unfinished_step_count(), 1);
+    assert!(plan.finished_at.is_some());
+    assert_eq!(
+        plan.to_live_value()["run_finished_with_unreported_steps"],
+        false
+    );
+
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "plan_state" && event["plan"]["status"] == "failed" })
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "error" && event["code"] == "plan_execution_incomplete"
+        })
+    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "done"
+            && event["phase"] == "failed"
+            && event["reason"] == "incomplete_plan"
+    }));
+
+    crate::session_store::delete_session_from_storage(&session_id)
+        .await
+        .expect("test session should be removed");
+}
+
+#[tokio::test]
+async fn run_finish_phase_stop_cancels_a_slow_completion_verifier_without_terminal_write() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "finish-contract-stop-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("finish-contract-stop");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let plan = completion_verifier_test_plan("plan_finish_contract_stop");
+    let mut session = test_session(&session_id, "Finish contract stop", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.pending_plan = Some(plan.clone());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    state.active_runs.lock().await.insert(
+        session_id.clone(),
+        SessionRunBinding {
+            connection_id: 81,
+            cancel: run_cancel.clone(),
+            stop_requested: Arc::clone(&stop_requested),
+            deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+        },
+    );
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let gate = Arc::new(CompletionVerifierTestGate::default());
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::Execute;
+    phase_state.cycle_workspace = workspace.clone();
+    phase_state.approved_plan = Some(plan);
+    phase_state.completion_evidence.verifier_gate = Some(Arc::clone(&gate));
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let trigger = async {
+        wait_for_completion_verifier_gate(&gate).await;
+        stop_requested.store(true, Ordering::Relaxed);
+    };
+    let (control, ()) = tokio::join!(run_finish_phase(&ctx, &mut phase_state), trigger);
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(phase_state.run_stopped);
+    assert!(!phase_state.run_failed);
+    assert!(run_cancel.is_cancelled());
+    wait_for_completion_verifier_stop(&gate).await;
+    let persisted_plan = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("executing plan should remain untouched for outer stop handling");
+    assert_eq!(persisted_plan.status, crate::plan::PlanStatus::Executing);
+    assert!(persisted_plan.finished_at.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(live_rx.try_recv().is_err());
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Executing)
+    );
+    state.active_runs.lock().await.remove(&session_id);
+}
+
+#[tokio::test]
+async fn run_finish_phase_shutdown_cancels_a_slow_completion_verifier_without_failure_event() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "finish-contract-shutdown-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("finish-contract-shutdown");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let plan = completion_verifier_test_plan("plan_finish_contract_shutdown");
+    let mut session = test_session(&session_id, "Finish contract shutdown", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.pending_plan = Some(plan.clone());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = cancel.child_token();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let gate = Arc::new(CompletionVerifierTestGate::default());
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::Execute;
+    phase_state.cycle_workspace = workspace.clone();
+    phase_state.approved_plan = Some(plan);
+    phase_state.completion_evidence.verifier_gate = Some(Arc::clone(&gate));
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let trigger = async {
+        wait_for_completion_verifier_gate(&gate).await;
+        cancel.cancel();
+    };
+    let (control, ()) = tokio::join!(run_finish_phase(&ctx, &mut phase_state), trigger);
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(phase_state.shutting_down);
+    assert!(!phase_state.run_failed);
+    wait_for_completion_verifier_stop(&gate).await;
+    let persisted_plan = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("executing plan should remain untouched for shutdown handling");
+    assert_eq!(persisted_plan.status, crate::plan::PlanStatus::Executing);
+    assert!(persisted_plan.finished_at.is_none());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(live_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn run_finish_phase_completion_deadline_fails_closed_without_late_events() {
+    let mut config = test_config();
+    config.tool_timeout = Duration::from_millis(25);
+    let state = Arc::new(test_app_state_with_config(config));
+    let session_id = format!(
+        "finish-contract-timeout-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("finish-contract-timeout");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let plan = completion_verifier_test_plan("plan_finish_contract_timeout");
+    let mut session = test_session(&session_id, "Finish contract timeout", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.pending_plan = Some(plan.clone());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let gate = Arc::new(CompletionVerifierTestGate::default());
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::Execute;
+    phase_state.cycle_workspace = workspace.clone();
+    phase_state.approved_plan = Some(plan);
+    phase_state.completion_evidence.verifier_gate = Some(Arc::clone(&gate));
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let control = tokio::time::timeout(
+        Duration::from_secs(2),
+        run_finish_phase(&ctx, &mut phase_state),
+    )
+    .await
+    .expect("the verifier deadline must bound Finish");
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(phase_state.run_failed);
+    wait_for_completion_verifier_stop(&gate).await;
+    let failed_plan = state.sessions.lock().await[&session_id]
+        .pending_plan
+        .clone()
+        .expect("timed-out plan should remain resumable");
+    assert_eq!(failed_plan.status, crate::plan::PlanStatus::Failed);
+    assert_eq!(
+        failed_plan.progress[0].status,
+        crate::plan::PlanStepStatus::Blocked
+    );
+    assert!(
+        failed_plan.progress[0]
+            .note
+            .contains("completion-contract-timeout")
+    );
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    let error = events
+        .iter()
+        .find(|event| {
+            event["type"] == "error" && event["code"] == "plan_completion_contract_failed"
+        })
+        .expect("deadline should emit one stable contract failure");
+    assert_eq!(
+        error["checks"][0]["check_id"],
+        "completion-contract-timeout"
+    );
+    assert_eq!(
+        error["checks"][0]["reason"],
+        "completion verification exceeded its hard deadline"
+    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "done"
+            && event["phase"] == "failed"
+            && event["reason"] == "completion_contract_failed"
+    }));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        live_rx.try_recv().is_err(),
+        "no worker result may arrive late"
+    );
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Failed)
+    );
+}
+
+#[tokio::test]
+async fn run_finish_phase_completion_verifier_can_finish_normally_after_a_slow_start() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "finish-contract-normal-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("finish-contract-normal");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let plan = completion_verifier_test_plan("plan_finish_contract_normal");
+    let mut session = test_session(&session_id, "Finish contract normal", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.pending_plan = Some(plan.clone());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let gate = Arc::new(CompletionVerifierTestGate::default());
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::Execute;
+    phase_state.cycle_workspace = workspace.clone();
+    phase_state.approved_plan = Some(plan);
+    phase_state.completion_evidence.verifier_gate = Some(Arc::clone(&gate));
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let trigger = async {
+        wait_for_completion_verifier_gate(&gate).await;
+        gate.release.store(true, Ordering::Relaxed);
+    };
+    let (control, ()) = tokio::join!(run_finish_phase(&ctx, &mut phase_state), trigger);
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(!phase_state.run_failed);
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Completed)
+    );
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(!events.iter().any(|event| {
+        event["type"] == "error" && event["code"] == "plan_completion_contract_failed"
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["type"] == "done" && event["phase"] == "finish" })
+    );
+}
+
+#[tokio::test]
 async fn run_finish_phase_rolls_back_plan_registration_when_persistence_fails() {
     let state = Arc::new(test_app_state());
     let session_id = format!(
@@ -5822,7 +7318,9 @@ async fn run_finish_phase_rolls_back_plan_registration_when_persistence_fails() 
                 "state":"ready",
                 "title":"Persist the plan safely",
                 "goal":"Keep memory and durable state consistent",
-                "steps":[{"id":"save","title":"Save the accepted revision"}]
+                "steps":[{"id":"save","title":"Save the accepted revision"}],
+                "acceptance_criteria":["The approved workspace remains available while the revision is saved."],
+                "completion_checks":[{"id":"save-workspace","step_id":"save","covers":[{"section":"acceptance_criteria","index":0}],"kind":"workspace_path","path":".","expected_path_type":"directory"}]
             }"#,
         )
         .expect("submission should validate"),
@@ -6236,6 +7734,7 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -6382,6 +7881,7 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -6519,6 +8019,7 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
     phase_state
@@ -6660,6 +8161,7 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -6779,6 +8281,7 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -6955,6 +8458,7 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -7055,6 +8559,7 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -7226,6 +8731,7 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -7348,6 +8854,7 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 
@@ -7508,6 +9015,7 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         plan_evidence_truncated: false,
         replace_plan_evidence: false,
         approved_plan: None,
+        completion_evidence: PlanCompletionRunEvidence::default(),
         plan_action_prompt: None,
     };
 

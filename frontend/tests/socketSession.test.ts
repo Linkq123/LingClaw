@@ -51,6 +51,19 @@ describe('socket session binding', () => {
     document.body.innerHTML = `
       <span id="conn-dot"></span>
       <span id="conn-label"></span>
+      <div id="input-area">
+        <textarea id="input" aria-describedby="composer-availability-detail"></textarea>
+        <button id="send" aria-describedby="composer-availability-detail"></button>
+        <button id="stop"></button>
+        <p id="composer-availability-status" hidden>
+          <span id="composer-availability-message"></span>
+          <button id="composer-availability-action"></button>
+          <button id="composer-availability-retry"></button>
+        </p>
+        <span id="composer-availability-detail" role="status" aria-live="polite"
+          >Checking model configuration...</span
+        >
+      </div>
       <aside id="session-drawer">
         <div class="session-drawer-header">
           <button id="session-drawer-toggle-btn"></button>
@@ -110,8 +123,7 @@ describe('socket session binding', () => {
 
   it('starts a model revision handshake when the socket opens', async () => {
     vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => {})));
-    const { acceptComposerConfigRevision, acceptComposerSocketModelPayloadRevision } =
-      await import('../src/composerAvailability.js');
+    const composerModule = await import('../src/composerAvailability.js');
     const { connect } = await import('../src/socket.js');
     stateModule.state.composerConfigRevision = 50;
     stateModule.state.composerSessionModelRevision = 50;
@@ -120,11 +132,74 @@ describe('socket session binding', () => {
     const socket = mockWebSocket.mock.instances[0] as unknown as { onopen?: () => void };
     socket.onopen?.();
 
+    expect(stateModule.dom.input?.getAttribute('aria-describedby')).toBe(
+      'composer-availability-detail',
+    );
+    expect(document.getElementById('composer-availability-detail')?.textContent).toBe(
+      'Checking model configuration...',
+    );
+
     // An HTTP response cannot consume the connection-scoped handshake.
-    expect(acceptComposerConfigRevision(49)).toBe(false);
-    expect(acceptComposerSocketModelPayloadRevision(5)).toBe(true);
+    expect(composerModule.acceptComposerConfigRevision(49)).toBe(false);
+    expect(composerModule.acceptComposerSocketModelPayloadRevision(5)).toBe(true);
     expect(stateModule.state.composerConfigRevision).toBe(5);
     expect(stateModule.state.composerSessionModelRevision).toBeNull();
+
+    composerModule.setComposerExplicitPrimaryModelConfigured(true, 5);
+    composerModule.setComposerSessionModelConfigured(false, false, true, 5);
+    expect(stateModule.dom.sendBtn?.disabled).toBe(false);
+    expect(stateModule.dom.input?.hasAttribute('aria-describedby')).toBe(false);
+    expect(stateModule.dom.sendBtn?.hasAttribute('aria-describedby')).toBe(false);
+    expect(document.getElementById('composer-availability-detail')?.hidden).toBe(true);
+    expect(document.getElementById('composer-availability-detail')?.textContent).toBe('');
+  });
+
+  it('actively aborts a hanging Session model recovery when its socket closes', async () => {
+    const sockets: Array<{
+      readyState: number;
+      close: ReturnType<typeof vi.fn>;
+      onclose?: (() => void) | null;
+    }> = [];
+    Object.assign(mockWebSocket, { OPEN: 1, CLOSED: 3 });
+    mockWebSocket.mockImplementation(() => {
+      const socket = {
+        readyState: 1,
+        close: vi.fn(),
+        onopen: undefined,
+        onclose: undefined,
+        onerror: undefined,
+        onmessage: undefined,
+        send: vi.fn(),
+      };
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    });
+    let recoverySignal: AbortSignal | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>((_input, init) => {
+        recoverySignal = init?.signal ?? null;
+        return new Promise<Response>(() => {});
+      }),
+    );
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.composerConfigRevision = 7;
+    stateModule.state.composerSessionModelRevision = 6;
+    stateModule.state.composerEffectiveModelConfigured = null;
+
+    const { refreshActiveComposerSessionModelState } = await import('../src/composerModels.js');
+    const { connect } = await import('../src/socket.js');
+    connect(() => {});
+    const recovery = refreshActiveComposerSessionModelState('main');
+    expect(recoverySignal?.aborted).toBe(false);
+
+    stateModule.state.reconnectAttempts = 3;
+    sockets[0].readyState = 3;
+    sockets[0].onclose?.();
+
+    expect(recoverySignal?.aborted).toBe(true);
+    await expect(recovery).resolves.toBe('cancelled');
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it('retranslates the current connection state without resetting it to offline', async () => {

@@ -6,6 +6,9 @@ import { dom, state } from './state.js';
 import type { AppConfig, ConfigApiResponse } from './types/config.js';
 
 export const CONFIG_SAVED_EVENT = 'lingclaw:config-saved';
+export const COMPOSER_SESSION_MODEL_RECOVERY_EVENT = 'lingclaw:composer-session-model-recovery';
+export const COMPOSER_SESSION_MODEL_RECOVERY_INVALIDATED_EVENT =
+  'lingclaw:composer-session-model-recovery-invalidated';
 
 let availabilityRequestGeneration = 0;
 let explicitStateGeneration = 0;
@@ -14,6 +17,9 @@ let lastConfiguredModelsAvailable: boolean | undefined;
 let configLoadState: 'pending' | 'loaded' | 'unavailable' = 'pending';
 let composerRevisionHandshakePending = false;
 let composerConnectionGeneration = 0;
+let composerSessionIdentityGeneration = 0;
+let sessionModelRecoveryScheduled = false;
+let sessionModelRecoveryUnavailable = false;
 let restorableSessionTransition: {
   modelOverridePresent: boolean;
   effectiveModelConfigured: boolean | null;
@@ -61,6 +67,25 @@ function modelRevisionIsCurrent(revision: number | null): boolean {
   );
 }
 
+function scheduleSessionModelRecoveryIfNeeded(): void {
+  if (sessionModelRecoveryScheduled) return;
+  sessionModelRecoveryScheduled = true;
+  queueMicrotask(() => {
+    sessionModelRecoveryScheduled = false;
+    if (
+      state.activeGroupId ||
+      state.sessionSwitchInFlight ||
+      state.composerSessionTransitionPending ||
+      state.composerSessionIdentityPending ||
+      (state.composerEffectiveModelConfigured !== null &&
+        state.composerSessionModelRevision === state.composerConfigRevision)
+    ) {
+      return;
+    }
+    document.dispatchEvent(new CustomEvent(COMPOSER_SESSION_MODEL_RECOVERY_EVENT));
+  });
+}
+
 export function acceptComposerConfigRevision(value: unknown): boolean {
   const revision = normalizeConfigRevision(value);
   if (revision === null) {
@@ -73,6 +98,7 @@ export function acceptComposerConfigRevision(value: unknown): boolean {
     state.composerConfigRevision = revision;
     explicitStateGeneration += 1;
     recomputeComposerAvailability();
+    scheduleSessionModelRecoveryIfNeeded();
   }
   return true;
 }
@@ -83,9 +109,12 @@ export function acceptComposerConfigRevision(value: unknown): boolean {
  * establish a lower baseline, which identifies a newly started process.
  */
 export function beginComposerRevisionHandshake(): void {
+  invalidateComposerSessionModelRecovery();
   availabilityRequestGeneration += 1;
   composerConnectionGeneration += 1;
+  composerSessionIdentityGeneration += 1;
   composerRevisionHandshakePending = true;
+  sessionModelRecoveryUnavailable = false;
   state.composerSessionIdentityPending = true;
   recomputeComposerAvailability();
   void refreshComposerAvailability();
@@ -93,6 +122,33 @@ export function beginComposerRevisionHandshake(): void {
 
 export function getComposerConnectionGeneration(): number {
   return composerConnectionGeneration;
+}
+
+export function getComposerSessionIdentityGeneration(): number {
+  return composerSessionIdentityGeneration;
+}
+
+export function invalidateComposerSessionModelRecovery(): void {
+  document.dispatchEvent(new Event(COMPOSER_SESSION_MODEL_RECOVERY_INVALIDATED_EVENT));
+}
+
+export function beginComposerSessionModelRecovery(): void {
+  sessionModelRecoveryUnavailable = false;
+  recomputeComposerAvailability();
+}
+
+export function failComposerSessionModelRecovery(): void {
+  sessionModelRecoveryUnavailable = true;
+  recomputeComposerAvailability();
+}
+
+export function composerSessionModelRecoveryNeedsRetry(): boolean {
+  return (
+    !state.activeGroupId &&
+    sessionModelRecoveryUnavailable &&
+    (state.composerEffectiveModelConfigured === null ||
+      state.composerSessionModelRevision !== state.composerConfigRevision)
+  );
 }
 
 export function acceptComposerSocketModelPayloadRevision(value: unknown): boolean {
@@ -173,6 +229,7 @@ export function applyComposerHttpSessionModelState(
   // must advance the Session snapshot together with the global revision so a
   // missed or delayed WebSocket event cannot strand the Composer in checking.
   state.composerSessionModelRevision = revision;
+  sessionModelRecoveryUnavailable = false;
   recomputeComposerAvailability();
   return true;
 }
@@ -317,6 +374,21 @@ export function canBypassComposerModelGate(value: string): boolean {
   return command !== '/new';
 }
 
+function setAriaDescriptionReference(
+  element: HTMLElement | null | undefined,
+  id: string,
+  active: boolean,
+): void {
+  if (!element) return;
+  const references = new Set(
+    (element.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean),
+  );
+  if (active) references.add(id);
+  else references.delete(id);
+  if (references.size > 0) element.setAttribute('aria-describedby', [...references].join(' '));
+  else element.removeAttribute('aria-describedby');
+}
+
 export function syncComposerAvailability(): void {
   const storageProtected = state.storageMode === 'protected';
   const ready = isComposerModelReady();
@@ -426,7 +498,24 @@ export function syncComposerAvailability(): void {
     if (message) message.textContent = visibleStatus ? compactLabel : '';
   }
   const detail = document.getElementById('composer-availability-detail');
-  if (detail && detail.textContent !== fullReason) detail.textContent = fullReason;
+  const descriptionActive = !canSubmit && Boolean(fullReason);
+  setAriaDescriptionReference(dom.input, 'composer-availability-detail', descriptionActive);
+  setAriaDescriptionReference(dom.sendBtn, 'composer-availability-detail', descriptionActive);
+  if (detail) {
+    if (descriptionActive) {
+      detail.hidden = false;
+      detail.setAttribute('role', 'status');
+      detail.setAttribute('aria-live', 'polite');
+      detail.setAttribute('aria-atomic', 'true');
+      if (detail.textContent !== fullReason) detail.textContent = fullReason;
+    } else {
+      if (detail.textContent) detail.textContent = '';
+      detail.hidden = true;
+      detail.removeAttribute('role');
+      detail.removeAttribute('aria-live');
+      detail.removeAttribute('aria-atomic');
+    }
+  }
   if (dom.composerAvailabilityAction) {
     dom.composerAvailabilityAction.hidden = !visibleStatus || resolution === null;
     dom.composerAvailabilityAction.textContent = composerResolutionLabel(resolution);
@@ -537,6 +626,8 @@ function recomputeComposerAvailability(): void {
         lastConfiguredModelsAvailable,
       );
     }
+  } else if (sessionModelRecoveryUnavailable) {
+    state.composerModelAvailability = 'config-unavailable';
   } else if (!modelRevisionIsCurrent(state.composerSessionModelRevision)) {
     state.composerModelAvailability = 'checking';
   } else if (state.composerEffectiveModelConfigured === true) {
@@ -673,6 +764,7 @@ export function setComposerSessionModelConfigured(
         ? modelOverrideConfigured
         : modelOverrideConfigured || state.composerExplicitPrimaryModelConfigured;
   state.composerSessionModelRevision = normalizeConfigRevision(configRevision);
+  sessionModelRecoveryUnavailable = false;
   if (completeTransition) {
     completeComposerSessionTransition();
     return true;
@@ -701,6 +793,9 @@ export function beginComposerSessionTransition(
   restoreOnCommandResult = false,
   expectedSessionId = '',
 ): void {
+  invalidateComposerSessionModelRecovery();
+  composerSessionIdentityGeneration += 1;
+  sessionModelRecoveryUnavailable = false;
   restorableSessionTransition = restoreOnCommandResult
     ? {
         modelOverridePresent: state.composerSessionModelOverridePresent,

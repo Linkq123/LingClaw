@@ -1,9 +1,9 @@
 use crate::Config;
-use crate::tools::safety::{check_dangerous_command, resolve_path_checked};
+use crate::tools::safety::{CheckedWorkspacePath, check_dangerous_command, resolve_path_checked};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::Path,
     process::Stdio,
     sync::{
         Arc,
@@ -43,7 +43,7 @@ enum ExecMode {
 #[derive(Debug, Clone)]
 struct ExecRequest {
     mode: ExecMode,
-    working_dir: PathBuf,
+    working_dir: CheckedWorkspacePath,
     env: BTreeMap<String, String>,
     stdin: Option<Vec<u8>>,
 }
@@ -259,7 +259,8 @@ impl RawExecRequest {
         let working_dir = match self.working_dir {
             Some(dir) => resolve_path_checked(&dir, workspace)
                 .map_err(|message| format!("working_dir {message}"))?,
-            None => workspace.to_path_buf(),
+            None => resolve_path_checked(".", workspace)
+                .map_err(|message| format!("working_dir {message}"))?,
         };
         validate_exec_env(&self.env)?;
 
@@ -364,9 +365,15 @@ async fn run_exec_request(
 ) -> std::io::Result<ExecRunOutcome> {
     let capture_limit = capture_budget_limit(max_output_bytes);
     let live_budget = SharedByteBudget::new(max_output_bytes);
-    let mut command_process = build_command(request);
+    let cwd = request
+        .working_dir
+        .process_cwd()
+        .map_err(std::io::Error::other)?;
+    let mut command_process = build_command(request, cwd.path());
 
+    cwd.validate().map_err(std::io::Error::other)?;
     let mut child = command_process.spawn()?;
+    drop(cwd);
     let stdin_writer = child
         .stdin
         .take()
@@ -432,7 +439,7 @@ async fn run_exec_request(
     })
 }
 
-fn build_command(request: &ExecRequest) -> tokio::process::Command {
+fn build_command(request: &ExecRequest, working_dir: &Path) -> tokio::process::Command {
     let mut command_process = match &request.mode {
         ExecMode::Shell { command } => {
             let shell = if cfg!(windows) { "cmd" } else { "sh" };
@@ -449,7 +456,7 @@ fn build_command(request: &ExecRequest) -> tokio::process::Command {
     };
 
     command_process
-        .current_dir(&request.working_dir)
+        .current_dir(working_dir)
         .envs(request.env.iter())
         .stdin(if request.stdin.is_some() {
             Stdio::piped()
@@ -786,4 +793,83 @@ fn apply_exec_process_flags(command: &mut tokio::process::Command) {
     }
     #[cfg(not(target_os = "windows"))]
     let _ = command;
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn exec_cwd_does_not_follow_an_intermediate_replacement_after_request_parsing() {
+        let root = std::env::temp_dir().join(format!(
+            "lingclaw-exec-cwd-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let workspace = root.join("workspace");
+        let original = root.join("original-subtree");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(workspace.join("subtree")).expect("create workspace subtree");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        let args = if cfg!(windows) {
+            serde_json::json!({
+                "program": "cmd.exe",
+                "args": ["/C", "echo escaped>escaped.txt"],
+                "working_dir": "subtree"
+            })
+        } else {
+            serde_json::json!({
+                "program": "sh",
+                "args": ["-c", "printf escaped > escaped.txt"],
+                "working_dir": "subtree"
+            })
+        };
+        let request = parse_exec_request(&args, &workspace).expect("parse checked exec request");
+        if let Err(error) = std::fs::rename(workspace.join("subtree"), &original) {
+            #[cfg(windows)]
+            {
+                assert!(
+                    error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32)
+                );
+                drop(request);
+                std::fs::remove_dir_all(root).expect("clean locked exec capability fixture");
+                return;
+            }
+            #[cfg(not(windows))]
+            panic!("rename checked cwd subtree: {error}");
+        }
+        let replacement = workspace.join("subtree");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &replacement).expect("create cwd replacement symlink");
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .arg("/c")
+                .arg("mklink")
+                .arg("/J")
+                .arg(&replacement)
+                .arg(&outside)
+                .output()
+                .expect("run junction command");
+            assert!(output.status.success());
+        }
+
+        let result = run_exec_request(&request, Duration::from_secs(5), 1024, None, None).await;
+
+        #[cfg(unix)]
+        std::fs::remove_file(&replacement).expect("remove replacement symlink");
+        #[cfg(windows)]
+        std::fs::remove_dir(&replacement).expect("remove replacement junction");
+        assert!(result.is_err(), "moved exec cwd must fail closed");
+        assert!(!original.join("escaped.txt").exists());
+        assert!(!outside.join("escaped.txt").exists());
+        drop(result);
+        drop(request);
+        std::fs::remove_dir_all(root).expect("clean exec capability fixture");
+    }
 }

@@ -1209,7 +1209,8 @@ Streamable HTTP 示例：
 - `enabledServers` 必须是已配置且未禁用的 server
 - `enabledTools` 必须是当前发现到的 MCP tool，且所属 server 必须在 `enabledServers` 中
 - `confirmMutatingTools` 启用后，LingClaw 会阻止自动执行启发式判定为 mutating 的 MCP tool，避免模型绕过确认直接修改外部系统
-- `clientCapabilities.roots` 控制 initialize 时是否向 MCP server 声明 `roots` capability；`sampling` / `elicitation` 字段为兼容预留，后端不会声明尚未实现的 client capability
+- `clientCapabilities.roots` 仅控制 stdio transport 在 initialize 时是否声明 `roots` capability。stdio 的 `roots/list` 返回受目录 capability 约束的 root：Linux/Android 只让目标 MCP 子进程继承 fd，父进程副本保持 close-on-exec；Windows 在响应/Session 生命周期内保持 no-delete 根句柄链。Streamable HTTP 无法安全传递本地 OS capability，因此总是不声明 `roots`，并以 JSON-RPC `-32601` 拒绝服务器发来的 `roots/list`
+- `sampling` / `elicitation` 字段为兼容预留，后端不会声明尚未实现的 client capability
 - 保存到当前 session workspace 的 `.lingclaw-mcp-policy.json`
 - 子代理只会继承该 session 已启用的 MCP tools，再按子代理 `mcp_policy` 做过滤
 
@@ -1301,7 +1302,11 @@ Streamable HTTP 示例：
 
 `auth/start` 会发现 OAuth protected resource metadata 与 authorization server metadata，生成 PKCE 授权 URL，并把 pending state 写入本地授权文件。若授权服务器不支持动态客户端注册，需要在 `mcpServers.<name>.auth.clientId` 中配置客户端 ID；`clientSecret` 可选。callback 支持浏览器 loopback GET，也支持前端 POST `{server, code, state}` 完成 token exchange。OAuth token 存储在本地 `~/.lingclaw/mcp-auth.json`，按 server 分组保存；access token 过期时会使用 refresh token 自动刷新；`auth/disconnect` 会清除对应 server 的本地 token。
 
-Streamable HTTP 运行时会在 initialize 后维护 GET SSE 通知流，并记录 `Last-Event-ID` 用于后续重连；POST/GET SSE 中的 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/prompts/list_changed` 会分别清理对应缓存。
+Streamable HTTP 运行时会在 initialize 后维护 GET SSE 通知流，并记录 `Last-Event-ID` 用于后续重连；POST/GET SSE 中的 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/prompts/list_changed` 会分别清理对应缓存。每个完整 Session cache key 使用一个稳定的 per-key request control：Settings 保存、授权断开和 server 级清理会推进 request epoch，但不会拆掉仍有在途 lease 的锁；迟到 initialize 响应只有在 authority 仍为当前且 key 尚未被新 Session 占用时才能安装，普通 POST 还必须匹配发出请求时的 `session_id + generation`。普通缓存 Session、临时 one-shot（包括 catalog/policy discovery 与隔离工具调用）、迟到响应，以及 SSE/workspace/idle/Settings/server 清理的所有 Streamable HTTP initialize 与 DELETE，统一共享按配置 endpoint 规范化的 remote cleanup-domain authority。规范化去除 URL userinfo 和 fragment，仅解码百分号编码的 RFC unreserved octet，把保留的百分号编码统一成大写十六进制，并在保留 scheme、host、有效 port、path 与 query 的同时维持 reserved 编码差异；非法百分号编码稳定 fail-closed。transport POST/GET SSE/DELETE client 使用同一规范 endpoint 且禁止重定向，OAuth discovery/token client 则保持独立 redirect policy。timeout、HTTP 不使用的 command/args/env/cwd、workspace、policy namespace、client capabilities、本地 server 别名、headers、轮换凭据及其他本地 cache 维度都不会划分该域；同 endpoint 的不同本地认证配置也保守共享该域，而不同 endpoint 仍可并行。initialize 在请求可能发出前启用 RAII owner；调用者取消或 panic、超时、Settings/server 失效、未知响应及相关任务取消都会留下进程期 tombstone。临时 Session 在 initialize handoff 后继续携带 lifecycle owner，贯穿请求与 shutdown；终态清理前的 Drop/取消会同步隔离 endpoint，并移除本地 Session/event/stream 状态。若失败的 initialize 响应、JSON-RPC error、后置解析或 `notifications/initialized` 已提供 Session ID，运行时会在同一域受控 DELETE；只有确认完成或确认未应用才重新授权。远端 DELETE cleanup 跨实际网络副作用持有串行 authority；DELETE 发送前记录 pending tombstone 并脱离旧本地 generation，调用者取消会保留 pending/uncertain 隔离，且不会取消后台请求。只有 `200 OK` 或 `204 No Content` 能确认 DELETE 已完成；按 MCP/HTTP 语义，`404` 表示 Session 已不存在、`405` 表示服务端不支持客户端终止、`410` 表示目标已消失，三者都不会留下迟到 DELETE。`202 Accepted`、其他任何状态、超时、网络失败或后台任务取消会保留 uncertain tombstone，在当前进程内拒绝同 endpoint initialize，而无关 endpoint 不受影响。endpoint authority 跨全部 cache key 追踪活动身份：新 key 安装同一个 Session ID 时，会在统一运行时事务中推进旧 key epoch、移除旧 Session/event ID/SSE task，并清理对应 tool/resource/prompt descriptor cache；旧 key 同时获得 supersession 门禁，之后的请求会在网络发送前被拒绝，迟到响应也无法恢复状态。replacement 仍有效时，旧清理仅清除本地代际，不发送远端 DELETE。idle TTL 到期不会再同步丢弃本地 identity；异步调用方会持有 endpoint 与 cache-key authority 完成受控 DELETE，仅在 `Confirmed`/`NotApplied` 后重建，并让并发调用共享同一清理/重建流程；`202`、超时、取消或其他 ambiguous 结果都在发送 initialize 前 fail-closed。已确认或明确未应用的 cleanup 会在 Session、event ID、stream、请求、cleanup lease 与 endpoint mapping 全部结束后回收空 per-key/endpoint control。
+
+普通 Session-bound POST 在最终发送前校验通过后登记 `cache key + epoch + generation` 的 RAII in-flight 计数，并一直持有到响应处理、传输错误、timeout、调用取消或 panic 路径结束。idle 检测只会在该精确代际计数为零时进入 DELETE；计数非零时会复活/延后过期时间，旧代际 Drop 不会影响 replacement。响应进入 workspace/identity/404 终止失败后，清理先仅释放这个已完成响应自己的 lease，再原子写入 endpoint 与 cache-key Pending quarantine、脱离旧本地 generation，并让 runtime-owned task 等待其余同代际请求归零；最后一个正常完成的 lease 只触发一次 DELETE。请求取消或 cleanup task 取消会把 cleanup 强制转为 Uncertain，即使迟到 DELETE 返回成功也不解除隔离。传输、响应体或 SSE timeout 会在任何 best-effort `notifications/cancelled` token 获取或网络 await 之前，同步写入 endpoint Uncertain tombstone、移除 exact generation 并释放该请求 lease，因为远端 POST 仍可能完成；该规则覆盖普通缓存请求、临时 one-shot 请求，以及尚无 Session ID 的 one-shot initialize。若 endpoint 已有 Pending cleanup，timeout 会原子、单调地把同一 tombstone 升级为 sticky Uncertain；旧 DELETE observer 的 `200/204/404/405/410`、后续 lifecycle cleanup、通知结果或调用者取消都不能降低或清除它。发送 DELETE 前再次发现同 endpoint、同 Session ID replacement 时只结束旧本地清理，不触碰 replacement；不同 endpoint 可并行。initialize 响应安装 Session ID 后，initialize owner 立即绑定该精确 identity；若 `notifications/initialized`、SSE 启动或其他后置检查完成前失效，会原子写入 endpoint quarantine，并按 generation 移除 Session、Last-Event-ID、SSE task 与 descriptor 状态。即使本地 Session 仍显示 Active，Pending/Uncertain cleanup 也会在任何后续 POST 前被拒绝。
+
+HTTP descriptor cache entry 绑定 per-key control epoch、可选 `session_id + generation` 与独立 descriptor epoch。tools/resources/prompts 的直接列表和 catalog 批量加载在请求前捕获 authority，响应后仅通过同一 runtime mutex 下的 CAS 才能写缓存；cache hit 同样重新验证。same-ID replacement、Settings/授权/server 清理或任一 `notifications/*/list_changed` 会推进相应 authority，因此旧响应即使已经完成网络读取，也不能在失效之后重新填回 tool/resource/prompt/catalog 缓存。该机制只增加内部一致性约束，不改变公开 MCP JSON-RPC 协议。
 
 ## 4.9 GET /api/usage
 
@@ -1754,7 +1759,7 @@ Group socket 初始化顺序通常为：
 - `discard`：丢弃非终态、非执行中的计划
 - `resume`：从已批准且至少开始过一次执行的 `failed` 或 `stopped` 计划继续剩余步骤；规划阶段中断产生的 `stopped` 计划不允许 Resume
 
-所有操作都必须携带当前 `plan_id` 和 `revision`。`plan_action` 不能与 `text`、`images`、`plan_mode` 或 `execute_plan_id` 同时出现。批准、反馈和刷新都不会向历史追加合成 user 消息。反馈/回答会暂存在当前活动计划中，直到模型提交新 revision；若规划在此之前中断，`plan_state.plan.pending_feedback` 会返回该草稿供用户检查并重新提交。刷新提示仍只属于对应 Plan-only run。Runtime 会把精确 revision 作为执行契约注入每个 Agent cycle，并通过 `plan_state` 更新进度。History 的 `plans[]` 最多同步最近 50 个 revision，并始终包含当前 revision。LingClaw 启动时会把数据库中遗留的 `planning`/`executing` 状态恢复为 `stopped`；其中只有保留批准时间和执行次数的执行中断计划可以 Resume。
+所有操作都必须携带当前 `plan_id` 和 `revision`。`plan_action` 不能与 `text`、`images`、`plan_mode` 或 `execute_plan_id` 同时出现。批准、反馈和刷新都不会向历史追加合成 user 消息。反馈/回答会暂存在当前活动计划中，直到模型提交新 revision；若规划在此之前中断，`plan_state.plan.pending_feedback` 会返回该草稿供用户检查并重新提交。刷新提示仍只属于对应 Plan-only run。Runtime 会把精确 revision 和明确的 execute/resume 指令作为执行契约注入 Agent，并通过 `plan_state` 更新进度。`allow_stale` 只确认在本次过期证据快照下执行，不会刷新、重解释或替换批准 revision；明确的 goal、原步骤约束、verification、acceptance criteria 与 `completion_checks` 优先于宽泛 assumptions。全部进度项均为 `completed` 或明确 `skipped` 只是进入 `completed` 的必要条件；Finish 还必须通过该 revision 的服务端完成检查，否则保留真实进度/适应步骤，把绑定的原步骤置为 `blocked`，并进入可修订或 Resume 的 `failed`。History 的 `plans[]` 最多同步最近 50 个 revision，并始终包含当前 revision。LingClaw 启动时会把数据库中遗留的 `planning`/`executing` 状态恢复为 `stopped`；其中只有保留批准时间和执行次数的执行中断计划可以 Resume。
 
 兼容旧客户端的 `{ "execute_plan_id": "plan_..." }` 仅可执行尚未修订的 revision 1 ready 计划；计划产生新 revision 后必须改用携带明确 revision 的 `plan_action`，避免旧页面批准未展示过的内容。新客户端始终应使用 `plan_action`。稳定错误 code 包括：
 
@@ -1763,6 +1768,8 @@ Group socket 初始化顺序通常为：
 - `plan_already_active`：Session 已有活动计划或 run
 - `group_plan_mode_unsupported`：Group 请求规划模式
 - `plan_evidence_verification_failed`：批准或恢复前未能在限定时间内完成本地证据校验
+- `plan_execution_incomplete`：Agent 结束执行时仍有未完成或未明确跳过的步骤；计划保留真实进度并进入 `failed`，可用 `resume` 继续
+- `plan_completion_contract_failed`：步骤虽可能全部报告完成，但最终证据未满足批准 revision；错误事件携带绑定的 `plan_id`、`revision` 与失败 `checks[]`
 
 ### 5.2.5 只规划模式工具边界
 
@@ -1773,7 +1780,9 @@ Group socket 初始化顺序通常为：
 - MCP 工具只暴露当前 Session policy 已启用、`annotations.readOnlyHint=true` 且 `annotations.destructiveHint!=true` 的工具；缺少 annotations 时默认禁用。第三方 annotations 属于 LingClaw 信任的服务器声明
 - 不暴露 `todos`、`exec`、`write_file`、`patch_file`、`delete_file`、`task`、`orchestrate`
 - 如果模型仍尝试调用非只读工具，后端会拒绝该调用，不执行对应 handler
-- Plan-only 必须通过内部 `submit_plan` 终结；`needs_input` 包含 1–5 个阻塞问题，`ready` 包含 1–12 个稳定 ID 步骤。结构总量上限 64KB，校验失败时模型可在同一 loop 内修正
+- Plan-only 必须通过内部 `submit_plan` 终结；`needs_input` 包含 1–5 个阻塞问题，`ready` 包含 1–12 个稳定 ID 步骤、至少一条验收标准，并用 `completion_checks` 覆盖每条 verification 与 acceptance criterion。结构总量上限 64KB，校验失败时模型可在同一 loop 内修正
+- `completion_checks[].covers` 使用零基索引绑定 `verification` / `acceptance_criteria`；检查只能绑定原始步骤。`kind` 支持 `workspace_path`（最终路径类型及可选精确内容/字节数/SHA-256）、`approved_evidence_unchanged`（仅接受已捕获的 `file` 或非递归 `directory` 证据）、`plan_progress`、`tool_call_success`（工具名与实际执行参数必须精确一致）。其中 `plan_progress` 只增加附加进度门禁，不为任何条款提供服务器验收覆盖；每条 verification/acceptance 仍须至少由 `workspace_path`、`approved_evidence_unchanged` 或 `tool_call_success` 覆盖。同一路径的自相矛盾约束会在提交时拒绝
+- 所有工作区文件工具、子进程 cwd、Plan 初始证据和 Finish 路径检查都以 no-follow 方式建立持久化工作区根 capability，并在实际打开、创建、删除、枚举、复核及读取期间保留同一信任锚；安全校验不会返回可供事后无 guard 裸路径重开的授权，也不会重新 canonicalize 根 pathname 后接受替换目标。Linux 与 Android 构建使用 `openat2` 的 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`，syscall/ABI 不可用时稳定 fail-closed。Windows 使用锁定父目录相对的 `NtCreateFile` 以零数据权限保留最终 identity，实际操作也从同一父链相对打开并复核目标；身份比较使用非零卷序列号与完整 128-bit `FILE_ID_INFO`，拒绝全零与全 FF 非唯一哨兵，查询不支持时 fail-closed。各操作按需申请最小权限且拒绝 reparse point；副作用操作通常持有不共享删除的祖先/目标句柄链，若已打开的 DELETE-access 句柄要求兼容路径，则保持 delete sharing，但会在每次操作前复核最初 identity。只能接收 cwd 或枚举 pathname 的系统 API 会在完整组件链 guard 存活时执行。stdio MCP 缓存会保留 workspace/cwd capability；Linux/Android 只让目标 MCP 子进程继承目录 fd（父进程副本保持 close-on-exec），Windows 在 root URI 使用期间保持 no-delete 句柄链。Streamable HTTP 只复核本地 capability，不声明或返回本地 roots；失配时逐出并关闭旧远端 Session。正式发布支持 Windows 与 Linux；其他 Unix 目标不会用 `st_dev` 冒充完整 mount identity，而是对安全工作区操作明确 fail-closed。文件检查在同一个受检句柄上读取 metadata、精确字节和 SHA-256，实际读取上限为 64 MiB。整个 verifier 使用较短的 `toolTimeout` 或 30 秒硬截止时间；`/stop`、run cancellation 或服务关闭会取消验证且不发送合同失败，截止时间耗尽则返回 `completion-contract-timeout` 检查并令计划安全进入 `failed`
 - 不支持 Tool Calling 的 Provider 退化为单步骤 legacy plan，并保留原始 Markdown
 
 ### 5.2.6 忙碌期干预
@@ -2131,6 +2140,19 @@ History 顶层还可包含结构化计划历史：
         "risks": [],
         "verification": ["运行完整测试"],
         "acceptance_criteria": ["迁移可回滚"],
+        "completion_checks": [
+          {
+            "id": "storage-tests",
+            "step_id": "inspect",
+            "covers": [
+              { "section": "verification", "index": 0 },
+              { "section": "acceptance_criteria", "index": 0 }
+            ],
+            "kind": "tool_call_success",
+            "tool_name": "exec",
+            "arguments": { "command": "cargo test storage" }
+          }
+        ],
         "questions": []
       },
       "progress": [
@@ -2150,7 +2172,8 @@ History 顶层还可包含结构化计划历史：
 - `plans[]` 按计划消息位置与 revision 排序；旧 revision 带 `historical:true`，客户端必须只读折叠展示。当前 revision 带 `historical:false`
 - `status` 取值为 `planning`、`needs_input`、`ready`、`executing`、`completed`、`failed`、`stopped`、`discarded`
 - `progress[].status` 取值为 `pending`、`in_progress`、`completed`、`blocked`、`skipped`；适应性步骤可能只存在于 `progress[]`，并携带 `deviation_reason`
-- `unfinished_steps` 与 `run_finished_with_unreported_steps` 表示运行结束后仍未被 Agent 报告完成的步骤；服务端不会自动补成 completed
+- `artifact.completion_checks[]` 是批准 revision 的不可变、可展示合同；空字段可能因 `skip_serializing_if` 省略。新结构化 ready revision 必须用非 `plan_progress` 的服务器检查完整覆盖 verification/acceptance；progress check 只能作为额外门禁。旧持久化结构若包含验收/验证但缺少检查，或只有 progress 自报检查，不能只凭自由文本 note 完成，需修订后重试
+- `unfinished_steps` 表示尚未被 Agent 报告为 `completed` 或 `skipped` 的步骤；服务端不会自动补成 completed。当前执行若带着未完成步骤或失败完成检查结束，计划进入 `failed`；`run_finished_with_unreported_steps` 仅用于兼容展示旧版本已经持久化的异常 `completed` 记录
 - `pending_plan` 仅作为旧客户端兼容入口，在当前计划为 `ready` 时出现；新客户端以 `plans[]` 为准
 
 补充说明：
@@ -2313,6 +2336,19 @@ History 顶层还可包含结构化计划历史：
       "risks": [],
       "verification": ["运行完整测试"],
       "acceptance_criteria": ["迁移可回滚"],
+      "completion_checks": [
+        {
+          "id": "storage-tests",
+          "step_id": "inspect",
+          "covers": [
+            { "section": "verification", "index": 0 },
+            { "section": "acceptance_criteria", "index": 0 }
+          ],
+          "kind": "tool_call_success",
+          "tool_name": "exec",
+          "arguments": { "command": "cargo test storage" }
+        }
+      ],
       "questions": []
     },
     "progress": [
@@ -2711,6 +2747,46 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
   "reason": "user_stop"
 }
 ```
+
+- 已批准计划在仍有未完成步骤时结束，会先发送 `plan_execution_incomplete` 错误，再以失败终态结束：
+
+```json
+{
+  "type": "done",
+  "phase": "failed",
+  "reason": "incomplete_plan"
+}
+```
+
+- 全部步骤虽已报告完成，但最终证据不满足批准 revision 时，先发送绑定合同的错误，再以失败终态结束。自由文本 `note` 或适应步骤不能覆盖该结果：
+
+```json
+{
+  "type": "error",
+  "code": "plan_completion_contract_failed",
+  "plan_id": "plan_...",
+  "revision": 2,
+  "checks": [
+    {
+      "check_id": "result-bytes",
+      "step_id": "verify-result",
+      "reason": "file size is 18 bytes; the approved contract requires 17 bytes"
+    }
+  ],
+  "content": "The final workspace or execution evidence did not satisfy the immutable approved revision. The plan was marked failed and can be revised or resumed.",
+  "dismissible": true
+}
+```
+
+```json
+{
+  "type": "done",
+  "phase": "failed",
+  "reason": "completion_contract_failed"
+}
+```
+
+若 Finish 验证因 `/stop`、连接/run cancellation 或服务关闭被取消，不会发送上述错误，也不会由 verifier 写入 Completed/Failed；正常的外层运行终止流程负责持久化 `stopped`。若验证超过硬截止时间，`checks[]` 使用稳定的 `check_id: "completion-contract-timeout"` 和非敏感原因，并按合同失败结束。
 
 ## 5.3.3 上下文维护事件
 

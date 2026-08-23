@@ -6,8 +6,17 @@ import {
   initComposerModelPicker,
   invalidateComposerModelCatalog,
   openComposerModelPicker,
+  refreshActiveComposerSessionModelState,
   syncComposerModelControls,
 } from '../src/composerModels.js';
+import {
+  acceptComposerSocketModelPayloadRevision,
+  beginComposerRevisionHandshake,
+  beginComposerSessionTransition,
+  completeComposerSessionTransition,
+  invalidateComposerSessionModelRecovery,
+  setComposerSessionModelConfigured,
+} from '../src/composerAvailability.js';
 import { openAttachPopup } from '../src/images.js';
 import { setLanguage } from '../src/i18n.js';
 import { dom, initDomRefs, state } from '../src/state.js';
@@ -17,6 +26,33 @@ function response(payload: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+function deferredResponse(): {
+  promise: Promise<Response>;
+  resolve: (value: Response) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: Response) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<Response>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function installOpenSocket(): WebSocket {
+  const socket = { readyState: WebSocket.OPEN } as WebSocket;
+  state.ws = socket;
+  return socket;
+}
+
+function recoveryRequestSignal(fetchMock: ReturnType<typeof vi.fn>, call = 0): AbortSignal {
+  const init = fetchMock.mock.calls[call]?.[1] as RequestInit | undefined;
+  const signal = init?.signal;
+  if (!signal) throw new Error('Session model recovery request must carry an AbortSignal');
+  return signal;
 }
 
 const catalogPayload = {
@@ -85,6 +121,16 @@ describe('Composer model picker', () => {
           <div id="attach-upload-status" style="display: none"></div>
         </div>
       </div>
+      <div id="input-area">
+        <textarea id="input"></textarea>
+        <button id="send"></button>
+      </div>
+      <p id="composer-availability-status" hidden>
+        <span id="composer-availability-message"></span>
+        <button id="composer-availability-action" hidden></button>
+        <button id="composer-availability-retry" hidden></button>
+      </p>
+      <span id="composer-availability-detail"></span>
     `;
     initDomRefs();
     invalidateComposerModelCatalog();
@@ -107,18 +153,22 @@ describe('Composer model picker', () => {
     state.composerExplicitPrimaryModelConfigured = true;
     state.composerModelAvailability = 'ready';
     state.imageCapable = false;
+    installOpenSocket();
     vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(response(catalogPayload)));
     initComposerModelPicker();
   });
 
   afterEach(() => {
+    invalidateComposerSessionModelRecovery();
     closeComposerModelPicker(false);
     invalidateComposerModelCatalog();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     document.body.innerHTML = '';
     dom.composerModelBtn = null;
     dom.composerModelLabel = null;
     dom.composerModelPopup = null;
+    state.ws = null;
   });
 
   it('groups searchable models by provider and shows configured capabilities', async () => {
@@ -447,5 +497,308 @@ describe('Composer model picker', () => {
     expect(state.composerSessionModelRevision).toBe(8);
     expect(state.composerModelAvailability).toBe('ready');
     expect(catalogRequests).toBe(1);
+  });
+
+  it('bounds permanently hanging recovery GETs and recovers through the existing Retry action', async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (event: PromiseRejectionEvent): void => {
+      unhandledRejections.push(event.reason);
+      event.preventDefault();
+    };
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+    try {
+      const hangingFetch = vi.fn<typeof fetch>((_input, init) => {
+        if (init?.signal) signals.push(init.signal);
+        if (signals.length === 1) return new Promise<Response>(() => {});
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => new Promise<unknown>(() => {}),
+        } as Response);
+      });
+      vi.stubGlobal('fetch', hangingFetch);
+      state.composerSessionModelRevision = 6;
+      state.composerConfigRevision = 7;
+      state.composerEffectiveModelConfigured = null;
+
+      const recovery = refreshActiveComposerSessionModelState('main');
+      expect(hangingFetch).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await expect(recovery).resolves.toBe('failed');
+      expect(hangingFetch).toHaveBeenCalledTimes(2);
+      expect(signals).toHaveLength(2);
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+      expect(state.composerModelAvailability).toBe('config-unavailable');
+      expect(dom.composerAvailabilityRetry?.hidden).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+
+      const retryFetch = vi.fn<typeof fetch>().mockResolvedValue(response(catalogPayload));
+      vi.stubGlobal('fetch', retryFetch);
+      let retry: ReturnType<typeof refreshActiveComposerSessionModelState> | null = null;
+      const retryHandler = (): void => {
+        retry = refreshActiveComposerSessionModelState('main');
+      };
+      dom.composerAvailabilityRetry?.addEventListener('click', retryHandler, { once: true });
+      dom.composerAvailabilityRetry?.click();
+      expect(retry).not.toBeNull();
+      await expect(retry!).resolves.toBe('applied');
+
+      expect(retryFetch).toHaveBeenCalledTimes(1);
+      expect(retryFetch.mock.calls[0]?.[1]?.method).toBeUndefined();
+      expect(recoveryRequestSignal(retryFetch).aborted).toBe(false);
+      expect(state.composerModelAvailability).toBe('ready');
+      expect(dom.composerAvailabilityRetry?.hidden).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+      await Promise.resolve();
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      window.removeEventListener('unhandledrejection', onUnhandledRejection);
+    }
+  });
+
+  it('cancels a Session recovery that enters Group chat before the response applies', async () => {
+    const delayed = deferredResponse();
+    const fetchMock = vi.fn<typeof fetch>().mockReturnValue(delayed.promise);
+    vi.stubGlobal('fetch', fetchMock);
+    state.composerSessionModelRevision = 6;
+    state.composerConfigRevision = 7;
+    state.composerEffectiveModelConfigured = null;
+    state.composerCurrentModel = 'gateway/current';
+
+    const recovery = refreshActiveComposerSessionModelState('main');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const signal = recoveryRequestSignal(fetchMock);
+    beginComposerSessionTransition();
+    state.activeGroupId = 'review-group';
+    state.composerCurrentModel = 'group/model';
+    state.imageCapable = true;
+    expect(signal.aborted).toBe(true);
+    await expect(recovery).resolves.toBe('cancelled');
+    delayed.resolve(
+      response({
+        ...catalogPayload,
+        session: { ...catalogPayload.session, model: 'stale/session-model' },
+        capabilities: { image: false },
+        configRevision: 99,
+        models: catalogPayload.models.map((model) => ({ ...model, name: `Stale ${model.name}` })),
+      }),
+    );
+
+    await Promise.resolve();
+    expect(state.composerConfigRevision).toBe(7);
+    expect(state.composerSessionModelRevision).toBeNull();
+    expect(state.composerCurrentModel).toBe('group/model');
+    expect(state.imageCapable).toBe(true);
+  });
+
+  it('cancels a recovery after the Session identity changes even if the id returns', async () => {
+    const delayed = deferredResponse();
+    const fetchMock = vi.fn<typeof fetch>().mockReturnValue(delayed.promise);
+    vi.stubGlobal('fetch', fetchMock);
+    state.composerSessionModelRevision = 6;
+    state.composerConfigRevision = 7;
+    state.composerEffectiveModelConfigured = null;
+
+    const recovery = refreshActiveComposerSessionModelState('main');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const signal = recoveryRequestSignal(fetchMock);
+    beginComposerSessionTransition(false, 'other-session');
+    state.activeSessionId = 'other-session';
+    completeComposerSessionTransition();
+    beginComposerSessionTransition(false, 'main');
+    state.activeSessionId = 'main';
+    completeComposerSessionTransition();
+    state.composerCurrentModel = 'new-identity/model';
+    state.imageCapable = true;
+    expect(signal.aborted).toBe(true);
+    await expect(recovery).resolves.toBe('cancelled');
+    delayed.resolve(
+      response({
+        ...catalogPayload,
+        session: { ...catalogPayload.session, model: 'old-identity/model' },
+        capabilities: { image: false },
+        configRevision: 88,
+      }),
+    );
+
+    await Promise.resolve();
+    expect(state.composerConfigRevision).toBe(7);
+    expect(state.composerCurrentModel).toBe('new-identity/model');
+    expect(state.imageCapable).toBe(true);
+  });
+
+  it('cancels a recovery when its bound socket disconnects', async () => {
+    const delayed = deferredResponse();
+    const fetchMock = vi.fn<typeof fetch>().mockReturnValue(delayed.promise);
+    vi.stubGlobal('fetch', fetchMock);
+    state.composerSessionModelRevision = 6;
+    state.composerConfigRevision = 7;
+    state.composerEffectiveModelConfigured = null;
+    const socket = state.ws as WebSocket & { readyState: number };
+
+    const recovery = refreshActiveComposerSessionModelState('main');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const signal = recoveryRequestSignal(fetchMock);
+    socket.readyState = WebSocket.CLOSED;
+    invalidateComposerSessionModelRecovery();
+    expect(signal.aborted).toBe(true);
+    await expect(recovery).resolves.toBe('cancelled');
+    delayed.resolve(
+      response({
+        ...catalogPayload,
+        session: { ...catalogPayload.session, model: 'disconnected/model' },
+        capabilities: { image: true },
+        configRevision: 77,
+      }),
+    );
+
+    await Promise.resolve();
+    expect(state.composerConfigRevision).toBe(7);
+    expect(state.composerSessionModelRevision).toBe(6);
+    expect(state.composerCurrentModel).toBe('gateway/current');
+    expect(state.imageCapable).toBe(false);
+  });
+
+  it('rejects an old daemon HTTP response after a lower socket revision establishes a new baseline', async () => {
+    const oldDaemonResponse = deferredResponse();
+    let sessionModelRequests = 0;
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation((input) => {
+      const url = String(input);
+      if (url.startsWith('/api/session-models')) {
+        sessionModelRequests += 1;
+        if (sessionModelRequests === 1) return oldDaemonResponse.promise;
+        return Promise.resolve(
+          response({
+            ...catalogPayload,
+            configRevision: 5,
+            models: catalogPayload.models.map((model) => ({
+              ...model,
+              name: `New ${model.name}`,
+            })),
+          }),
+        );
+      }
+      if (url === '/api/config') {
+        return Promise.resolve(
+          response({
+            config: {},
+            configuredModelsAvailable: true,
+            explicitPrimaryModelConfigured: false,
+            configRevision: 5,
+          }),
+        );
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    state.composerConfigRevision = 100;
+    state.composerSessionModelRevision = 99;
+    state.composerEffectiveModelConfigured = null;
+    const recovery = refreshActiveComposerSessionModelState('main');
+    await vi.waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/session-models')),
+      ).toHaveLength(1),
+    );
+    const oldDaemonSignal = recoveryRequestSignal(fetchMock);
+
+    installOpenSocket();
+    beginComposerRevisionHandshake();
+    expect(oldDaemonSignal.aborted).toBe(true);
+    expect(acceptComposerSocketModelPayloadRevision(5)).toBe(true);
+    setComposerSessionModelConfigured(true, true, true, 5, false);
+    state.composerSessionIdentityPending = false;
+    state.composerCurrentModel = 'new-daemon/model';
+    state.imageCapable = true;
+    await expect(recovery).resolves.toBe('cancelled');
+    oldDaemonResponse.resolve(
+      response({
+        ...catalogPayload,
+        session: { ...catalogPayload.session, model: 'old-daemon/model' },
+        capabilities: { image: false },
+        configRevision: 101,
+        models: catalogPayload.models.map((model) => ({ ...model, name: `Old ${model.name}` })),
+      }),
+    );
+
+    await Promise.resolve();
+    expect(state.composerConfigRevision).toBe(5);
+    expect(state.composerSessionModelRevision).toBe(5);
+    expect(state.composerCurrentModel).toBe('new-daemon/model');
+    expect(state.imageCapable).toBe(true);
+
+    state.composerCurrentModel = 'gateway/current';
+    await openComposerModelPicker(true);
+    expect(dom.composerModelPopup?.textContent).toContain('New Current Reasoner');
+    expect(dom.composerModelPopup?.textContent).not.toContain('Old Current Reasoner');
+  });
+
+  it('retries when a superseding catalog request fails instead of reporting false convergence', async () => {
+    const firstRecovery = deferredResponse();
+    const recoveredPayload = {
+      ...catalogPayload,
+      session: { ...catalogPayload.session, model: 'gateway/vision', effort: 'high' },
+      capabilities: { image: true },
+      configRevision: 8,
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockReturnValueOnce(firstRecovery.promise)
+      .mockRejectedValueOnce(new Error('superseding picker request failed'))
+      .mockResolvedValueOnce(response(recoveredPayload))
+      .mockImplementation((input) => {
+        if (String(input) === '/api/config') {
+          return Promise.resolve(
+            response({
+              config: {},
+              configuredModelsAvailable: true,
+              explicitPrimaryModelConfigured: true,
+              configRevision: 8,
+            }),
+          );
+        }
+        return Promise.reject(new Error(`Unexpected request: ${String(input)}`));
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    state.composerSessionModelRevision = 6;
+    state.composerConfigRevision = 7;
+    state.composerEffectiveModelConfigured = null;
+
+    const recovery = refreshActiveComposerSessionModelState('main');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await openComposerModelPicker(true);
+    firstRecovery.resolve(
+      response({
+        ...catalogPayload,
+        session: {
+          ...catalogPayload.session,
+          model: 'superseded/model',
+          effort: 'low',
+        },
+        capabilities: { image: false },
+        configRevision: 88,
+        models: catalogPayload.models.map((model) => ({
+          ...model,
+          name: `Superseded ${model.name}`,
+        })),
+      }),
+    );
+
+    await expect(recovery).resolves.toBe('applied');
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/session-models')),
+    ).toHaveLength(3);
+    expect(state.composerConfigRevision).toBe(8);
+    expect(state.composerSessionModelRevision).toBe(8);
+    expect(state.composerCurrentModel).toBe('gateway/vision');
+    expect(state.composerCurrentEffort).toBe('high');
+    expect(state.imageCapable).toBe(true);
+
+    await openComposerModelPicker();
+    expect(dom.composerModelPopup?.textContent).toContain('Current Reasoner');
+    expect(dom.composerModelPopup?.textContent).not.toContain('Superseded Current Reasoner');
   });
 });

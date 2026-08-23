@@ -129,6 +129,10 @@ pub(crate) fn session_ids_match(a: &str, b: &str) -> bool {
 const INBOUND_BUFFER_CAPACITY: usize = 128;
 static CONFIG_FILE_LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
     std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
+#[cfg(test)]
+static CONFIG_WRITE_WAIT_SIGNALS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 static S3_LIFECYCLE_SYNC_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 static S3_LIFECYCLE_SYNCED_CONFIG_ID: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
@@ -734,6 +738,44 @@ impl SessionModelPreferenceError {
     }
 }
 
+#[cfg(not(test))]
+async fn acquire_config_write_lock_for_session(
+    _session_id: &str,
+) -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    CONFIG_FILE_LOCK.write().await
+}
+
+#[cfg(test)]
+fn install_config_write_wait_signal(session_id: &str, signal: tokio::sync::oneshot::Sender<()>) {
+    CONFIG_WRITE_WAIT_SIGNALS
+        .lock()
+        .expect("config write wait signal lock")
+        .insert(session_id.to_string(), signal);
+}
+
+#[cfg(test)]
+async fn acquire_config_write_lock_for_session(
+    session_id: &str,
+) -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    use std::{future::Future as _, task::Poll};
+
+    let mut pending_signal = CONFIG_WRITE_WAIT_SIGNALS
+        .lock()
+        .expect("config write wait signal lock")
+        .remove(session_id);
+    let mut lock = Box::pin(CONFIG_FILE_LOCK.write());
+    std::future::poll_fn(move |cx| match lock.as_mut().poll(cx) {
+        Poll::Ready(guard) => Poll::Ready(guard),
+        Poll::Pending => {
+            if let Some(signal) = pending_signal.take() {
+                let _ = signal.send(());
+            }
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 pub(crate) async fn update_session_model_preferences(
     state: &AppState,
     session_id: &str,
@@ -741,7 +783,7 @@ pub(crate) async fn update_session_model_preferences(
     requested_effort: Option<&str>,
     reject_busy: bool,
 ) -> Result<SessionModelPreferenceUpdate, SessionModelPreferenceError> {
-    let _config_guard = CONFIG_FILE_LOCK.write().await;
+    let _config_guard = acquire_config_write_lock_for_session(session_id).await;
     // Keep the reservation gate until the new pair is durable. This makes the
     // operation linearizable with Agent startup: either the run already owns
     // the Session and the update is rejected, or the complete model/effort

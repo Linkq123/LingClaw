@@ -5896,8 +5896,9 @@ fn resolve_path_checked_allows_workspace_root_absolute_path() {
     let resolved = resolve_path_checked(&base.to_string_lossy(), &base)
         .expect("workspace root path should be allowed");
 
-    assert_eq!(resolved, base.canonicalize().unwrap_or(base.clone()));
+    assert_eq!(resolved.display_path(), base);
 
+    drop(resolved);
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -5910,8 +5911,9 @@ fn resolve_path_checked_allows_relative_path_that_normalizes_to_workspace_root()
     let resolved = resolve_path_checked("nested/..", &base)
         .expect("normalized in-workspace path should be allowed");
 
-    assert_eq!(resolved, base.canonicalize().unwrap_or(base.clone()));
+    assert_eq!(resolved.display_path(), base);
 
+    drop(resolved);
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -6919,10 +6921,11 @@ async fn api_session_workspace_rebind_does_not_invert_config_and_run_locks() {
         .await
         .insert(session_id.clone(), session);
 
-    // Keep a reader alive so the preference update queues as a config writer.
     // A rebind must already own its config read lock before it queues for
-    // active_runs; otherwise the queued writer and rebind form a deadlock.
-    let config_read_guard = CONFIG_FILE_LOCK.read().await;
+    // active_runs; otherwise the later preference writer and rebind form a
+    // deadlock. Let the rebind itself be that reader so an unrelated writer
+    // from a parallel test cannot be queued between a synthetic reader and the
+    // operation under test.
     let active_runs_guard = state.active_runs.lock().await;
     let control_lock = session_control::session_control_lock(&state, &session_id).await;
     let mut headers = HeaderMap::new();
@@ -6949,27 +6952,28 @@ async fn api_session_workspace_rebind_does_not_invert_config_and_run_locks() {
         }
     });
 
-    let mut rebind_reached_control_gate = false;
-    for _ in 0..100 {
-        if control_lock.try_lock().is_err() {
-            rebind_reached_control_gate = true;
-            break;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if control_lock.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        rebind_reached_control_gate,
-        "rebind should reach the Session control gate before the assertion"
-    );
+    })
+    .await
+    .expect("rebind should reach the Session control gate before the assertion");
 
+    let (writer_waiting_tx, writer_waiting_rx) = tokio::sync::oneshot::channel();
+    install_config_write_wait_signal(&session_id, writer_waiting_tx);
     let preference_task = tokio::spawn({
         let state = state.clone();
         let session_id = session_id.clone();
         async move { update_session_model_preferences(&state, &session_id, None, None, true).await }
     });
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(2), writer_waiting_rx)
+        .await
+        .expect("preference writer must actually poll the blocked config write lock")
+        .expect("preference writer should report its blocked lock acquisition");
     drop(active_runs_guard);
 
     let rebind_result = tokio::time::timeout(Duration::from_secs(2), rebind_task)
@@ -6979,7 +6983,6 @@ async fn api_session_workspace_rebind_does_not_invert_config_and_run_locks() {
         .expect("rebind should succeed");
     assert_eq!(rebind_result.0["session"]["workspace"]["kind"], "directory");
 
-    drop(config_read_guard);
     tokio::time::timeout(Duration::from_secs(2), preference_task)
         .await
         .expect("model preference update should finish after readers leave")
@@ -7092,11 +7095,15 @@ fn resolve_path_checked_accepts_new_absolute_child_of_extended_windows_workspace
     let resolved = resolve_path_checked(&requested.to_string_lossy(), &canonical)
         .expect("ordinary Windows path should match the extended workspace root");
 
-    assert_eq!(resolved, canonical.join("new-directory/new-file.txt"));
+    assert_eq!(
+        resolved.display_path(),
+        canonical.join("new-directory/new-file.txt")
+    );
     assert!(
         !requested.exists(),
         "the resolver must not create the target"
     );
+    drop(resolved);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -7116,7 +7123,8 @@ fn resolve_path_checked_matches_windows_workspace_case_insensitively() {
     let resolved = resolve_path_checked(&requested.to_string_lossy(), &canonical)
         .expect("Windows workspace matching should ignore path casing");
 
-    assert_eq!(resolved, canonical.join("new-file.txt"));
+    assert_eq!(resolved.display_path(), canonical.join("new-file.txt"));
+    drop(resolved);
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -7279,6 +7287,21 @@ async fn api_session_group_is_forbidden_when_the_feature_is_disabled() {
     )
     .await
     .expect_err("disabled Group endpoints must reject writes before validation");
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(payload["code"], "group_feature_disabled");
+    assert_eq!(payload["error"], "Group chat is disabled by configuration.");
+}
+
+#[tokio::test]
+async fn api_session_groups_list_is_forbidden_when_the_feature_is_disabled() {
+    let mut config = test_config();
+    config.enable_groups = false;
+    let state = Arc::new(test_app_state_with_config(config));
+
+    let (status, Json(payload)) = crate::session_control::api_session_groups(State(state))
+        .await
+        .expect_err("the disabled Group list endpoint must fail closed");
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(payload["code"], "group_feature_disabled");
@@ -8177,6 +8200,7 @@ async fn api_put_mcp_session_policy_rejects_previously_enabled_tool_missing_afte
 
     let mut session = test_session(&session_id, "MCP Policy Stale", None);
     session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
     session.version = SESSION_VERSION;
     state
         .sessions
@@ -10909,6 +10933,7 @@ fn handle_command_reports_mcp_load_failures() {
 
     let mut session = test_session(&session_id, "MCP Status", None);
     session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
     session.version = SESSION_VERSION;
 
     let mut config = test_config();
