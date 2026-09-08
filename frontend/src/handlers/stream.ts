@@ -9,6 +9,7 @@ import {
   removeLiveTail,
   renderMarkdown,
 } from '../markdown.js';
+import { appendLiveReasoningText } from '../renderers/reasoning.js';
 
 function revealAssistantMessage(message) {
   const row = message ? message.closest('.msg-row') : null;
@@ -82,17 +83,7 @@ function segmentedStructuralMarkdownNeedsFinalRender(raw: string): boolean {
 
 function flushReasoningText() {
   if (!state.reasoningPanel || !state.pendingReasoningText) return;
-  const body = state.reasoningPanel.querySelector('.reasoning-body');
-  if (!body) {
-    state.pendingReasoningText = '';
-    return;
-  }
-  if (!body._textNode) {
-    body._textNode = document.createTextNode(state.pendingReasoningText);
-    body.appendChild(body._textNode);
-  } else {
-    body._textNode.nodeValue += state.pendingReasoningText;
-  }
+  appendLiveReasoningText(state.reasoningPanel, state.pendingReasoningText);
   state.pendingReasoningText = '';
 }
 

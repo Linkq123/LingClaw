@@ -26,7 +26,7 @@ use crate::{
     Session,
     agent::{TaskIntent, WorkingState},
     config::Config,
-    context::{USAGE_ROLE_MEMORY, UsageUpdate, apply_usage_update, build_usage_labels},
+    context::{USAGE_ROLE_MEMORY, UsageUpdate, build_usage_labels},
     providers,
     tools::{ToolRankingContext, ToolRankingSource},
 };
@@ -345,7 +345,26 @@ struct MemoryProcessStats {
     had_user_context_before: bool,
     had_user_context_after: bool,
     changed: bool,
+}
+
+struct PreparedMemoryUpdate {
+    existing: StructuredMemory,
+    response: String,
+    excerpt_chars: usize,
+    facts_before: usize,
+    entries_before: usize,
+    had_user_context_before: bool,
     usage: Option<UsageUpdate>,
+}
+
+struct PlannedMemoryUpdate {
+    stats: MemoryProcessStats,
+    replacement: Option<StructuredMemory>,
+}
+
+enum MemoryFailure {
+    Error(String),
+    Timeout,
 }
 
 type SharedMemoryQueueStatus = Arc<Mutex<MemoryQueueStatusSnapshot>>;
@@ -1893,6 +1912,8 @@ fn dedupe_project_signals(project_signals: &mut Vec<ProjectSignal>) {
 #[derive(Clone)]
 struct MemoryUpdateRequest {
     session_id: String,
+    usage_operation_id: String,
+    auxiliary_permit: crate::auxiliary_tasks::AuxiliaryTaskPermit,
     workspace: PathBuf,
     model: String,
     /// Immutable runtime configuration captured by the Agent run that
@@ -1901,6 +1922,30 @@ struct MemoryUpdateRequest {
     config: Arc<Config>,
     /// Only user messages + final assistant response (no tool noise).
     conversation_excerpt: Vec<crate::ChatMessage>,
+    #[cfg(test)]
+    usage_database: Option<crate::storage::Database>,
+    #[cfg(test)]
+    post_provider_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    post_usage_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    force_private_save_failure: bool,
+}
+
+struct MemoryEnqueueInput {
+    session_id: String,
+    workspace: PathBuf,
+    model: String,
+    config: Arc<Config>,
+    conversation_excerpt: Vec<crate::ChatMessage>,
+}
+
+#[cfg(test)]
+pub(crate) struct MemoryUpdateTestControls {
+    pub(crate) usage_database: Option<crate::storage::Database>,
+    pub(crate) post_provider_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    pub(crate) post_usage_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    pub(crate) force_private_save_failure: bool,
 }
 
 /// Max pending update requests. Beyond this, new requests replace the latest.
@@ -1915,6 +1960,8 @@ pub(crate) struct MemoryUpdateQueue {
     status: SharedMemoryQueueStatus,
     config: Arc<Mutex<Arc<Config>>>,
     cancel: CancellationToken,
+    auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry,
+    worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl MemoryUpdateQueue {
@@ -1922,6 +1969,7 @@ impl MemoryUpdateQueue {
     pub(crate) fn spawn(
         config: Config,
         sessions: Arc<AsyncMutex<HashMap<String, Session>>>,
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry,
     ) -> Self {
         let (tx, rx) = mpsc::channel(MEMORY_QUEUE_CAPACITY);
         let status = Arc::new(Mutex::new(MemoryQueueStatusSnapshot {
@@ -1930,17 +1978,20 @@ impl MemoryUpdateQueue {
         }));
         let config = Arc::new(Mutex::new(Arc::new(config)));
         let cancel = CancellationToken::new();
-        tokio::spawn(memory_updater_loop(
+        let worker = tokio::spawn(memory_updater_loop(
             rx,
             status.clone(),
             cancel.clone(),
             sessions,
+            auxiliary_tasks.clone(),
         ));
         Self {
             tx,
             status,
             config,
             cancel,
+            auxiliary_tasks,
+            worker: Arc::new(tokio::sync::Mutex::new(Some(worker))),
         }
     }
 
@@ -1968,6 +2019,15 @@ impl MemoryUpdateQueue {
         self.cancel.cancel();
     }
 
+    pub(crate) async fn shutdown_and_wait(&self) {
+        self.shutdown();
+        if let Some(worker) = self.worker.lock().await.take()
+            && let Err(error) = worker.await
+        {
+            eprintln!("ERROR: Memory queue worker failed during shutdown: {error}");
+        }
+    }
+
     /// Enqueue a memory update request (non-blocking).
     pub(crate) fn enqueue(
         &self,
@@ -1977,15 +2037,84 @@ impl MemoryUpdateQueue {
         config: Arc<Config>,
         conversation_excerpt: Vec<crate::ChatMessage>,
     ) {
+        self.enqueue_inner(
+            MemoryEnqueueInput {
+                session_id,
+                workspace,
+                model,
+                config,
+                conversation_excerpt,
+            },
+            #[cfg(test)]
+            MemoryUpdateTestControls {
+                usage_database: None,
+                post_provider_gate: None,
+                post_usage_gate: None,
+                force_private_save_failure: false,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enqueue_with_test_controls(
+        &self,
+        session_id: String,
+        workspace: PathBuf,
+        model: String,
+        config: Arc<Config>,
+        conversation_excerpt: Vec<crate::ChatMessage>,
+        controls: MemoryUpdateTestControls,
+    ) {
+        self.enqueue_inner(
+            MemoryEnqueueInput {
+                session_id,
+                workspace,
+                model,
+                config,
+                conversation_excerpt,
+            },
+            controls,
+        );
+    }
+
+    fn enqueue_inner(
+        &self,
+        input: MemoryEnqueueInput,
+        #[cfg(test)] controls: MemoryUpdateTestControls,
+    ) {
         if self.cancel.is_cancelled() {
             return;
         }
+        let MemoryEnqueueInput {
+            session_id,
+            workspace,
+            model,
+            config,
+            conversation_excerpt,
+        } = input;
+        let auxiliary_permit = match self.auxiliary_tasks.permit(
+            &session_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         let req = MemoryUpdateRequest {
             session_id,
+            usage_operation_id: crate::session_store::new_auxiliary_usage_operation_id("memory"),
+            auxiliary_permit,
             workspace,
             model: model.clone(),
             config,
             conversation_excerpt,
+            #[cfg(test)]
+            usage_database: controls.usage_database,
+            #[cfg(test)]
+            post_provider_gate: controls.post_provider_gate,
+            #[cfg(test)]
+            post_usage_gate: controls.post_usage_gate,
+            #[cfg(test)]
+            force_private_save_failure: controls.force_private_save_failure,
         };
         if self.tx.try_send(req).is_err() {
             eprintln!("Warning: memory update queue is full, request dropped");
@@ -2009,6 +2138,7 @@ async fn memory_updater_loop(
     status: SharedMemoryQueueStatus,
     cancel: CancellationToken,
     sessions: Arc<AsyncMutex<HashMap<String, Session>>>,
+    auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry,
 ) {
     let mut pending: Option<MemoryUpdateRequest> = None;
 
@@ -2036,135 +2166,36 @@ async fn memory_updater_loop(
                 _ = tokio::time::sleep(DEBOUNCE_DURATION) => req,
             };
 
-            // Process the debounced request with a timeout guard
-            let audit_baseline = build_audit_baseline(&final_req);
-            let started_at = now_epoch_secs();
-            let start = std::time::Instant::now();
-            with_queue_status(&status, |snapshot| {
-                snapshot.state = "running".to_string();
-                snapshot.started += 1;
-                snapshot.last_model = Some(final_req.model.clone());
-                snapshot.last_excerpt_chars = audit_baseline.excerpt_chars;
-                snapshot.last_started_at = started_at;
-            });
-
-            let config_snapshot = Arc::clone(&final_req.config);
-            let memory_timeout = config_snapshot.tool_timeout.max(Duration::from_secs(30));
-            let http = Client::builder()
-                .timeout(memory_timeout)
-                .build()
-                .unwrap_or_else(|_| Client::new());
-
-            match tokio::select! {
-                _ = cancel.cancelled() => return,
-                result = tokio::time::timeout(
-                    memory_timeout,
-                    process_memory_update(&final_req, &config_snapshot, &http),
-                ) => result,
-            } {
-                Ok(Err(error)) => {
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let now = now_epoch_secs();
-                    with_queue_status(&status, |snapshot| {
-                        snapshot.state = "idle".to_string();
-                        snapshot.failed += 1;
-                        snapshot.last_duration_ms = duration_ms;
-                        snapshot.last_error = Some(error.clone());
-                        snapshot.last_failure_at = now;
-                        snapshot.last_finished_at = now;
-                    });
-                    append_memory_audit_record(
-                        &final_req.workspace,
-                        &MemoryAuditRecord {
-                            timestamp: now,
-                            model: final_req.model.clone(),
-                            status: "error".to_string(),
-                            excerpt_chars: audit_baseline.excerpt_chars,
-                            duration_ms,
-                            facts_before: audit_baseline.facts_before,
-                            facts_after: audit_baseline.facts_before,
-                            entries_before: audit_baseline.entries_before,
-                            entries_after: audit_baseline.entries_before,
-                            had_user_context_before: audit_baseline.had_user_context_before,
-                            had_user_context_after: audit_baseline.had_user_context_before,
-                            changed: false,
-                            error: Some(error.clone()),
-                        },
-                    )
-                    .await;
-                    eprintln!("memory update error: {error}");
-                }
+            let permit = final_req.auxiliary_permit.clone();
+            let task_status = status.clone();
+            let task_sessions = Arc::clone(&sessions);
+            let queue_cancel = cancel.clone();
+            let task = match auxiliary_tasks.spawn(permit, move |task_context| async move {
+                execute_memory_update_request(
+                    final_req,
+                    task_status,
+                    task_sessions,
+                    queue_cancel,
+                    task_context,
+                )
+                .await;
+            }) {
+                Ok(task) => task,
                 Err(_) => {
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let now = now_epoch_secs();
-                    let error = "memory update timed out".to_string();
                     with_queue_status(&status, |snapshot| {
                         snapshot.state = "idle".to_string();
-                        snapshot.timed_out += 1;
-                        snapshot.last_duration_ms = duration_ms;
-                        snapshot.last_error = Some(error.clone());
-                        snapshot.last_failure_at = now;
-                        snapshot.last_finished_at = now;
                     });
-                    append_memory_audit_record(
-                        &final_req.workspace,
-                        &MemoryAuditRecord {
-                            timestamp: now,
-                            model: final_req.model.clone(),
-                            status: "timeout".to_string(),
-                            excerpt_chars: audit_baseline.excerpt_chars,
-                            duration_ms,
-                            facts_before: audit_baseline.facts_before,
-                            facts_after: audit_baseline.facts_before,
-                            entries_before: audit_baseline.entries_before,
-                            entries_after: audit_baseline.entries_before,
-                            had_user_context_before: audit_baseline.had_user_context_before,
-                            had_user_context_after: audit_baseline.had_user_context_before,
-                            changed: false,
-                            error: Some(error.clone()),
-                        },
-                    )
-                    .await;
-                    eprintln!("{error}");
+                    continue;
                 }
-                Ok(Ok(stats)) => {
-                    if let Some(usage) = stats.usage.as_ref() {
-                        let mut sessions = sessions.lock().await;
-                        if let Some(session) = sessions.get_mut(&final_req.session_id) {
-                            apply_usage_update(session, usage);
-                        }
-                    }
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let now = now_epoch_secs();
-                    with_queue_status(&status, |snapshot| {
-                        snapshot.state = "idle".to_string();
-                        snapshot.succeeded += 1;
-                        snapshot.last_duration_ms = duration_ms;
-                        snapshot.last_error = None;
-                        snapshot.last_success_at = now;
-                        snapshot.last_finished_at = now;
-                        snapshot.last_excerpt_chars = stats.excerpt_chars;
-                    });
-                    append_memory_audit_record(
-                        &final_req.workspace,
-                        &MemoryAuditRecord {
-                            timestamp: now,
-                            model: final_req.model.clone(),
-                            status: "success".to_string(),
-                            excerpt_chars: stats.excerpt_chars,
-                            duration_ms,
-                            facts_before: stats.facts_before,
-                            facts_after: stats.facts_after,
-                            entries_before: stats.entries_before,
-                            entries_after: stats.entries_after,
-                            had_user_context_before: stats.had_user_context_before,
-                            had_user_context_after: stats.had_user_context_after,
-                            changed: stats.changed,
-                            error: None,
-                        },
-                    )
-                    .await;
-                }
+            };
+            if let Err(error) = task.wait().await {
+                with_queue_status(&status, |snapshot| {
+                    snapshot.state = "idle".to_string();
+                    snapshot.failed += 1;
+                    snapshot.last_error = Some(error.clone());
+                    snapshot.last_failure_at = now_epoch_secs();
+                    snapshot.last_finished_at = snapshot.last_failure_at;
+                });
             }
         } else {
             // Wait for next request
@@ -2179,6 +2210,295 @@ async fn memory_updater_loop(
             }
         }
     }
+}
+
+async fn execute_memory_update_request(
+    final_req: MemoryUpdateRequest,
+    status: SharedMemoryQueueStatus,
+    sessions: Arc<AsyncMutex<HashMap<String, Session>>>,
+    queue_cancel: CancellationToken,
+    task_context: crate::auxiliary_tasks::AuxiliaryTaskContext,
+) {
+    let audit_baseline = build_audit_baseline(&final_req);
+    let started_at = now_epoch_secs();
+    let start = std::time::Instant::now();
+    with_queue_status(&status, |snapshot| {
+        snapshot.state = "running".to_string();
+        snapshot.started += 1;
+        snapshot.last_model = Some(final_req.model.clone());
+        snapshot.last_excerpt_chars = audit_baseline.excerpt_chars;
+        snapshot.last_started_at = started_at;
+    });
+
+    let config_snapshot = Arc::clone(&final_req.config);
+    let memory_timeout = config_snapshot.tool_timeout.max(Duration::from_secs(30));
+    let http = Client::builder()
+        .timeout(memory_timeout)
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    // This deadline covers only the Provider phase. Once the Provider has
+    // succeeded its Usage is durable work and must be committed even if the
+    // lifecycle is cancelled while parsing or writing private memory later.
+    let provider_result = tokio::select! {
+        biased;
+        result = tokio::time::timeout(
+            memory_timeout,
+            prepare_memory_update(&final_req, &config_snapshot, &http),
+        ) => Some(result),
+        _ = task_context.cancelled() => None,
+        _ = queue_cancel.cancelled() => None,
+    };
+    let Some(provider_result) = provider_result else {
+        with_queue_status(&status, |snapshot| snapshot.state = "idle".to_string());
+        return;
+    };
+
+    let prepared = match provider_result {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
+            finish_memory_failure(
+                &final_req,
+                &status,
+                &task_context,
+                &queue_cancel,
+                &audit_baseline,
+                start,
+                MemoryFailure::Error(error),
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            finish_memory_failure(
+                &final_req,
+                &status,
+                &task_context,
+                &queue_cancel,
+                &audit_baseline,
+                start,
+                MemoryFailure::Timeout,
+            )
+            .await;
+            return;
+        }
+    };
+
+    #[cfg(test)]
+    if let Some((reached, release)) = final_req.post_provider_gate.as_ref() {
+        reached.notify_one();
+        release.notified().await;
+    }
+
+    if let Some(usage) = prepared.usage.as_ref() {
+        #[cfg(not(test))]
+        let usage_result = crate::session_store::persist_auxiliary_usage_update(
+            Arc::clone(&sessions),
+            final_req.session_id.clone(),
+            final_req.usage_operation_id.clone(),
+            usage.clone(),
+        )
+        .await;
+        #[cfg(test)]
+        let usage_result = match final_req.usage_database.clone() {
+            Some(database) => {
+                crate::session_store::persist_auxiliary_usage_update_with_database(
+                    database,
+                    Arc::clone(&sessions),
+                    final_req.session_id.clone(),
+                    final_req.usage_operation_id.clone(),
+                    usage.clone(),
+                )
+                .await
+            }
+            None => {
+                crate::session_store::persist_auxiliary_usage_update(
+                    Arc::clone(&sessions),
+                    final_req.session_id.clone(),
+                    final_req.usage_operation_id.clone(),
+                    usage.clone(),
+                )
+                .await
+            }
+        };
+        match usage_result {
+            Ok(crate::storage::AuxiliaryUsageApplyOutcome::Missing) => {
+                with_queue_status(&status, |snapshot| snapshot.state = "idle".to_string());
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                finish_memory_failure(
+                    &final_req,
+                    &status,
+                    &task_context,
+                    &queue_cancel,
+                    &audit_baseline,
+                    start,
+                    MemoryFailure::Error(format!("Persist memory Usage: {error}")),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    if let Some((reached, release)) = final_req.post_usage_gate.as_ref() {
+        reached.notify_one();
+        release.notified().await;
+    }
+
+    if task_context.is_cancelled() || queue_cancel.is_cancelled() {
+        with_queue_status(&status, |snapshot| snapshot.state = "idle".to_string());
+        return;
+    }
+
+    let planned = match plan_memory_update(prepared) {
+        Ok(planned) => planned,
+        Err(error) => {
+            finish_memory_failure(
+                &final_req,
+                &status,
+                &task_context,
+                &queue_cancel,
+                &audit_baseline,
+                start,
+                MemoryFailure::Error(error),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if let Some(replacement) = planned.replacement.as_ref() {
+        let Some(_write_permit) = task_context.begin_private_write() else {
+            with_queue_status(&status, |snapshot| snapshot.state = "idle".to_string());
+            return;
+        };
+        if queue_cancel.is_cancelled() {
+            with_queue_status(&status, |snapshot| snapshot.state = "idle".to_string());
+            return;
+        }
+        #[cfg(test)]
+        let save_result = if final_req.force_private_save_failure {
+            Err("injected structured memory save failure".to_string())
+        } else {
+            save_structured_memory(&final_req.workspace, replacement)
+        };
+        #[cfg(not(test))]
+        let save_result = save_structured_memory(&final_req.workspace, replacement);
+        if let Err(error) = save_result {
+            finish_memory_failure(
+                &final_req,
+                &status,
+                &task_context,
+                &queue_cancel,
+                &audit_baseline,
+                start,
+                MemoryFailure::Error(error),
+            )
+            .await;
+            return;
+        }
+    }
+
+    if task_context.is_cancelled() || queue_cancel.is_cancelled() {
+        with_queue_status(&status, |snapshot| snapshot.state = "idle".to_string());
+        return;
+    }
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let now = now_epoch_secs();
+    let stats = planned.stats;
+    with_queue_status(&status, |snapshot| {
+        snapshot.state = "idle".to_string();
+        snapshot.succeeded += 1;
+        snapshot.last_duration_ms = duration_ms;
+        snapshot.last_error = None;
+        snapshot.last_success_at = now;
+        snapshot.last_finished_at = now;
+        snapshot.last_excerpt_chars = stats.excerpt_chars;
+    });
+    if let Some(_write_permit) = task_context.begin_private_write()
+        && !queue_cancel.is_cancelled()
+    {
+        append_memory_audit_record(
+            &final_req.workspace,
+            &MemoryAuditRecord {
+                timestamp: now,
+                model: final_req.model.clone(),
+                status: "success".to_string(),
+                excerpt_chars: stats.excerpt_chars,
+                duration_ms,
+                facts_before: stats.facts_before,
+                facts_after: stats.facts_after,
+                entries_before: stats.entries_before,
+                entries_after: stats.entries_after,
+                had_user_context_before: stats.had_user_context_before,
+                had_user_context_after: stats.had_user_context_after,
+                changed: stats.changed,
+                error: None,
+            },
+        )
+        .await;
+    }
+}
+
+async fn finish_memory_failure(
+    req: &MemoryUpdateRequest,
+    status: &SharedMemoryQueueStatus,
+    task_context: &crate::auxiliary_tasks::AuxiliaryTaskContext,
+    queue_cancel: &CancellationToken,
+    baseline: &MemoryAuditBaseline,
+    start: std::time::Instant,
+    failure: MemoryFailure,
+) {
+    if task_context.is_cancelled() || queue_cancel.is_cancelled() {
+        with_queue_status(status, |snapshot| snapshot.state = "idle".to_string());
+        return;
+    }
+    let (error, timed_out) = match failure {
+        MemoryFailure::Error(error) => (error, false),
+        MemoryFailure::Timeout => ("memory update timed out".to_string(), true),
+    };
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let now = now_epoch_secs();
+    with_queue_status(status, |snapshot| {
+        snapshot.state = "idle".to_string();
+        if timed_out {
+            snapshot.timed_out += 1;
+        } else {
+            snapshot.failed += 1;
+        }
+        snapshot.last_duration_ms = duration_ms;
+        snapshot.last_error = Some(error.clone());
+        snapshot.last_failure_at = now;
+        snapshot.last_finished_at = now;
+    });
+    if let Some(_write_permit) = task_context.begin_private_write()
+        && !queue_cancel.is_cancelled()
+    {
+        append_memory_audit_record(
+            &req.workspace,
+            &MemoryAuditRecord {
+                timestamp: now,
+                model: req.model.clone(),
+                status: if timed_out { "timeout" } else { "error" }.to_string(),
+                excerpt_chars: baseline.excerpt_chars,
+                duration_ms,
+                facts_before: baseline.facts_before,
+                facts_after: baseline.facts_before,
+                entries_before: baseline.entries_before,
+                entries_after: baseline.entries_before,
+                had_user_context_before: baseline.had_user_context_before,
+                had_user_context_after: baseline.had_user_context_before,
+                changed: false,
+                error: Some(error.clone()),
+            },
+        )
+        .await;
+    }
+    eprintln!("memory update error: {error}");
 }
 
 /// Merge a parsed LLM extraction response into the existing memory.
@@ -2593,13 +2913,14 @@ pub(crate) fn merge_llm_response_into_memory(
     dedupe_structured_memory(memory);
 }
 
-/// Core memory update: call LLM to extract memory from conversation,
-/// merge with existing memory, and persist.
-async fn process_memory_update(
+/// Provider phase of a memory update. This phase deliberately performs no
+/// private-file mutations so a successful Provider Usage record can commit
+/// before response parsing or storage is attempted.
+async fn prepare_memory_update(
     req: &MemoryUpdateRequest,
     config: &Config,
     http: &Client,
-) -> Result<MemoryProcessStats, String> {
+) -> Result<PreparedMemoryUpdate, String> {
     let existing = load_structured_memory(&req.workspace);
     let facts_before = existing.facts.len();
     let entries_before = existing.entry_count();
@@ -2609,15 +2930,13 @@ async fn process_memory_update(
     let excerpt = build_conversation_excerpt(&req.conversation_excerpt);
     let excerpt_chars = excerpt.chars().count();
     if excerpt.trim().is_empty() {
-        return Ok(MemoryProcessStats {
+        return Ok(PreparedMemoryUpdate {
+            existing,
+            response: String::new(),
             excerpt_chars,
             facts_before,
-            facts_after: facts_before,
             entries_before,
-            entries_after: entries_before,
             had_user_context_before,
-            had_user_context_after: had_user_context_before,
-            changed: false,
             usage: None,
         });
     }
@@ -2729,18 +3048,43 @@ Keep durable knowledge only; skip ephemeral task details."#
         ),
     };
 
-    let response = response.content.trim().to_string();
+    Ok(PreparedMemoryUpdate {
+        existing,
+        response: response.content.trim().to_string(),
+        excerpt_chars,
+        facts_before,
+        entries_before,
+        had_user_context_before,
+        usage: Some(usage),
+    })
+}
+
+/// Parse and plan the private-memory mutation after Provider Usage is durable.
+/// The caller owns the lifecycle write authorization and performs the actual
+/// save from `replacement`, without another cancellation race.
+fn plan_memory_update(prepared: PreparedMemoryUpdate) -> Result<PlannedMemoryUpdate, String> {
+    let PreparedMemoryUpdate {
+        existing,
+        response,
+        excerpt_chars,
+        facts_before,
+        entries_before,
+        had_user_context_before,
+        usage: _,
+    } = prepared;
     if response.is_empty() {
-        return Ok(MemoryProcessStats {
-            excerpt_chars,
-            facts_before,
-            facts_after: facts_before,
-            entries_before,
-            entries_after: entries_before,
-            had_user_context_before,
-            had_user_context_after: had_user_context_before,
-            changed: false,
-            usage: Some(usage),
+        return Ok(PlannedMemoryUpdate {
+            stats: MemoryProcessStats {
+                excerpt_chars,
+                facts_before,
+                facts_after: facts_before,
+                entries_before,
+                entries_after: entries_before,
+                had_user_context_before,
+                had_user_context_after: had_user_context_before,
+                changed: false,
+            },
+            replacement: None,
         });
     }
 
@@ -2809,21 +3153,25 @@ Keep durable knowledge only; skip ephemeral task details."#
     // Only update timestamp and persist when actual content changed.
     let after_json = serde_json::to_string(&merged).unwrap_or_default();
     let changed = before_json != after_json;
-    if changed {
+    let replacement = if changed {
         merged.updated_at = now;
-        save_structured_memory(&req.workspace, &merged)?;
-    }
+        Some(merged)
+    } else {
+        None
+    };
 
-    Ok(MemoryProcessStats {
-        excerpt_chars,
-        facts_before,
-        facts_after,
-        entries_before,
-        entries_after,
-        had_user_context_before,
-        had_user_context_after,
-        changed,
-        usage: Some(usage),
+    Ok(PlannedMemoryUpdate {
+        stats: MemoryProcessStats {
+            excerpt_chars,
+            facts_before,
+            facts_after,
+            entries_before,
+            entries_after,
+            had_user_context_before,
+            had_user_context_after,
+            changed,
+        },
+        replacement,
     })
 }
 

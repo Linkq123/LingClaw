@@ -9,6 +9,8 @@
   background: var(--bg);
 }
 
+#app-workspace[hidden],
+#workspace-portal-root[hidden],
 .console-page-host[hidden] {
   display: none;
 }
@@ -86,7 +88,7 @@
 }
 
 .console-return-button {
-  width: 100%;
+  width: auto;
   min-height: 38px;
   display: flex;
   align-items: center;
@@ -107,8 +109,8 @@
 
 .console-return-button:hover {
   color: var(--text);
-  border-color: color-mix(in srgb, var(--accent2) 35%, var(--border));
-  background: color-mix(in srgb, var(--accent2) 5%, var(--surface));
+  border-color: color-mix(in srgb, var(--color-action) 35%, var(--border));
+  background: color-mix(in srgb, var(--color-action) 5%, var(--surface));
 }
 
 .console-page-surface .settings-nav {
@@ -121,9 +123,9 @@
   color: var(--dim);
   font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
   line-height: 1.3;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .console-nav-group-label.is-observe {
@@ -141,8 +143,8 @@
 
 .console-page-surface .settings-nav-item.active {
   border-color: transparent;
-  background: color-mix(in srgb, var(--accent2) 9%, var(--surface));
-  box-shadow: inset 3px 0 0 var(--accent2);
+  background: color-mix(in srgb, var(--color-selected) 9%, var(--surface));
+  box-shadow: inset 3px 0 0 var(--color-selected);
 }
 
 .console-page-surface .console-nav-observe {
@@ -228,7 +230,7 @@
 .console-page-surface select:focus-visible,
 .console-page-surface textarea:focus-visible,
 .console-page-surface button:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent2) 72%, white);
+  outline: 2px solid color-mix(in srgb, var(--color-focus) 78%, white);
   outline-offset: 2px;
 }
 
@@ -262,24 +264,6 @@
   min-height: 48px;
   padding: 8px 18px;
   background: color-mix(in srgb, var(--surface) 96%, var(--bg));
-}
-
-.settings-mobile-save,
-.settings-mobile-reload {
-  display: none;
-}
-
-.console-mobile-back {
-  display: none;
-  width: 44px;
-  height: 44px;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border);
-  border-radius: 11px;
-  color: var(--text);
-  background: var(--surface);
 }
 
 .console-save-button,
@@ -400,6 +384,7 @@ html.is-console-transition-fallback.is-console-leaving #app-workspace {
   .console-return-button {
     justify-content: center;
     padding-inline: 0;
+    width: 42px;
   }
 
   .console-page-surface .settings-nav-item {
@@ -444,27 +429,62 @@ html.is-console-transition-fallback.is-console-leaving #app-workspace {
     padding: 6px 10px;
   }
 
-  .console-mobile-back {
-    display: flex;
+  .console-return-button {
+    width: 44px;
+    height: 44px;
+    flex: 0 0 auto;
+    justify-content: center;
+    padding: 0;
   }
 
-  .console-page-surface .settings-title-block p,
-  .console-reload-button {
+  .console-return-button span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .console-page-surface .settings-title-block p {
     display: none;
+  }
+
+  .console-page-surface .settings-topbar.has-config-conflict {
+    flex-wrap: wrap;
+  }
+
+  .console-page-surface .has-config-conflict .settings-topbar-actions {
+    flex-basis: 100%;
+    max-width: none;
+  }
+
+  .console-page-surface .has-config-conflict .settings-status {
+    flex: 1;
+    max-width: none;
+    text-align: left;
+  }
+
+  .console-reload-button {
+    flex: 0 0 auto;
+    min-height: 44px;
   }
 
   .console-page-surface .settings-title-block {
     flex: 1;
   }
 
-  .console-page-surface .settings-title-block h2 {
+  .console-page-surface .settings-title-block h1 {
+    font-size: 18px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .console-save-button {
-    display: none;
+    display: inline-flex;
+    min-width: 68px;
+    padding-inline: 12px;
   }
 
   .console-page-surface .settings-body {
@@ -485,17 +505,6 @@ html.is-console-transition-fallback.is-console-leaving #app-workspace {
   .console-page-surface .settings-footer {
     min-height: 58px;
     padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
-  }
-
-  .console-page-surface .settings-footer-actions,
-  .settings-mobile-save,
-  .settings-mobile-reload {
-    display: flex;
-  }
-
-  .settings-mobile-save,
-  .settings-mobile-reload {
-    min-height: 44px;
   }
 
   .console-page-surface .settings-discard-dialog {

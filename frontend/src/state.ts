@@ -12,6 +12,7 @@ import type {
   PlanStatePayload,
 } from './types.js';
 import type { ComposerModelAvailability } from './composerAvailability.js';
+import type { ReasoningDensity } from './reasoningDensity.js';
 
 // ── DOM refs ──
 
@@ -42,8 +43,9 @@ export interface DomRefs {
   headerVersionEl: HTMLElement | null;
   toggleTodosBtn: HTMLButtonElement | null;
   toggleToolsBtn: HTMLButtonElement | null;
-  toggleReasoningBtn: HTMLButtonElement | null;
+  toggleReasoningBtn: HTMLElement | null;
   toggleAutoDebugBtn: HTMLButtonElement | null;
+  autoDebugHost: HTMLElement | null;
   usageBadge: HTMLElement | null;
   toolDrawer: HTMLElement | null;
   toolDrawerBackdrop: HTMLElement | null;
@@ -83,6 +85,9 @@ export const dom: DomRefs = {} as DomRefs;
 
 export interface AppState {
   ws: WebSocket | null;
+  executionIdentityProtocol: 'unavailable' | 'legacy' | 'strict';
+  socketGeneration: number;
+  legacyExecutionSocketGeneration: number;
   currentMsg: HTMLElement | null;
   busy: boolean;
   storageMode: 'healthy' | 'protected';
@@ -130,6 +135,11 @@ export interface AppState {
   todoPendingFocusId: string | null;
   reasoningPanel: HTMLElement | null;
   activeExecutionStack: HTMLElement | null;
+  terminalExecutionStack: HTMLElement | null;
+  executionRunSequence: number;
+  activeExecutionRunId: number;
+  activeExecutionServerRunId: string;
+  activeExecutionPlanId: string;
   reactStatusRow: HTMLElement | null;
   reactStatusPhase: ReactPhase;
   reactStatusCycle: number | null;
@@ -149,6 +159,7 @@ export interface AppState {
   showTodos: boolean;
   showTools: boolean;
   showReasoning: boolean;
+  reasoningDensity: ReasoningDensity;
   autoDebugEnabled: boolean;
   latestAutoTrace: AutoTraceEvent | null;
   latestCompression: CompressionOutcome | null;
@@ -209,6 +220,9 @@ export interface AppState {
 
 export const state: AppState = {
   ws: null,
+  executionIdentityProtocol: 'unavailable',
+  socketGeneration: 0,
+  legacyExecutionSocketGeneration: 0,
   currentMsg: null,
   busy: false,
   storageMode: 'healthy',
@@ -262,6 +276,11 @@ export const state: AppState = {
   todoPendingFocusId: null,
   reasoningPanel: null,
   activeExecutionStack: null,
+  terminalExecutionStack: null,
+  executionRunSequence: 0,
+  activeExecutionRunId: 0,
+  activeExecutionServerRunId: '',
+  activeExecutionPlanId: '',
   reactStatusRow: null,
   reactStatusPhase: '',
   reactStatusCycle: null,
@@ -284,6 +303,7 @@ export const state: AppState = {
   showTodos: false,
   showTools: true,
   showReasoning: true,
+  reasoningDensity: 'summary',
   autoDebugEnabled: false,
   latestAutoTrace: null,
   latestCompression: null,
@@ -367,12 +387,11 @@ export function initDomRefs() {
   dom.headerVersionEl = document.getElementById('app-version-header');
   dom.toggleTodosBtn = document.getElementById('toggle-todos-btn') as HTMLButtonElement | null;
   dom.toggleToolsBtn = document.getElementById('toggle-tools-btn') as HTMLButtonElement | null;
-  dom.toggleReasoningBtn = document.getElementById(
-    'toggle-reasoning-btn',
-  ) as HTMLButtonElement | null;
+  dom.toggleReasoningBtn = document.getElementById('toggle-reasoning-btn');
   dom.toggleAutoDebugBtn = document.getElementById(
     'toggle-auto-debug-btn',
   ) as HTMLButtonElement | null;
+  dom.autoDebugHost = document.getElementById('auto-debug-host');
   dom.usageBadge = document.getElementById('usage-badge');
   dom.toolDrawer = document.getElementById('tool-drawer');
   dom.toolDrawerBackdrop = document.getElementById('tool-drawer-backdrop');

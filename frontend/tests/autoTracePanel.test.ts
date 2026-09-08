@@ -55,9 +55,11 @@ describe('auto trace debug panel', () => {
   beforeEach(() => {
     document.body.innerHTML = `
       <div id="chat"></div>
+      <aside id="auto-debug-host" hidden></aside>
       <button id="toggle-auto-debug-btn"></button>
     `;
     dom.chat = document.getElementById('chat') as HTMLElement;
+    dom.autoDebugHost = document.getElementById('auto-debug-host') as HTMLElement;
     dom.toggleAutoDebugBtn = document.getElementById('toggle-auto-debug-btn') as HTMLButtonElement;
     state.autoFollowChat = true;
     state.bulkRenderingChat = false;
@@ -75,6 +77,7 @@ describe('auto trace debug panel', () => {
     state.autoDebugRow = null;
     document.body.innerHTML = '';
     dom.chat = null;
+    dom.autoDebugHost = null;
     dom.toggleAutoDebugBtn = null;
   });
 
@@ -182,6 +185,12 @@ describe('auto trace debug panel', () => {
     expect(panel?.textContent).toContain('ready_signal=no');
     expect(panel?.textContent).toContain('blocked_signal=yes');
     expect(panel?.textContent).toContain('retry=same_tool');
+    expect(dom.chat?.contains(panel)).toBe(false);
+    expect(dom.autoDebugHost?.contains(panel)).toBe(true);
+    expect(dom.autoDebugHost?.hidden).toBe(false);
+    const close = panel?.querySelector<HTMLButtonElement>('[data-action="close-auto-debug"]');
+    expect(close?.getAttribute('aria-label')).toBe('Close');
+    expect(close?.querySelector('svg.icon')).not.toBeNull();
   });
 
   it('updates the existing panel when a newer trace arrives', () => {
@@ -198,6 +207,17 @@ describe('auto trace debug panel', () => {
     expect(panels).toHaveLength(1);
     expect(panels[0].textContent).toContain('selected=xhigh');
     expect(panels[0].textContent).toContain('retry_same_args');
+  });
+
+  it('removes diagnostics and hides its host without changing the chat log', () => {
+    dom.chat?.appendChild(document.createElement('div'));
+    applyAutoTrace(sampleTrace());
+    setAutoDebugEnabled(true);
+    setAutoDebugEnabled(false);
+
+    expect(document.querySelector('[data-auto-trace-panel="true"]')).toBeNull();
+    expect(dom.autoDebugHost?.hidden).toBe(true);
+    expect(dom.chat?.children).toHaveLength(1);
   });
 
   it('clears stale compression at start when react updates are disabled', () => {

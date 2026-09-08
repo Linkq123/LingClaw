@@ -13,6 +13,7 @@ import { scrollDown } from '../scroll.js';
 import { animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import {
   mountExecutionPanel,
+  linkExecutionDelegate,
   refreshExecutionStackForPanel,
   resumeExecutionStackAutoCollapse,
 } from './execution-stack.js';
@@ -33,6 +34,7 @@ import {
 import { iconMarkup } from '../icons.js';
 import { tr } from '../i18n.js';
 import { trapDialogFocus } from '../pages/dialogFocus.js';
+import { displayReasoningText, summarizeReasoningText } from './reasoning.js';
 
 type SubagentPanelRef = {
   task_id?: string;
@@ -64,9 +66,7 @@ type ToolCounts = {
   running: number;
 };
 
-type TextNodeHost = HTMLElement & {
-  _textNode?: Text;
-};
+const subagentReasoningText = new WeakMap<HTMLElement, string>();
 
 const LABELS = {
   get subagent() {
@@ -165,8 +165,23 @@ function getReasoningMeta(panel): HTMLElement | null {
   return (panel as Element).querySelector('[data-subagent-reasoning-meta]') as HTMLElement | null;
 }
 
-function getReasoningBody(panel): TextNodeHost | null {
-  return (panel as Element).querySelector('[data-subagent-reasoning-body]') as TextNodeHost | null;
+function getReasoningBody(panel): HTMLElement | null {
+  return (panel as Element).querySelector('[data-subagent-reasoning-body]') as HTMLElement | null;
+}
+
+function syncSubagentReasoningBody(panel: HTMLElement): void {
+  const body = getReasoningBody(panel);
+  if (!body) return;
+  const raw = subagentReasoningText.get(body) || '';
+  body.textContent = displayReasoningText(raw, state.reasoningDensity);
+  body.dataset.reasoningDensity = state.reasoningDensity;
+  body.setAttribute('aria-label', tr(`reasoning.${state.reasoningDensity}Aria`));
+}
+
+export function syncSubagentReasoningDensity(root: ParentNode = document): void {
+  root
+    .querySelectorAll<HTMLElement>('.subagent-panel')
+    .forEach((panel) => syncSubagentReasoningBody(panel));
 }
 
 export function ensurePromptCard(panel) {
@@ -704,6 +719,31 @@ function registerSubagentPanel(panel, taskId, agentName) {
   state.activeSubagentPanels.set(panelKey({ task_id: taskId, agent: agentName }), panel);
 }
 
+function syncSubagentExecutionSemantics(panel: HTMLElement): void {
+  const agent = panel.dataset.agent || tr('execution.subagent');
+  const prompt = panel.querySelector<HTMLElement>('.subagent-prompt')?.textContent?.trim() || '';
+  const status = panel.querySelector<HTMLElement>('.subagent-status')?.textContent?.trim() || '';
+  const outcome = panel.dataset.finalError || panel.dataset.finalSummaryBody || '';
+  panel.dataset.executionAction = tr('execution.delegate');
+  panel.dataset.executionObject = [agent, prompt ? reasoningPreview(prompt) : '']
+    .filter(Boolean)
+    .join(' · ');
+  panel.dataset.executionResult = [status, outcome ? reasoningPreview(outcome, '') : '']
+    .filter(Boolean)
+    .join(': ');
+  panel.dataset.executionState = panel.classList.contains('subagent-failed')
+    ? 'failed'
+    : panel.classList.contains('subagent-done')
+      ? 'completed'
+      : panel.classList.contains('subagent-skipped')
+        ? 'skipped'
+        : 'running';
+  const kicker = panel.querySelector<HTMLElement>('.subagent-kicker');
+  const label = panel.querySelector<HTMLElement>('.subagent-label');
+  if (kicker) kicker.textContent = tr('execution.delegate');
+  if (label) label.textContent = panel.dataset.executionObject;
+}
+
 function buildSubagentPanel(agentName, prompt, taskId) {
   const displayPrompt = stripDelegatedPromptRuntimeContext(prompt);
   const panel = document.createElement('div');
@@ -720,7 +760,7 @@ function buildSubagentPanel(agentName, prompt, taskId) {
   header.innerHTML = `
     <span class="subagent-icon">${iconMarkup('user-node')}</span>
     <span class="subagent-head-copy">
-      <span class="subagent-kicker" data-i18n="execution.subagent">${LABELS.subagent}</span>
+      <span class="subagent-kicker">${tr('execution.delegate')}</span>
       <span class="subagent-label">${escHtml(agentName)}</span>
     </span>
     <span class="subagent-status">${LABELS.running}</span>
@@ -784,6 +824,7 @@ function buildSubagentPanel(agentName, prompt, taskId) {
 
   syncToolOverview(panel);
   syncPanelActions(panel);
+  syncSubagentExecutionSemantics(panel);
   return panel;
 }
 
@@ -796,7 +837,7 @@ export function createDetachedSubagentPanel(agentName, prompt, taskId) {
   return panel;
 }
 
-export function createSubagentPanel(agentName, prompt, taskId) {
+export function createSubagentPanel(agentName, prompt, taskId, parentToolCallId?: string) {
   const existing = resolvePanel({
     task_id: taskId,
     agent: agentName,
@@ -804,6 +845,7 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   });
   if (existing) {
     updateSubagentPrompt({ task_id: taskId, agent: agentName }, prompt);
+    linkExecutionDelegate(existing, parentToolCallId);
     return existing;
   }
 
@@ -811,6 +853,7 @@ export function createSubagentPanel(agentName, prompt, taskId) {
 
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
   mountExecutionPanel(panel, 'subagent', currentRow);
+  linkExecutionDelegate(panel, parentToolCallId);
   pinReactStatusToBottom();
   animatePanelIn(panel);
   scrollDown();
@@ -829,6 +872,7 @@ export function updateSubagentPrompt(ref: SubagentPanelRef, prompt, { allowBlank
   const promptCard = ensurePromptCard(panel);
   const promptEl = promptCard?.querySelector('.subagent-prompt');
   if (promptEl) promptEl.textContent = displayPrompt;
+  syncSubagentExecutionSemantics(panel);
 }
 
 export function addSubagentTool(ref: SubagentPanelRef, toolName, toolId, toolArgs = '') {
@@ -893,7 +937,7 @@ function subagentCompletionStatus(panel: HTMLElement): string {
 export function refreshSubagentPanelsLanguage(): void {
   document.querySelectorAll<HTMLElement>('.subagent-panel').forEach((panel) => {
     const kicker = panel.querySelector<HTMLElement>('.subagent-kicker');
-    if (kicker) kicker.textContent = LABELS.subagent;
+    if (kicker) kicker.textContent = tr('execution.delegate');
     if (panel.classList.contains('subagent-modal-open')) {
       panel.setAttribute(
         'aria-label',
@@ -940,8 +984,10 @@ export function refreshSubagentPanelsLanguage(): void {
     }
 
     if (!panel.classList.contains('subagent-active')) renderSummary(panel);
+    syncSubagentReasoningBody(panel);
     syncPanelActions(panel);
     syncSubagentModalPlaceholder(panel);
+    syncSubagentExecutionSemantics(panel);
   });
 }
 
@@ -991,15 +1037,12 @@ export function startSubagentReasoning(ref: SubagentPanelRef) {
   if (!card || !body) return;
   card.dataset.reasoningActive = 'true';
 
-  if (!body._textNode) {
-    body.textContent = '';
-    body._textNode = document.createTextNode('');
-    body.appendChild(body._textNode);
-  }
-
   const cycleLabel = panel.querySelector('[data-subagent-chip="cycle"]')?.textContent?.trim() || '';
-  if ((body._textNode.nodeValue || '').trim()) body._textNode.nodeValue += '\n\n';
-  if (cycleLabel) body._textNode.nodeValue += `[${cycleLabel}]\n`;
+  let raw = subagentReasoningText.get(body) || '';
+  if (raw.trim()) raw += '\n\n';
+  if (cycleLabel) raw += `[${cycleLabel}]\n`;
+  subagentReasoningText.set(body, raw);
+  syncSubagentReasoningBody(panel);
 
   card.hidden = false;
   if (meta) {
@@ -1020,14 +1063,9 @@ export function appendSubagentReasoning(ref: SubagentPanelRef, content) {
   const body = getReasoningBody(panel);
   if (!card || !body) return;
 
-  if (!body._textNode) {
-    body.textContent = '';
-    body._textNode = document.createTextNode('');
-    body.appendChild(body._textNode);
-  }
-
   card.hidden = false;
-  body._textNode.nodeValue += content;
+  subagentReasoningText.set(body, `${subagentReasoningText.get(body) || ''}${content}`);
+  syncSubagentReasoningBody(panel);
   scrollDown();
 }
 
@@ -1041,10 +1079,10 @@ export function finishSubagentReasoning(ref: SubagentPanelRef) {
   const card = getReasoningCard(panel);
   if (card) card.dataset.reasoningActive = 'false';
 
-  const rawText = body._textNode?.nodeValue || body.textContent || '';
-  const preview = reasoningPreview(rawText);
+  const rawText = subagentReasoningText.get(body) || '';
+  const preview = summarizeReasoningText(rawText).previewText;
   meta.textContent = preview;
-  meta.title = rawText.trim() || LABELS.completed;
+  meta.title = preview;
 }
 
 export function restoreSubagentHistorySnapshot(
@@ -1060,14 +1098,13 @@ export function restoreSubagentHistorySnapshot(
     const body = getReasoningBody(panel);
     const meta = getReasoningMeta(panel);
     if (card && body) {
-      body.textContent = '';
-      body._textNode = document.createTextNode(reasoning);
-      body.appendChild(body._textNode);
+      subagentReasoningText.set(body, reasoning);
+      syncSubagentReasoningBody(panel);
       card.hidden = false;
       if (meta) {
-        const preview = reasoningPreview(reasoning);
+        const preview = summarizeReasoningText(reasoning).previewText;
         meta.textContent = preview;
-        meta.title = reasoning;
+        meta.title = preview;
       }
     }
   }
@@ -1201,6 +1238,7 @@ export function finishSubagentPanel(
   renderSummary(panel);
   syncToolCount(panel, stats.tool_calls ?? null);
   syncPanelActions(panel);
+  syncSubagentExecutionSemantics(panel);
   syncSubagentModalPlaceholder(panel);
   refreshExecutionStackForPanel(panel);
 

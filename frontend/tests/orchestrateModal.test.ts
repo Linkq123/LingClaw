@@ -73,6 +73,13 @@ describe('orchestrate task modal hosting', () => {
   it('uses the shared workflow and task status icons', () => {
     mountOrchestration();
 
+    const panel = dom.chat?.querySelector('.orchestrate-panel') as HTMLElement | null;
+    expect(panel?.querySelector('.orchestrate-label')?.textContent).toBe(
+      'Coordinate · 1 tasks · 1 layers',
+    );
+    expect(panel?.dataset.executionAction).toBe('Coordinate');
+    expect(panel?.dataset.executionResult).toContain('0/1');
+
     expect(dom.chat?.querySelector('.orchestrate-icon use')?.getAttribute('href')).toBe(
       '#icon-workflow',
     );
@@ -508,7 +515,7 @@ describe('orchestrate task modal hosting', () => {
     setLanguage('zh-CN');
     refreshSubagentPanelsLanguage();
     refreshOrchestratePanelsLanguage();
-    expect(label?.textContent).toBe('编排 · 2 个任务 · 2 层');
+    expect(label?.textContent).toBe('协调 · 2 个任务 · 2 层');
   });
 
   it('refreshes task rows, progress, layers, and summary in an open orchestration', () => {

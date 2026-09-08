@@ -1,4 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// These model-policy unit tests hold transport ready. Real connection/identity
+// transitions are exercised through main.ts and socket.ts in composerTransport.test.ts.
+vi.mock('../src/composerTransport.js', () => ({
+  composerTransportAvailability: () => 'ready',
+  composerTransportReasonKey: () => '',
+}));
 import { setLanguage } from '../src/i18n.js';
 import { dom, initDomRefs, state } from '../src/state.js';
 import {

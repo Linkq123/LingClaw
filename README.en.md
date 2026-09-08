@@ -107,7 +107,7 @@ lingclaw db status
 lingclaw db backup
 ```
 
-Sessions, groups, messages, todos, usage, working-directory bindings, and sub-agent snapshots live in `~/.lingclaw/lingclaw.db`. On upgrade from the JSON store, LingClaw validates and migrates the old `sessions/` and `groups/` directories before serving HTTP requests. The originals remain permanently under `~/.lingclaw/backups/sqlite-migration-*/`; LingClaw does not dual-write them.
+Sessions, groups, messages, top-level terminal outcomes, todos, usage, working-directory bindings, and sub-agent snapshots live in `~/.lingclaw/lingclaw.db`. A refresh, reconnect, or daemon restart therefore restores the server-recorded completed, failed, or stopped execution state and duration; only pre-upgrade history without a terminal fact degrades conservatively to incomplete. On upgrade from the JSON store, LingClaw validates and migrates the old `sessions/` and `groups/` directories before serving HTTP requests. The originals remain permanently under `~/.lingclaw/backups/sqlite-migration-*/`; LingClaw does not dual-write them.
 
 See the [deployment guide](docs/deploy.en.md) for installation details, systemd, Docker, and reverse proxies.
 
@@ -153,7 +153,7 @@ Sessions can maintain a human-readable `MEMORY.md`, daily notes, optional Struct
 
 ### A readable execution trail
 
-Reasoning, Tool, Task Plan, Sub-agent, and Orchestration steps share one execution stack. Completed runs retain a compact summary; expanded runs reveal every step. Arguments, results, and images live in a separate inspector instead of crowding the conversation.
+Reasoning, Tool, execution-outline, Sub-agent, Orchestration, and ReAct phase steps share one execution stack. Only runs explicitly reported complete by the backend auto-collapse; failed, blocked, waiting, stopped, and incomplete outcomes keep a dynamically resolved recovery entry visible, while manual disclosure always wins. The summary names the current action and object, progress, verification, artifacts, failure point, and unresolved work. A later success for the same Tool/target keeps earlier failures inspectable but removes them from unresolved work; transient model retry attempts do not duplicate a final error across notices, cards, and the stack. Summary and Normal expose only derived trace metadata; raw thinking enters the DOM only in explicit Verbose mode. Auto Debug is a closable dock between recent messages and the composer, outside the conversation timeline and never over the input, while arguments, results, and images live in a separate inspector.
 
 ### Group conversations built for coordination
 

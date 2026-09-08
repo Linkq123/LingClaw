@@ -835,7 +835,40 @@ pub(crate) async fn run_subagent(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_subagent_with_working_directory(
+pub(crate) fn run_subagent_with_working_directory<'a>(
+    spec: &'a SubAgentSpec,
+    prompt: &'a str,
+    config: &'a Config,
+    http: &'a Client,
+    session_home: &'a Path,
+    working_directory: &'a Path,
+    parent_live_tx: &'a LiveTx,
+    cancel: CancellationToken,
+    hooks: &'a HookRegistry,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
+    task_id: &'a str,
+) -> Pin<Box<dyn Future<Output = SubAgentOutcome> + Send + 'a>> {
+    // This executor intentionally crosses a type-erased heap boundary.  Its
+    // complete ReAct state machine is large enough that embedding the concrete
+    // future in the parent Agent's Tokio poll chain can exhaust the default
+    // Windows worker stack before the first provider request is made.
+    Box::pin(run_subagent_with_working_directory_inner(
+        spec,
+        prompt,
+        config,
+        http,
+        session_home,
+        working_directory,
+        parent_live_tx,
+        cancel,
+        hooks,
+        replay_ctx,
+        task_id,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_with_working_directory_inner(
     spec: &SubAgentSpec,
     prompt: &str,
     config: &Config,
@@ -2100,6 +2133,43 @@ mod tests {
             .expect("system time should be after unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}"))
+    }
+
+    #[test]
+    fn subagent_executor_exposes_a_heap_boxed_poll_boundary() {
+        let spec = SubAgentSpec {
+            name: "explore".into(),
+            description: String::new(),
+            system_prompt: "Inspect the workspace.".into(),
+            max_turns: 1,
+            tools: Default::default(),
+            mcp_policy: None,
+            source: Default::default(),
+            path: String::new(),
+        };
+        let config = test_config();
+        let http = Client::new();
+        let workspace = PathBuf::from(".");
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(1);
+        let hooks = HookRegistry::new();
+        let future = run_subagent_with_working_directory(
+            &spec,
+            "Inspect the workspace.",
+            &config,
+            &http,
+            &workspace,
+            &workspace,
+            &live_tx,
+            CancellationToken::new(),
+            &hooks,
+            None,
+            "boxed-boundary",
+        );
+
+        assert!(
+            std::mem::size_of_val(&future) <= 2 * std::mem::size_of::<usize>(),
+            "the concrete executor future must not be embedded in the parent Tokio poll chain"
+        );
     }
 
     #[tokio::test]

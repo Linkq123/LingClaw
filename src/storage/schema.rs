@@ -1,5 +1,5 @@
 pub(crate) const APPLICATION_ID: i64 = 0x4C_43_4C_57;
-pub(crate) const SCHEMA_VERSION: i64 = 6;
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 pub(crate) const INITIAL_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -50,6 +50,25 @@ CREATE TABLE IF NOT EXISTS session_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_session_messages_tool_call
     ON session_messages(session_id, tool_call_id) WHERE tool_call_id IS NOT NULL;
+
+CREATE TABLE session_run_outcomes (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    run_connection_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    reason TEXT,
+    duration_ms INTEGER NOT NULL,
+    start_message_index INTEGER NOT NULL,
+    end_message_index INTEGER NOT NULL,
+    plan_id TEXT,
+    plan_revision INTEGER,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, run_id)
+);
+CREATE INDEX idx_session_run_outcomes_boundary
+    ON session_run_outcomes(session_id, end_message_index, finished_at, run_id);
 
 CREATE TABLE IF NOT EXISTS session_skills (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -237,6 +256,27 @@ CREATE TABLE IF NOT EXISTS group_runs (
     PRIMARY KEY (group_id, run_id),
     UNIQUE (group_id, position)
 );
+"#;
+
+pub(crate) const SESSION_RUN_OUTCOMES_SCHEMA: &str = r#"
+CREATE TABLE session_run_outcomes (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    run_connection_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    reason TEXT,
+    duration_ms INTEGER NOT NULL,
+    start_message_index INTEGER NOT NULL,
+    end_message_index INTEGER NOT NULL,
+    plan_id TEXT,
+    plan_revision INTEGER,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, run_id)
+);
+CREATE INDEX idx_session_run_outcomes_boundary
+    ON session_run_outcomes(session_id, end_message_index, finished_at, run_id);
 "#;
 
 pub(crate) const PLAN_LIFECYCLE_SCHEMA: &str = r#"

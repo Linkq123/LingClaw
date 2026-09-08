@@ -190,6 +190,7 @@ export function addSystem(t, kind = 'info', options: { dismissible?: boolean } =
   queueUnreadContent({ countable: true });
   pinReactStatusToBottom();
   scrollDown();
+  return row;
 }
 
 export function addError(t, options: { dismissible?: boolean } = {}) {
@@ -208,6 +209,7 @@ export function addError(t, options: { dismissible?: boolean } = {}) {
   queueUnreadContent({ countable: true });
   pinReactStatusToBottom();
   scrollDown();
+  return row;
 }
 
 export function showWelcome() {

@@ -1,105 +1,86 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { dom, state } from '../src/state.js';
 import {
+  appendLiveReasoningText,
   buildHistoryReasoningPanel,
+  createLiveReasoningPanel,
   finalizeOrDiscardLiveReasoningPanel,
   finalizeLiveReasoningPanel,
+  reasoningTextForTest,
   summarizeReasoningText,
+  syncReasoningPanelsDensity,
 } from '../src/renderers/reasoning.js';
+import { mountExecutionPanel } from '../src/renderers/execution-stack.js';
 import { wrapInTimeline } from '../src/renderers/timeline.js';
 
-describe('buildHistoryReasoningPanel', () => {
-  it('sets body.textContent to the full thinking text', () => {
-    const panel = buildHistoryReasoningPanel('deep reasoning step');
-    const body = panel.querySelector<HTMLElement>('.reasoning-body');
-    expect(body).not.toBeNull();
-    expect(body!.textContent).toBe('deep reasoning step');
+describe('density-aware reasoning panels', () => {
+  beforeEach(() => {
+    document.body.innerHTML = '<div id="chat"></div>';
+    dom.chat = document.getElementById('chat') as HTMLElement;
+    state.activeExecutionStack = null;
+    state.reasoningDensity = 'summary';
   });
 
-  it('does not set a _textNode property on body (dead code guard)', () => {
-    const panel = buildHistoryReasoningPanel('some thinking');
-    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: unknown };
-    expect(body._textNode).toBeUndefined();
+  it('defaults history replay to a bounded Summary without inserting the raw tail', () => {
+    const raw = `${'analysis '.repeat(50)}PRIVATE_RAW_TAIL`;
+    const panel = buildHistoryReasoningPanel(raw);
+
+    expect(panel.dataset.reasoningDensity).toBe('summary');
+    expect(panel.textContent).not.toContain('PRIVATE_RAW_TAIL');
+    expect(panel.querySelector('.reasoning-body')?.textContent?.length).toBeLessThanOrEqual(221);
+    expect(reasoningTextForTest(panel)).toBe(raw);
+    expect(panel.querySelector('.reasoning-status')?.getAttribute('title')).not.toContain(
+      'PRIVATE_RAW_TAIL',
+    );
   });
 
-  it('sets statusEl.title to trimmed single-line summary text', () => {
-    const panel = buildHistoryReasoningPanel('hello world');
-    const statusEl = panel.querySelector<HTMLElement>('.reasoning-status');
-    expect(statusEl?.title).toBe('hello world');
+  it('renders Normal as derived trace metadata and Verbose as the full trace', () => {
+    const raw = `${'head '.repeat(240)}TAIL_SENTINEL`;
+    const panel = buildHistoryReasoningPanel(raw);
+    document.body.appendChild(panel);
+
+    state.reasoningDensity = 'normal';
+    syncReasoningPanelsDensity();
+    const normal = panel.querySelector('.reasoning-body')?.textContent || '';
+    expect(normal).not.toContain('TAIL_SENTINEL');
+    expect(normal).toContain('Reasoning trace retained');
+    expect(normal.length).toBeLessThan(raw.length);
+
+    state.reasoningDensity = 'verbose';
+    syncReasoningPanelsDensity();
+    expect(panel.querySelector('.reasoning-body')?.textContent).toBe(raw);
   });
 
-  it('collapses runs of newlines into a single space for statusEl.title', () => {
-    const panel = buildHistoryReasoningPanel('line one\n\nline two');
-    const statusEl = panel.querySelector<HTMLElement>('.reasoning-status');
-    // /\n+/ replaces one-or-more consecutive newlines with a single space
-    expect(statusEl?.title).toBe('line one line two');
+  it('keeps live raw reasoning off-DOM in Summary while updating its accessible preview', () => {
+    const panel = createLiveReasoningPanel();
+    document.body.appendChild(panel);
+    appendLiveReasoningText(panel, `${'working '.repeat(40)}LIVE_PRIVATE_TAIL`);
+
+    expect(panel.textContent).not.toContain('LIVE_PRIVATE_TAIL');
+    expect(reasoningTextForTest(panel)).toContain('LIVE_PRIVATE_TAIL');
+    expect(panel.querySelector('.reasoning-body')?.getAttribute('aria-label')).toBe(
+      'Concise reasoning summary',
+    );
   });
 
-  it('shows full preview text (≤60 chars) without ellipsis', () => {
-    const panel = buildHistoryReasoningPanel('short text');
-    const statusEl = panel.querySelector<HTMLElement>('.reasoning-status');
-    expect(statusEl?.textContent).toBe('short text');
-    expect(statusEl?.title).toBe('short text');
+  it('preserves the in-memory raw trace across density changes and finalization', () => {
+    const panel = createLiveReasoningPanel();
+    appendLiveReasoningText(panel, 'first line\n\nsecond line');
+    expect(finalizeLiveReasoningPanel(panel)).toBe(true);
+    expect(reasoningTextForTest(panel)).toBe('first line\n\nsecond line');
+    expect(panel.querySelector('.reasoning-status')?.textContent).toContain('Reasoning trace');
+    expect(panel.dataset.executionState).toBe('completed');
   });
 
-  it('truncates statusEl.textContent with … and preserves full title for long thinking', () => {
-    const long = 'a'.repeat(80);
-    const panel = buildHistoryReasoningPanel(long);
-    const statusEl = panel.querySelector<HTMLElement>('.reasoning-status');
-    expect(statusEl?.textContent).toBe('a'.repeat(60) + '\u2026');
-    expect(statusEl?.title).toBe(long);
-  });
-
-  it('does not add … when thinking is exactly 60 characters', () => {
-    const exact = 'b'.repeat(60);
-    const panel = buildHistoryReasoningPanel(exact);
-    const statusEl = panel.querySelector<HTMLElement>('.reasoning-status');
-    expect(statusEl?.textContent).toBe(exact);
-    expect(statusEl?.title).toBe(exact);
-  });
-
-  it('falls back to the localized completed label when thinking trims to empty', () => {
-    const panel = buildHistoryReasoningPanel('   \n  ');
-    const statusEl = panel.querySelector<HTMLElement>('.reasoning-status');
-    expect(statusEl?.title).toBe('Completed');
-    expect(statusEl?.textContent).toBe('Completed');
-  });
-
-  it('marks whitespace-only reasoning as empty summary content', () => {
-    const summary = summarizeReasoningText('   \n  ');
-    expect(summary.hasContent).toBe(false);
-    expect(summary.previewText).toBe('Completed');
-    expect(summary.titleText).toBe('Completed');
-  });
-
-  it('drops live reasoning panels that only contain whitespace', () => {
-    const panel = document.createElement('div');
-    panel.innerHTML = `
-      <div class="reasoning-header">
-        <span class="reasoning-status">推理中</span>
-      </div>
-      <div class="reasoning-body"></div>
-    `;
-
-    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: Text };
-    body._textNode = document.createTextNode('   \n  ');
-    body.appendChild(body._textNode);
-
+  it('drops live reasoning panels that contain only whitespace', () => {
+    const panel = createLiveReasoningPanel();
+    appendLiveReasoningText(panel, '   \n  ');
     expect(finalizeLiveReasoningPanel(panel)).toBe(false);
   });
 
-  it('removes the timeline wrapper when discarding an empty live reasoning panel', () => {
-    const panel = document.createElement('div');
-    panel.innerHTML = `
-      <div class="reasoning-header">
-        <span class="reasoning-status">推理中</span>
-      </div>
-      <div class="reasoning-body"></div>
-    `;
-
-    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: Text };
-    body._textNode = document.createTextNode('   \n  ');
-    body.appendChild(body._textNode);
-
+  it('removes the owning timeline wrapper when empty reasoning is discarded', () => {
+    const panel = createLiveReasoningPanel();
+    appendLiveReasoningText(panel, '   ');
     const wrapper = wrapInTimeline(panel, 'reasoning');
     document.body.appendChild(wrapper);
 
@@ -107,54 +88,58 @@ describe('buildHistoryReasoningPanel', () => {
     expect(wrapper.isConnected).toBe(false);
   });
 
-  it('keeps live reasoning panels with real content and updates their summary', () => {
+  it('keeps a non-empty panel when finalizing a replay-compatible legacy body', () => {
     const panel = document.createElement('div');
     panel.innerHTML = `
-      <div class="reasoning-header">
-        <span class="reasoning-status">推理中</span>
-      </div>
-      <div class="reasoning-body"></div>
+      <div class="reasoning-header"><span class="reasoning-status"></span></div>
+      <div class="reasoning-body">legacy reasoning</div>
     `;
-
-    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: Text };
-    const statusEl = panel.querySelector('.reasoning-status') as HTMLElement;
-    body._textNode = document.createTextNode('first line\n\nsecond line');
-    body.appendChild(body._textNode);
-
     expect(finalizeLiveReasoningPanel(panel)).toBe(true);
-    expect(statusEl.textContent).toBe('first line second line');
-    expect(statusEl.title).toBe('first line second line');
+    expect(panel.querySelector('.reasoning-status')?.textContent).toContain('Reasoning trace');
   });
 
-  it('keeps the timeline wrapper when finalizing a non-empty live reasoning panel', () => {
-    const panel = document.createElement('div');
-    panel.innerHTML = `
-      <div class="reasoning-header">
-        <span class="reasoning-status">推理中</span>
-      </div>
-      <div class="reasoning-body"></div>
-    `;
-
-    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: Text };
-    body._textNode = document.createTextNode('first line\n\nsecond line');
-    body.appendChild(body._textNode);
-
-    const wrapper = wrapInTimeline(panel, 'reasoning');
-    document.body.appendChild(wrapper);
-
-    expect(finalizeOrDiscardLiveReasoningPanel(panel)).toBe(true);
-    expect(wrapper.isConnected).toBe(true);
+  it('normalizes whitespace and marks empty summaries', () => {
+    expect(summarizeReasoningText('line one\n\nline two').previewText).toContain('Reasoning trace');
+    expect(summarizeReasoningText('   \n  ').hasContent).toBe(false);
+    expect(summarizeReasoningText('   \n  ').previewText).toBe('Completed');
   });
 
-  it('panel has class reasoning-panel and header has class reasoning-header', () => {
-    const panel = buildHistoryReasoningPanel('some text');
-    expect(panel.classList.contains('reasoning-panel')).toBe(true);
-    const header = panel.querySelector('.reasoning-header');
-    expect(header).not.toBeNull();
-    expect((header as HTMLElement).dataset.action).toBe('toggle-tool');
-    expect(header?.querySelector('.reasoning-icon use')?.getAttribute('href')).toBe(
-      '#icon-reasoning',
-    );
-    expect(header?.querySelector('.chevron use')?.getAttribute('href')).toBe('#icon-chevron-right');
+  it('keeps keyboard disclosure semantics for history and live panels', () => {
+    const history = buildHistoryReasoningPanel('some text');
+    const live = createLiveReasoningPanel();
+    expect(history.querySelector('.reasoning-header')?.getAttribute('aria-expanded')).toBe('false');
+    expect(live.querySelector('.reasoning-header')?.getAttribute('aria-expanded')).toBe('true');
+    expect(history.querySelector('.reasoning-header')?.getAttribute('aria-controls')).toBeTruthy();
+  });
+
+  it.each(['summary', 'normal'] as const)(
+    'never inserts a short raw sentinel into the DOM at %s density',
+    (density) => {
+      const raw = 'SHORT_UNIQUE_REASONING_SENTINEL';
+      state.reasoningDensity = density;
+      const panel = buildHistoryReasoningPanel(raw);
+      mountExecutionPanel(panel, 'reasoning');
+      const stack = panel.closest<HTMLElement>('.execution-stack')!;
+
+      expect(reasoningTextForTest(panel)).toBe(raw);
+      expect(panel.querySelector('.reasoning-body')?.textContent).not.toContain(raw);
+      expect(panel.textContent).not.toContain(raw);
+      expect(panel.outerHTML).not.toContain(raw);
+      expect(panel.querySelector('.reasoning-status')?.getAttribute('title')).not.toContain(raw);
+      expect(Object.values(panel.dataset).join(' ')).not.toContain(raw);
+      expect(stack.textContent).not.toContain(raw);
+      expect(
+        stack.querySelector('.execution-stack-header')?.getAttribute('aria-label'),
+      ).not.toContain(raw);
+    },
+  );
+
+  it('allows the short raw trace only after Verbose is explicitly selected', () => {
+    const raw = 'SHORT_VERBOSE_REASONING_SENTINEL';
+    state.reasoningDensity = 'verbose';
+    const panel = buildHistoryReasoningPanel(raw);
+
+    expect(panel.querySelector('.reasoning-body')?.textContent).toBe(raw);
+    expect(panel.textContent).toContain(raw);
   });
 });

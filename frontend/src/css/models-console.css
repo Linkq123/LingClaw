@@ -1,6 +1,6 @@
 .models-console {
-  --models-console-accent: #6554d9;
-  --models-console-accent-hover: #5848c7;
+  --models-console-accent: var(--color-action);
+  --models-console-accent-hover: var(--color-action-hover);
   display: grid;
   align-content: start;
   gap: 18px;

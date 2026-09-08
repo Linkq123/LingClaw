@@ -10,6 +10,50 @@ async fn spawn_test_http_server(router: axum::Router) -> (String, tokio::task::J
     (format!("http://{address}"), task)
 }
 
+async fn spawn_protocol_websocket_server(
+    initial_payload: Value,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Value>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let payload = std::sync::Arc::new(std::sync::Mutex::new(initial_payload));
+    let websocket_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let websocket_targets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let config_payload = payload.clone();
+    let websocket_count_for_route = websocket_count.clone();
+    let websocket_targets_for_route = websocket_targets.clone();
+    let router = axum::Router::new()
+        .route(
+            "/api/client-config",
+            axum::routing::get(move || {
+                let payload = config_payload
+                    .lock()
+                    .expect("protocol test payload lock")
+                    .clone();
+                async move { axum::Json(payload) }
+            }),
+        )
+        .route(
+            "/ws",
+            axum::routing::get(
+                move |upgrade: axum::extract::ws::WebSocketUpgrade, uri: axum::http::Uri| {
+                    websocket_count_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    websocket_targets_for_route
+                        .lock()
+                        .expect("protocol test target lock")
+                        .push(uri.to_string());
+                    async move { upgrade.on_upgrade(|_| async {}) }
+                },
+            ),
+        );
+    let (base, task) = spawn_test_http_server(router).await;
+    (base, payload, websocket_count, websocket_targets, task)
+}
+
 #[tokio::test]
 async fn health_probe_rejects_unrelated_successful_services() {
     let unrelated = axum::Router::new().route(
@@ -64,6 +108,248 @@ fn health_probe_rejects_legacy_daemons_that_lack_workspace_capabilities() {
         })),
         DaemonHealth::Unavailable
     );
+}
+
+#[tokio::test]
+async fn client_capabilities_negotiate_strict_legacy_and_unsupported_execution_identity() {
+    for (payload, expected) in [
+        (
+            json!({
+                "features": {"groups": true},
+                "protocols": {"execution_identity": crate::EXECUTION_IDENTITY_PROTOCOL_VERSION}
+            }),
+            Some(ExecutionIdentityProtocol::Strict),
+        ),
+        (
+            json!({"features": {"groups": false}}),
+            Some(ExecutionIdentityProtocol::Legacy),
+        ),
+        (
+            json!({
+                "features": {"groups": false},
+                "protocols": {"execution_identity": 99}
+            }),
+            None,
+        ),
+    ] {
+        let router = axum::Router::new().route(
+            "/api/client-config",
+            axum::routing::get(move || {
+                let payload = payload.clone();
+                async move { axum::Json(payload) }
+            }),
+        );
+        let (base, task) = spawn_test_http_server(router).await;
+        let result = fetch_client_capabilities(&Client::new(), &base).await;
+        match expected {
+            Some(protocol) => {
+                let capabilities = result.expect("supported capability should negotiate");
+                assert_eq!(capabilities.execution_identity_protocol, protocol);
+                assert_eq!(
+                    capabilities.groups_enabled,
+                    protocol == ExecutionIdentityProtocol::Strict
+                );
+            }
+            None => assert!(
+                result
+                    .expect_err("unknown execution identity version must fail")
+                    .to_string()
+                    .contains("unsupported daemon execution identity protocol")
+            ),
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn every_tui_socket_generation_renegotiates_before_websocket_io() {
+    let strict = json!({
+        "features": {"groups": true},
+        "protocols": {"execution_identity": crate::EXECUTION_IDENTITY_PROTOCOL_VERSION}
+    });
+    let (base, payload, websocket_count, websocket_targets, task) =
+        spawn_protocol_websocket_server(strict.clone()).await;
+    let client = build_control_client(Duration::from_secs(1)).unwrap();
+    let mut app = test_app(true);
+
+    let mut first = connect_socket_for_app(&client, &base, "main", None, &mut app)
+        .await
+        .expect("initial strict socket should connect");
+    mark_socket_connected(&mut app);
+    assert_eq!(websocket_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let _ = first.close(None).await;
+
+    *payload.lock().unwrap() = json!({"features":{"groups":true}});
+    let legacy_error = connect_socket_for_app(&client, &base, "main", None, &mut app)
+        .await
+        .expect_err("strict to legacy must fail before a second websocket");
+    assert!(
+        legacy_error
+            .to_string()
+            .contains("older daemon cannot open a second")
+    );
+    assert_eq!(websocket_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    *payload.lock().unwrap() = json!({
+        "features":{"groups":true},
+        "protocols":{"execution_identity":99}
+    });
+    let unknown_error = connect_socket_for_app(&client, &base, "main", None, &mut app)
+        .await
+        .expect_err("an unknown protocol must fail before websocket I/O");
+    assert!(
+        unknown_error
+            .to_string()
+            .contains("unsupported daemon execution identity")
+    );
+    assert_eq!(
+        app.execution_identity_protocol,
+        ExecutionIdentityProtocol::Unavailable
+    );
+    assert_eq!(websocket_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    *payload.lock().unwrap() = strict.clone();
+    let mut group = connect_socket_for_app(&client, &base, "main", Some("review-group"), &mut app)
+        .await
+        .expect("a fresh strict negotiation may recover and switch targets");
+    mark_socket_connected(&mut app);
+    assert_eq!(websocket_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        websocket_targets
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|target| target.contains("group=review-group"))
+    );
+    let _ = group.close(None).await;
+
+    let mut upgraded = test_app(true);
+    *payload.lock().unwrap() = json!({"features":{"groups":true}});
+    let mut legacy = connect_socket_for_app(&client, &base, "main", None, &mut upgraded)
+        .await
+        .expect("the first legacy socket is compatible");
+    mark_socket_connected(&mut upgraded);
+    let _ = legacy.close(None).await;
+    *payload.lock().unwrap() = strict;
+    let mut strict_after_upgrade =
+        connect_socket_for_app(&client, &base, "main", None, &mut upgraded)
+            .await
+            .expect("legacy to strict renegotiation should recover");
+    mark_socket_connected(&mut upgraded);
+    assert_eq!(
+        upgraded.execution_identity_protocol,
+        ExecutionIdentityProtocol::Strict
+    );
+    let _ = strict_after_upgrade.close(None).await;
+
+    task.abort();
+    let _ = task.await;
+    let websocket_count_before_failure = websocket_count.load(std::sync::atomic::Ordering::SeqCst);
+    upgraded.input = "restore after negotiation failure".into();
+    let snapshot = ComposerSnapshot::capture(&upgraded);
+    upgraded.input.clear();
+    upgraded.pending_outbound_write = Some(snapshot);
+    let fetch_error = connect_socket_for_app(&client, &base, "main", None, &mut upgraded)
+        .await
+        .expect_err("capability fetch failure must precede websocket I/O");
+    assert!(
+        fetch_error
+            .to_string()
+            .contains("could not negotiate daemon capabilities")
+    );
+    assert_eq!(upgraded.input, "restore after negotiation failure");
+    assert!(upgraded.pending_outbound_write.is_none());
+    assert_eq!(
+        upgraded.execution_identity_protocol,
+        ExecutionIdentityProtocol::Unavailable
+    );
+    assert_eq!(
+        websocket_count.load(std::sync::atomic::Ordering::SeqCst),
+        websocket_count_before_failure
+    );
+}
+
+#[tokio::test]
+async fn real_tui_send_keeps_its_snapshot_until_a_valid_start_identity() {
+    let router = axum::Router::new()
+        .route(
+            "/api/client-config",
+            axum::routing::get(|| async {
+                axum::Json(json!({
+                    "features":{"groups":false},
+                    "protocols":{"execution_identity":crate::EXECUTION_IDENTITY_PROTOCOL_VERSION}
+                }))
+            }),
+        )
+        .route(
+            "/ws",
+            axum::routing::get(|upgrade: axum::extract::ws::WebSocketUpgrade| async move {
+                upgrade.on_upgrade(|mut socket| async move {
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                json!({"type":"start","round":1}).to_string().into(),
+                            ))
+                            .await;
+                        let _ = socket.recv().await;
+                    }
+                })
+            }),
+        );
+    let (base, task) = spawn_test_http_server(router).await;
+    let client = build_control_client(Duration::from_secs(1)).unwrap();
+    let mut app = test_app(false);
+    app.connected = true;
+    app.input = "sent over a real websocket".into();
+    app.pending_images
+        .push(json!({"url":"https://images.example/real-send.png"}));
+    app.plan_mode = true;
+    let snapshot = ComposerSnapshot::capture(&app);
+    let UserAction::Send(payload) =
+        handle_composer_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("composer should produce a real outbound payload");
+    };
+
+    let mut socket = connect_socket_for_app(&client, &base, "main", None, &mut app)
+        .await
+        .expect("strict websocket should connect");
+    mark_socket_connected(&mut app);
+    socket
+        .send(Message::Text(payload.into()))
+        .await
+        .expect("websocket write should succeed");
+    acknowledge_outbound_send(&mut app);
+    app.pending_outbound_write = Some(snapshot);
+
+    let message = socket
+        .next()
+        .await
+        .expect("server should send identityless start")
+        .expect("identityless start frame should decode");
+    let Message::Text(text) = message else {
+        panic!("expected text start event");
+    };
+    let value: Value = serde_json::from_str(&text).unwrap();
+    let action = apply_socket_event(&mut app, value);
+    assert_eq!(action, SocketEventAction::CloseExecutionProtocol);
+    let mut socket_slot = Some(socket);
+    apply_socket_event_action(action, &client, &mut socket_slot, &base, &mut app).await;
+
+    assert!(socket_slot.is_none());
+    assert_eq!(app.input, "sent over a real websocket");
+    assert_eq!(app.pending_images.len(), 1);
+    assert!(app.plan_mode);
+    assert!(app.pending_outbound_write.is_none());
+    assert!(!app.outbound_reconnect_pending);
+    assert!(!app.busy);
+    assert!(!app.connected);
+    assert!(
+        app.status
+            .contains("omitted the required execution identity")
+    );
+
+    task.abort();
 }
 
 #[tokio::test]
@@ -400,11 +686,371 @@ fn session_replay_reconciles_busy_state_from_history_and_start() {
     apply_socket_event(&mut app, json!({"type":"history","messages":[]}));
     assert!(!app.busy, "history clears stale local run state");
 
-    apply_socket_event(&mut app, json!({"type":"start","round":2}));
+    apply_socket_event(
+        &mut app,
+        json!({"type":"start","round":2,"run_connection_id":"run-2"}),
+    );
     assert!(app.busy, "a replayed live round restores busy state");
 
-    apply_socket_event(&mut app, json!({"type":"done"}));
+    apply_socket_event(&mut app, json!({"type":"done","run_connection_id":"run-2"}));
     assert!(!app.busy, "terminal events still clear busy state");
+}
+
+#[test]
+fn nonterminal_errors_do_not_end_an_active_tui_run() {
+    let mut app = test_app(false);
+    apply_socket_event(&mut app, json!({"type":"history","messages":[]}));
+    apply_socket_event(
+        &mut app,
+        json!({"type":"start","round":2,"run_connection_id":"run-errors"}),
+    );
+    assert!(app.busy);
+    assert!(app.direct_run_active);
+
+    apply_socket_event(
+        &mut app,
+        json!({
+            "type":"error",
+            "run_terminal":false,
+            "content":"Busy /think failed while the run continued."
+        }),
+    );
+    apply_socket_event(
+        &mut app,
+        json!({
+            "type":"error",
+            "content":"An unclassified legacy error is also nonterminal."
+        }),
+    );
+
+    assert!(app.busy);
+    assert!(app.direct_run_active);
+    assert_eq!(
+        app.lines
+            .iter()
+            .filter(|line| matches!(line.style, LineKind::Error))
+            .count(),
+        2
+    );
+
+    apply_socket_event(
+        &mut app,
+        json!({
+            "type":"error",
+            "run_terminal":true,
+            "run_connection_id":"run-errors",
+            "content":"The provider terminated the top-level run."
+        }),
+    );
+    assert!(!app.busy);
+    assert!(!app.direct_run_active);
+}
+
+#[test]
+fn late_done_from_an_old_connection_does_not_end_the_replacement_tui_run() {
+    let mut app = test_app(false);
+    apply_socket_event(&mut app, json!({"type":"history","messages":[]}));
+    apply_socket_event(
+        &mut app,
+        json!({"type":"start","round":1,"run_connection_id":"old-run"}),
+    );
+    apply_socket_event(
+        &mut app,
+        json!({
+            "type":"error",
+            "run_terminal":true,
+            "run_connection_id":"old-run",
+            "content":"The old run failed."
+        }),
+    );
+    assert!(!app.direct_run_active);
+
+    apply_socket_event(&mut app, json!({"type":"history","messages":[]}));
+    apply_socket_event(
+        &mut app,
+        json!({"type":"start","round":2,"run_connection_id":"new-run"}),
+    );
+    apply_socket_event(
+        &mut app,
+        json!({"type":"done","phase":"failed","run_connection_id":"old-run"}),
+    );
+    assert!(app.busy);
+    assert!(app.direct_run_active);
+    assert_eq!(app.direct_run_identity.as_deref(), Some("new-run"));
+
+    apply_socket_event(
+        &mut app,
+        json!({"type":"done","phase":"finish","run_connection_id":"new-run"}),
+    );
+    assert!(!app.busy);
+    assert!(!app.direct_run_active);
+    assert!(app.direct_run_identity.is_none());
+}
+
+#[test]
+fn identityless_legacy_runs_close_only_on_their_first_socket_generation() {
+    for (terminal, expected_busy) in [
+        (
+            json!({"type":"done","phase":"finish","reason":"complete"}),
+            false,
+        ),
+        (
+            json!({"type":"done","phase":"stopped","reason":"user_stop"}),
+            false,
+        ),
+        (
+            json!({"type":"done","phase":"failed","reason":"provider_error"}),
+            false,
+        ),
+    ] {
+        let mut app = test_app(false);
+        app.execution_identity_protocol = ExecutionIdentityProtocol::Legacy;
+        mark_socket_connected(&mut app);
+        apply_socket_event(&mut app, json!({"type":"history","messages":[]}));
+        apply_socket_event(&mut app, json!({"type":"start","round":1}));
+        assert!(app.direct_run_active);
+        assert_eq!(app.direct_run_identity.as_deref(), Some("legacy-socket-1"));
+
+        apply_socket_event(&mut app, terminal);
+        assert_eq!(app.busy, expected_busy);
+        assert!(!app.direct_run_active);
+        assert!(app.direct_run_identity.is_none());
+    }
+}
+
+#[test]
+fn identityless_legacy_terminal_error_closes_but_nonterminal_error_does_not() {
+    let mut app = test_app(false);
+    app.execution_identity_protocol = ExecutionIdentityProtocol::Legacy;
+    mark_socket_connected(&mut app);
+    apply_socket_event(&mut app, json!({"type":"history","messages":[]}));
+    apply_socket_event(&mut app, json!({"type":"start","round":1}));
+
+    apply_socket_event(
+        &mut app,
+        json!({
+            "type":"error",
+            "run_terminal":false,
+            "content":"The legacy command failed."
+        }),
+    );
+    assert!(app.busy);
+    assert!(app.direct_run_active);
+
+    apply_socket_event(
+        &mut app,
+        json!({
+            "type":"error",
+            "run_terminal":true,
+            "content":"The legacy run failed."
+        }),
+    );
+    assert!(!app.busy);
+    assert!(!app.direct_run_active);
+    assert!(app.direct_run_identity.is_none());
+}
+
+#[test]
+fn strict_identityless_start_restores_the_real_outbound_draft_before_closing() {
+    let mut app = test_app(false);
+    app.connected = true;
+    app.input = "preserve this draft".into();
+    app.pending_images
+        .push(json!({"url":"https://images.example/preserved.png"}));
+    app.plan_mode = true;
+    let snapshot = ComposerSnapshot::capture(&app);
+
+    assert!(matches!(
+        handle_composer_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        UserAction::Send(_)
+    ));
+    app.pending_outbound_write = Some(snapshot);
+
+    let action = apply_socket_event(&mut app, json!({"type":"start","round":1}));
+
+    assert_eq!(action, SocketEventAction::CloseExecutionProtocol);
+    assert_eq!(app.input, "preserve this draft");
+    assert_eq!(app.pending_images.len(), 1);
+    assert!(app.plan_mode);
+    assert!(app.pending_outbound_write.is_none());
+    assert!(!app.outbound_reconnect_pending);
+    assert!(!app.connected);
+    assert!(!app.busy);
+    assert!(!app.direct_run_active);
+    assert_eq!(
+        app.execution_identity_protocol,
+        ExecutionIdentityProtocol::Unavailable
+    );
+}
+
+#[test]
+fn strict_identityless_terminal_error_closes_but_nonterminal_error_does_not() {
+    let mut nonterminal = test_app(false);
+    nonterminal.connected = true;
+    nonterminal.input = "/think max".into();
+    let snapshot = ComposerSnapshot::capture(&nonterminal);
+    nonterminal.input.clear();
+    nonterminal.pending_outbound_write = Some(snapshot);
+    assert_eq!(
+        apply_socket_event(
+            &mut nonterminal,
+            json!({"type":"error","run_terminal":false,"content":"invalid effort"}),
+        ),
+        SocketEventAction::None
+    );
+    assert_eq!(nonterminal.input, "/think max");
+    assert!(nonterminal.connected);
+    assert_eq!(
+        nonterminal.execution_identity_protocol,
+        ExecutionIdentityProtocol::Strict
+    );
+
+    let mut terminal = test_app(false);
+    terminal.connected = true;
+    terminal.input = "provider request".into();
+    let snapshot = ComposerSnapshot::capture(&terminal);
+    terminal.input.clear();
+    terminal.pending_outbound_write = Some(snapshot);
+    assert_eq!(
+        apply_socket_event(
+            &mut terminal,
+            json!({"type":"error","run_terminal":true,"content":"provider failed"}),
+        ),
+        SocketEventAction::CloseExecutionProtocol
+    );
+    assert_eq!(terminal.input, "provider request");
+    assert!(!terminal.connected);
+    assert_eq!(
+        terminal.execution_identity_protocol,
+        ExecutionIdentityProtocol::Unavailable
+    );
+
+    let mut done = test_app(false);
+    done.connected = true;
+    apply_socket_event(
+        &mut done,
+        json!({"type":"start","run_connection_id":"strict-run"}),
+    );
+    assert!(done.direct_run_active);
+    assert_eq!(
+        apply_socket_event(&mut done, json!({"type":"done","phase":"failed"})),
+        SocketEventAction::CloseExecutionProtocol
+    );
+    assert!(!done.direct_run_active);
+    assert!(!done.busy);
+}
+
+#[test]
+fn legacy_disconnect_restores_pending_composer_while_strict_waits_for_history() {
+    let mut legacy = test_app(false);
+    legacy.execution_identity_protocol = ExecutionIdentityProtocol::Legacy;
+    mark_socket_connected(&mut legacy);
+    legacy.input = "legacy retry".into();
+    legacy
+        .pending_images
+        .push(json!({"url":"https://images.example/legacy.png"}));
+    legacy.plan_mode = true;
+    let legacy_snapshot = ComposerSnapshot::capture(&legacy);
+    legacy.input.clear();
+    legacy.pending_images.clear();
+    legacy.plan_mode = false;
+    legacy.pending_outbound_write = Some(legacy_snapshot);
+    legacy.busy = true;
+
+    mark_socket_disconnected(&mut legacy);
+
+    assert_eq!(legacy.input, "legacy retry");
+    assert_eq!(legacy.pending_images.len(), 1);
+    assert!(legacy.plan_mode);
+    assert!(legacy.pending_outbound_write.is_none());
+    assert!(!legacy.outbound_reconnect_pending);
+    assert!(!legacy.busy);
+
+    let mut strict = test_app(false);
+    strict.input = "strict pending".into();
+    let strict_snapshot = ComposerSnapshot::capture(&strict);
+    strict.input.clear();
+    strict.pending_outbound_write = Some(strict_snapshot);
+    mark_socket_connected(&mut strict);
+    mark_socket_disconnected(&mut strict);
+
+    assert!(strict.input.is_empty());
+    assert!(strict.pending_outbound_write.is_some());
+    assert!(strict.outbound_reconnect_pending);
+}
+
+#[tokio::test]
+async fn legacy_reconnect_quarantines_identityless_terminals_and_blocks_a_second_socket() {
+    let mut app = test_app(false);
+    app.execution_identity_protocol = ExecutionIdentityProtocol::Legacy;
+    mark_socket_connected(&mut app);
+    apply_socket_event(&mut app, json!({"type":"history","messages":[]}));
+    apply_socket_event(&mut app, json!({"type":"start","round":1}));
+    mark_socket_disconnected(&mut app);
+    assert!(!app.busy);
+    assert!(!app.direct_run_active);
+    assert!(reconnect_status(&app, "").contains("older daemon cannot reconnect"));
+
+    mark_socket_connected(&mut app);
+    assert_eq!(app.socket_generation, 2);
+    assert_eq!(app.legacy_execution_socket_generation, Some(1));
+    apply_socket_event(&mut app, json!({"type":"done","phase":"failed"}));
+    apply_socket_event(
+        &mut app,
+        json!({"type":"error","run_terminal":true,"content":"late"}),
+    );
+    assert_eq!(
+        apply_socket_event(&mut app, json!({"type":"start","round":2})),
+        SocketEventAction::CloseExecutionProtocol
+    );
+    assert!(!app.busy);
+    assert!(!app.direct_run_active);
+    assert!(
+        app.status
+            .contains("omitted the required execution identity")
+    );
+
+    app.execution_identity_protocol = ExecutionIdentityProtocol::Strict;
+    mark_socket_connected(&mut app);
+    apply_socket_event(
+        &mut app,
+        json!({"type":"start","round":2,"run_connection_id":"strict-new"}),
+    );
+    assert_eq!(
+        apply_socket_event(&mut app, json!({"type":"done","phase":"failed"})),
+        SocketEventAction::CloseExecutionProtocol
+    );
+    assert!(!app.busy);
+    assert!(!app.direct_run_active);
+
+    app.execution_identity_protocol = ExecutionIdentityProtocol::Strict;
+    mark_socket_connected(&mut app);
+    apply_socket_event(
+        &mut app,
+        json!({"type":"start","round":3,"run_connection_id":"strict-final"}),
+    );
+    apply_socket_event(
+        &mut app,
+        json!({"type":"done","phase":"finish","run_connection_id":"strict-final"}),
+    );
+    assert!(!app.busy);
+    assert!(!app.direct_run_active);
+
+    app.execution_identity_protocol = ExecutionIdentityProtocol::Legacy;
+    let router = axum::Router::new().route(
+        "/api/client-config",
+        axum::routing::get(|| async { axum::Json(json!({"features":{"groups":false}})) }),
+    );
+    let (base, task) = spawn_test_http_server(router).await;
+    let error = connect_socket_for_app(&Client::new(), &base, "main", None, &mut app)
+        .await
+        .expect_err("a second legacy connection must fail before network I/O");
+    assert!(
+        error
+            .to_string()
+            .contains("older daemon cannot open a second")
+    );
+    task.abort();
 }
 
 #[test]
@@ -470,7 +1116,10 @@ fn session_replay_restores_only_messages_missing_from_authoritative_history() {
     apply_socket_event(&mut initial_replay, json!({"type":"history","messages":[]}));
     assert!(initial_replay.input.is_empty());
     assert!(initial_replay.pending_outbound_write.is_some());
-    apply_socket_event(&mut initial_replay, json!({"type":"start"}));
+    apply_socket_event(
+        &mut initial_replay,
+        json!({"type":"start","run_connection_id":"initial-replay"}),
+    );
     assert!(initial_replay.pending_outbound_write.is_none());
 }
 
@@ -481,7 +1130,10 @@ fn replay_uses_raw_message_ids_and_image_fingerprints() {
     acknowledged.input = "repeat after acknowledgement".into();
     acknowledged.pending_outbound_write = Some(ComposerSnapshot::capture(&acknowledged));
     acknowledged.input.clear();
-    apply_socket_event(&mut acknowledged, json!({"type":"start"}));
+    apply_socket_event(
+        &mut acknowledged,
+        json!({"type":"start","run_connection_id":"acknowledged-replay"}),
+    );
     acknowledged.input = "repeat after acknowledgement".into();
     acknowledged.pending_outbound_write = Some(ComposerSnapshot::capture(&acknowledged));
     acknowledged.input.clear();
@@ -1534,6 +2186,507 @@ fn hot_enabling_groups_requests_a_preserved_group_list_refresh() {
     assert_eq!(action, SocketEventAction::RefreshGroups);
     assert!(app.groups_enabled);
     assert!(app.pages.contains(&Page::Groups));
+}
+
+#[tokio::test]
+async fn negotiated_group_enable_refreshes_after_connect_and_discards_stale_results() {
+    let websocket_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let group_request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release_first_group_request = std::sync::Arc::new(tokio::sync::Notify::new());
+    let ws_count = websocket_count.clone();
+    let request_count = group_request_count.clone();
+    let release_first = release_first_group_request.clone();
+    let router = axum::Router::new()
+        .route(
+            "/api/client-config",
+            axum::routing::get(|| async {
+                axum::Json(json!({
+                    "features":{"groups":true},
+                    "protocols":{"execution_identity":crate::EXECUTION_IDENTITY_PROTOCOL_VERSION}
+                }))
+            }),
+        )
+        .route(
+            "/api/session-groups",
+            axum::routing::get(move || {
+                let request_number =
+                    request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let release_first = release_first.clone();
+                async move {
+                    if request_number == 1 {
+                        release_first.notified().await;
+                    }
+                    axum::Json(json!({
+                        "groups":[{
+                            "id": if request_number == 1 {"stale-reviewers"} else {"reviewers"},
+                            "name":"Reviewers",
+                            "members":2
+                        }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/ws",
+            axum::routing::get(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
+                ws_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { upgrade.on_upgrade(|_| async {}) }
+            }),
+        );
+    let (base, task) = spawn_test_http_server(router).await;
+    let client = build_control_client(Duration::from_secs(1)).unwrap();
+    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+    let mut app = test_app(false);
+
+    let mut first = connect_socket_for_app_with_group_refresh(
+        &client,
+        &base,
+        "main",
+        None,
+        &mut app,
+        Some(&refresh_tx),
+    )
+    .await
+    .expect("WebSocket should connect before the negotiated Group refresh completes");
+    mark_socket_connected(&mut app);
+    assert_eq!(websocket_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while group_request_count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the post-connect Group request should start");
+    assert!(refresh_rx.try_recv().is_err());
+
+    app.active_group = Some("new-target".into());
+    release_first_group_request.notify_waiters();
+    let stale = tokio::time::timeout(Duration::from_secs(1), refresh_rx.recv())
+        .await
+        .expect("stale Group response should finish")
+        .expect("refresh sender should remain alive");
+    assert!(!apply_negotiated_group_refresh(&mut app, stale));
+    assert!(app.groups.is_empty());
+
+    app.active_group = None;
+    assert_eq!(
+        apply_socket_event(
+            &mut app,
+            json!({"type":"feature_status","features":{"groups":false}}),
+        ),
+        SocketEventAction::None
+    );
+    let disabled_result = NegotiatedGroupRefresh {
+        binding: group_refresh_binding(&app, app.socket_generation),
+        attempt: 1,
+        result: Ok(vec![GroupSummary {
+            id: "disabled-stale".into(),
+            name: "Disabled stale result".into(),
+            members: 1,
+        }]),
+    };
+    assert!(!apply_negotiated_group_refresh(&mut app, disabled_result));
+    assert!(app.groups.is_empty());
+
+    app.active_group = Some("reviewers".into());
+    let mut second = connect_socket_for_app_with_group_refresh(
+        &client,
+        &base,
+        "main",
+        Some("reviewers"),
+        &mut app,
+        Some(&refresh_tx),
+    )
+    .await
+    .expect("a current strict generation should reconnect");
+    mark_socket_connected(&mut app);
+    let current = tokio::time::timeout(Duration::from_secs(1), refresh_rx.recv())
+        .await
+        .expect("current Group response should finish")
+        .expect("refresh sender should remain alive");
+    assert!(apply_negotiated_group_refresh(&mut app, current));
+    assert_eq!(app.groups.len(), 1);
+    assert_eq!(app.groups[0].id, "reviewers");
+    assert_eq!(websocket_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        group_request_count.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert!(refresh_rx.try_recv().is_err());
+
+    let _ = first.close(None).await;
+    let _ = second.close(None).await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn negotiated_group_refresh_retries_once_on_the_same_healthy_socket() {
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_active_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests = request_count.clone();
+    let active = active_requests.clone();
+    let max_active = max_active_requests.clone();
+    let router = axum::Router::new()
+        .route(
+            "/api/client-config",
+            axum::routing::get(|| async {
+                axum::Json(json!({
+                    "features":{"groups":true},
+                    "protocols":{"execution_identity":crate::EXECUTION_IDENTITY_PROTOCOL_VERSION}
+                }))
+            }),
+        )
+        .route(
+            "/api/session-groups",
+            axum::routing::get(move || {
+                let request = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let concurrent = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                max_active.fetch_max(concurrent, std::sync::atomic::Ordering::SeqCst);
+                let active = active.clone();
+                async move {
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let status = if request == 1 {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    };
+                    let groups = if request == 1 {
+                        json!({"error":"temporary Group list failure"})
+                    } else {
+                        json!({"groups":[{"id":"recovered","name":"Recovered","members":1}]})
+                    };
+                    (status, axum::Json(groups))
+                }
+            }),
+        )
+        .route(
+            "/ws",
+            axum::routing::get(|upgrade: axum::extract::ws::WebSocketUpgrade| async move {
+                upgrade.on_upgrade(|_| async {})
+            }),
+        );
+    let (base, task) = spawn_test_http_server(router).await;
+    let client = build_control_client(Duration::from_secs(1)).unwrap();
+    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+    let mut app = test_app(false);
+    let mut socket = connect_socket_for_app_with_group_refresh(
+        &client,
+        &base,
+        "main",
+        None,
+        &mut app,
+        Some(&refresh_tx),
+    )
+    .await
+    .expect("the socket should not wait for Group discovery");
+    mark_socket_connected(&mut app);
+
+    let first = tokio::time::timeout(Duration::from_secs(1), refresh_rx.recv())
+        .await
+        .expect("first Group refresh should finish")
+        .expect("refresh sender should remain alive");
+    let now = tokio::time::Instant::now();
+    assert!(apply_negotiated_group_refresh_at(&mut app, first, now));
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(app.groups.is_empty());
+    assert!(app.groups_refresh_pending);
+    assert!(!take_due_group_refresh_retry(
+        &mut app,
+        now + GROUP_REFRESH_RETRY_BASE - Duration::from_millis(1)
+    ));
+    assert!(schedule_due_group_refresh_retry(
+        &client,
+        &base,
+        &mut app,
+        &refresh_tx,
+        true,
+        now + GROUP_REFRESH_RETRY_BASE,
+    ));
+
+    let second = tokio::time::timeout(Duration::from_secs(1), refresh_rx.recv())
+        .await
+        .expect("retry Group refresh should finish")
+        .expect("refresh sender should remain alive");
+    assert!(apply_negotiated_group_refresh_at(
+        &mut app,
+        second,
+        now + GROUP_REFRESH_RETRY_BASE
+    ));
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        max_active_requests.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(app.groups.len(), 1);
+    assert_eq!(app.groups[0].id, "recovered");
+    assert!(!app.groups_refresh_pending);
+    assert!(app.groups_refresh_retry_at.is_none());
+    assert!(app.status.contains("recovered"));
+
+    let _ = socket.close(None).await;
+    task.abort();
+}
+
+async fn exercise_group_refresh_feature_cycle_aba(old_succeeds: bool, old_finishes_first: bool) {
+    let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_active_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let releases = std::sync::Arc::new(vec![
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    ]);
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel::<usize>();
+    let requests = request_count.clone();
+    let active = active_requests.clone();
+    let max_active = max_active_requests.clone();
+    let request_releases = releases.clone();
+    let router = axum::Router::new().route(
+        "/api/session-groups",
+        axum::routing::get(move || {
+            let request = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let concurrent = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            max_active.fetch_max(concurrent, std::sync::atomic::Ordering::SeqCst);
+            let release = request_releases.get(request).cloned();
+            let active = active.clone();
+            let started_tx = started_tx.clone();
+            async move {
+                let _ = started_tx.send(request);
+                if let Some(release) = release {
+                    release.notified().await;
+                }
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if request == 0 && !old_succeeds {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({"error":"stale first-cycle failure"})),
+                    );
+                }
+                let id = if request == 0 { "stale" } else { "current" };
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(json!({
+                        "groups":[{"id":id,"name":id,"members":1}]
+                    })),
+                )
+            }
+        }),
+    );
+    let (base, task) = spawn_test_http_server(router).await;
+    let client = build_control_client(Duration::from_secs(2)).unwrap();
+    let (refresh_tx, mut refresh_rx) = mpsc::unbounded_channel();
+    let mut app = test_app(false);
+    app.connected = true;
+    app.socket_generation = 41;
+    let mut socket = None;
+
+    let first_action = apply_socket_event(
+        &mut app,
+        json!({"type":"feature_status","features":{"groups":true}}),
+    );
+    assert_eq!(first_action, SocketEventAction::RefreshGroups);
+    let first_cycle = app.groups_refresh_cycle.clone();
+    apply_socket_event_action_with_group_refresh(
+        first_action,
+        &client,
+        &mut socket,
+        &base,
+        &mut app,
+        Some(&refresh_tx),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("the first-cycle request should start"),
+        Some(0)
+    );
+
+    assert_eq!(
+        apply_socket_event(
+            &mut app,
+            json!({"type":"feature_status","features":{"groups":true}}),
+        ),
+        SocketEventAction::None,
+        "a repeated enabled status must not create another refresh cycle"
+    );
+    assert_eq!(app.groups_refresh_cycle, first_cycle);
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    assert_eq!(
+        apply_socket_event(
+            &mut app,
+            json!({"type":"feature_status","features":{"groups":false}}),
+        ),
+        SocketEventAction::None
+    );
+    let disabled_cycle = app.groups_refresh_cycle.clone();
+    assert_ne!(disabled_cycle, first_cycle);
+    assert!(!app.groups_refresh_pending);
+    assert!(app.groups_refresh_in_flight.is_none());
+
+    let second_action = apply_socket_event(
+        &mut app,
+        json!({"type":"feature_status","features":{"groups":true}}),
+    );
+    assert_eq!(second_action, SocketEventAction::RefreshGroups);
+    assert_ne!(app.groups_refresh_cycle, disabled_cycle);
+    assert_ne!(app.groups_refresh_cycle, first_cycle);
+    apply_socket_event_action_with_group_refresh(
+        second_action,
+        &client,
+        &mut socket,
+        &base,
+        &mut app,
+        Some(&refresh_tx),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("the re-enabled request should start"),
+        Some(1)
+    );
+    let second_binding = app
+        .groups_refresh_in_flight
+        .clone()
+        .expect("the second cycle owns the current in-flight request");
+    assert_eq!(second_binding.socket_generation, 41);
+    assert_eq!(second_binding.session_id, "main");
+    assert_eq!(second_binding.active_group, None);
+    assert_eq!(app.groups_refresh_attempts, 1);
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        max_active_requests.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the new cycle must not wait for an invalidated HTTP request"
+    );
+
+    if old_finishes_first {
+        let status_before_stale = app.status.clone();
+        releases[0].notify_one();
+        let stale = tokio::time::timeout(Duration::from_secs(1), refresh_rx.recv())
+            .await
+            .expect("the first-cycle response should finish")
+            .expect("the refresh sender should remain alive");
+        assert!(!apply_negotiated_group_refresh(&mut app, stale));
+        assert_eq!(app.status, status_before_stale);
+        assert_eq!(app.groups_refresh_in_flight, Some(second_binding.clone()));
+        assert!(app.groups_refresh_pending);
+        assert_eq!(app.groups_refresh_attempts, 1);
+        assert!(app.groups_refresh_retry_at.is_none());
+        assert!(app.groups.is_empty());
+
+        releases[1].notify_one();
+        let current = tokio::time::timeout(Duration::from_secs(1), refresh_rx.recv())
+            .await
+            .expect("the second-cycle response should finish")
+            .expect("the refresh sender should remain alive");
+        assert!(apply_negotiated_group_refresh(&mut app, current));
+    } else {
+        releases[1].notify_one();
+        let current = tokio::time::timeout(Duration::from_secs(1), refresh_rx.recv())
+            .await
+            .expect("the second-cycle response should finish first")
+            .expect("the refresh sender should remain alive");
+        assert!(apply_negotiated_group_refresh(&mut app, current));
+        let status_after_current = app.status.clone();
+
+        releases[0].notify_one();
+        let stale = tokio::time::timeout(Duration::from_secs(1), refresh_rx.recv())
+            .await
+            .expect("the stale first-cycle response should eventually finish")
+            .expect("the refresh sender should remain alive");
+        assert!(!apply_negotiated_group_refresh(&mut app, stale));
+        assert_eq!(app.status, status_after_current);
+    }
+
+    assert_eq!(app.groups.len(), 1);
+    assert_eq!(app.groups[0].id, "current");
+    assert!(!app.groups_refresh_pending);
+    assert!(app.groups_refresh_in_flight.is_none());
+    assert_eq!(app.groups_refresh_attempts, 0);
+    assert!(app.groups_refresh_retry_at.is_none());
+    assert_eq!(request_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn group_refresh_feature_cycle_rejects_old_success_before_current_success() {
+    exercise_group_refresh_feature_cycle_aba(true, true).await;
+}
+
+#[tokio::test]
+async fn group_refresh_feature_cycle_rejects_old_failure_before_current_success() {
+    exercise_group_refresh_feature_cycle_aba(false, true).await;
+}
+
+#[tokio::test]
+async fn group_refresh_feature_cycle_rejects_old_results_after_current_success() {
+    exercise_group_refresh_feature_cycle_aba(true, false).await;
+    exercise_group_refresh_feature_cycle_aba(false, false).await;
+}
+
+#[test]
+fn group_refresh_retry_is_bounded_and_invalidated_by_identity_changes() {
+    let start = tokio::time::Instant::now();
+    let mut app = test_app(true);
+    app.socket_generation = 7;
+    app.connected = true;
+    app.groups_refresh_pending = true;
+    let session_binding = group_refresh_binding(&app, app.socket_generation);
+
+    for attempt in 1..=GROUP_REFRESH_MAX_ATTEMPTS {
+        app.groups_refresh_in_flight = Some(session_binding.clone());
+        app.groups_refresh_retry_binding = Some(session_binding.clone());
+        app.groups_refresh_attempts = attempt;
+        assert!(apply_negotiated_group_refresh_at(
+            &mut app,
+            NegotiatedGroupRefresh {
+                binding: session_binding.clone(),
+                attempt,
+                result: Err(format!("attempt {attempt} failed")),
+            },
+            start,
+        ));
+        if attempt < GROUP_REFRESH_MAX_ATTEMPTS {
+            assert_eq!(
+                app.groups_refresh_retry_at,
+                Some(start + group_refresh_retry_delay(attempt))
+            );
+        } else {
+            assert!(app.groups_refresh_retry_at.is_none());
+        }
+    }
+
+    app.groups_refresh_retry_at = Some(start);
+    app.active_group = Some("new-group-target".into());
+    assert!(!take_due_group_refresh_retry(&mut app, start));
+    assert!(app.groups_refresh_retry_at.is_none());
+
+    let group_binding = group_refresh_binding(&app, app.socket_generation);
+    app.groups_refresh_retry_binding = Some(group_binding);
+    app.groups_refresh_retry_at = Some(start);
+    app.active_group = None;
+    assert!(!take_due_group_refresh_retry(&mut app, start));
+    assert!(app.groups_refresh_retry_at.is_none());
+
+    app.groups_refresh_retry_binding = Some(group_refresh_binding(&app, app.socket_generation));
+    app.groups_refresh_retry_at = Some(start);
+    app.groups_enabled = false;
+    assert!(!take_due_group_refresh_retry(&mut app, start));
+    assert!(app.groups_refresh_retry_at.is_none());
+
+    app.groups_enabled = true;
+    app.groups_refresh_pending = true;
+    app.socket_generation += 1;
+    let replacement = group_refresh_binding(&app, app.socket_generation);
+    app.groups_refresh_retry_binding = Some(replacement.clone());
+    app.groups_refresh_attempts = 1;
+    app.groups_refresh_retry_at = Some(start);
+    assert!(take_due_group_refresh_retry(&mut app, start));
 }
 
 #[test]

@@ -3362,6 +3362,113 @@ fn call_llm_stream_openai_responses_accepts_null_error_field() {
     );
 }
 
+#[tokio::test]
+async fn round24_responses_error_text_cannot_claim_transport_diagnostics_or_fallbacks() {
+    use crate::run_diagnostics::{RunDiagnostic, RunDiagnosticCode};
+
+    for prefix in [
+        "API 401 Unauthorized: ",
+        "API 429 Too Many Requests: ",
+        "API 503 Service Unavailable: ",
+        "HTTP error: ",
+        "Provider configuration error: ",
+        "API 400 Bad Request: unsupported tools and image_url content ",
+        "LLM request failed after all retries: ",
+        "Client disconnected ",
+    ] {
+        let raw = format!(
+            "{prefix}{}",
+            "<html>ROUND24_PRIVATE_MARKER https://key:secret@example.test/</html>".repeat(3000)
+        );
+        let events = [
+            json!({"type":"error","code":"server_error","message":raw}),
+            json!({"type":"response.failed","message":raw}),
+            json!({"message":raw}),
+            json!({"type":"error","error":raw}),
+            json!({"type":"error","error":{"message":raw}}),
+            json!({"type":"response.failed","response":{"error":{"code":"server_error","message":raw}}}),
+            json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":raw}}}),
+            json!({"type":"response.incomplete","error":raw}),
+            json!({"type":"response.completed","response":{"error":raw}}),
+            json!({"type":"error","detail":raw}),
+        ];
+        for event in events {
+            let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+            let error = process_openai_responses_stream_event(
+                &event.to_string(),
+                "error",
+                &tx,
+                &mut OpenAiResponsesStreamState::default(),
+            )
+            .await
+            .expect_err("the actual upstream error event must fail");
+            let diagnostic = RunDiagnostic::from_provider_error(&error);
+            assert_eq!(
+                diagnostic.code,
+                RunDiagnosticCode::ProviderResponseInvalid,
+                "upstream prefix {prefix} must retain its response origin"
+            );
+            assert!(error.starts_with("OpenAI Responses API "));
+            assert!(!is_transient_llm_error(&error));
+            assert!(!is_tool_calling_compatibility_error(&error));
+            assert!(!is_openai_tool_image_compatibility_error(&error));
+            assert!(!diagnostic.safe_message().contains("ROUND24_PRIVATE_MARKER"));
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("secret")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn round24_other_provider_errors_and_responses_checkpoint_keep_their_origin() {
+    use crate::run_diagnostics::{RunDiagnostic, RunDiagnosticCode};
+
+    let raw = "API 401 Unauthorized: HTTP error: Provider configuration error: secret";
+    for provider in ["OpenAI", "OpenAI Responses", "Anthropic", "Ollama"] {
+        for data in [
+            json!({"error":raw}),
+            json!({"error":{"code":401,"message":raw}}),
+        ] {
+            let error = provider_json_error(provider, &data).expect("upstream error");
+            assert_eq!(
+                RunDiagnostic::from_provider_error(&error).code,
+                RunDiagnosticCode::ProviderResponseInvalid
+            );
+            assert!(!is_transient_llm_error(&error));
+        }
+        let error = parse_json_response::<Value>(provider, &format!("{raw}<html>secret</html>"))
+            .expect_err("malformed upstream response");
+        assert_eq!(
+            RunDiagnostic::from_provider_error(&error).code,
+            RunDiagnosticCode::ProviderResponseInvalid
+        );
+    }
+    let response: GeminiGenerateResponse = serde_json::from_value(
+        json!({"error":{"code":401,"status":"UNAUTHENTICATED","message":raw}}),
+    )
+    .unwrap();
+    let error = gemini_response_error(&response).expect("Gemini response error");
+    assert_eq!(
+        RunDiagnostic::from_provider_error(&error).code,
+        RunDiagnosticCode::ProviderResponseInvalid
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let error = process_openai_responses_stream_event(
+        &json!({"type":"error","message":"previous_response_id expired: resp_old"}).to_string(),
+        "error",
+        &tx,
+        &mut OpenAiResponsesStreamState::default(),
+    )
+    .await
+    .expect_err("expired upstream checkpoint");
+    assert!(openai_responses_checkpoint_error(&error));
+    assert!(!is_transient_llm_error(&error));
+}
+
 #[test]
 fn build_openai_responses_body_flattens_tools_and_replays_tool_history() {
     let resolved = ResolvedModel {

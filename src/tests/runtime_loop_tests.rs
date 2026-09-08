@@ -100,6 +100,7 @@ fn test_app_state() -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     }
 }
@@ -121,6 +122,7 @@ fn test_app_state_with_hooks(hooks: HookRegistry) -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks,
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     }
 }
@@ -291,6 +293,62 @@ impl Drop for QueuedSseServerGuard {
     fn drop(&mut self) {
         self.handle.abort();
     }
+}
+
+struct BlockingAuxiliaryProviderState {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    requests: Mutex<Vec<serde_json::Value>>,
+    content: String,
+}
+
+async fn blocking_auxiliary_provider_handler(
+    State(state): State<Arc<BlockingAuxiliaryProviderState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    state.requests.lock().await.push(request);
+    state.arrived.notify_one();
+    state.release.notified().await;
+    Json(json!({
+        "choices": [{"message": {"content": state.content.clone()}}],
+        "usage": {"prompt_tokens": 17, "completion_tokens": 9}
+    }))
+    .into_response()
+}
+
+async fn spawn_blocking_auxiliary_provider(
+    content: &str,
+) -> (
+    String,
+    Arc<BlockingAuxiliaryProviderState>,
+    QueuedSseServerGuard,
+) {
+    let state = Arc::new(BlockingAuxiliaryProviderState {
+        arrived: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        requests: Mutex::new(Vec::new()),
+        content: content.to_string(),
+    });
+    let app = Router::new()
+        .route(
+            "/chat/completions",
+            axum::routing::post(blocking_auxiliary_provider_handler),
+        )
+        .with_state(Arc::clone(&state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("auxiliary Provider listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("auxiliary Provider listener should expose its address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (
+        format!("http://{address}"),
+        state,
+        QueuedSseServerGuard { handle },
+    )
 }
 
 async fn queued_openai_sse_handler(
@@ -1302,6 +1360,184 @@ async fn plan_feedback_is_durable_without_becoming_a_transcript_message() {
     );
 }
 
+#[tokio::test]
+async fn plan_feedback_terminal_outcome_uses_the_registered_replacement_revision() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-feedback-terminal-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("plan-feedback-terminal");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let mut session = test_session(&session_id, "Plan Feedback Terminal", None);
+    session.version = crate::SESSION_VERSION;
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Plan the storage migration.".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(10),
+    });
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some("Which storage engine should the plan use?".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(11),
+    });
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_feedback_terminal".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        revision: 3,
+        status: crate::plan::PlanStatus::NeedsInput,
+        artifact: crate::plan::PlanArtifact {
+            title: "Choose storage".into(),
+            goal: "Choose a storage engine".into(),
+            questions: vec![crate::plan::PlanQuestion {
+                id: "storage".into(),
+                prompt: "Which storage engine?".into(),
+                options: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        created_at: 10,
+        updated_at: 11,
+        ..Default::default()
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let mut current_session_id = session_id.clone();
+    let cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let action = handle_idle_socket_input(
+        r#"{"plan_action":{"action":"feedback","plan_id":"plan_feedback_terminal","revision":3,"answers":{"storage":"SQLite"}}}"#.into(),
+        &mut current_session_id,
+        &current_session_ref,
+        19,
+        &state,
+        &inbound_tx,
+        &live_tx,
+        &cancel,
+        &stop_requested,
+    )
+    .await;
+    let reservation = match action {
+        IdleSocketInputAction::StartAgent {
+            run_mode: AgentRunMode::PlanOnly,
+            reservation,
+            ..
+        } => reservation,
+        _ => panic!("valid feedback should reserve a PlanOnly run"),
+    };
+    {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .expect("feedback Session should remain loaded");
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: Some("I incorporated the storage answer.".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "submit-feedback-revision".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: crate::plan::TOOL_NAME_SUBMIT_PLAN.into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: Some(12),
+        });
+        session.messages.push(ChatMessage {
+            role: "tool".into(),
+            content: Some("Plan accepted.".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("submit-feedback-revision".into()),
+            timestamp: Some(13),
+        });
+    }
+
+    let run_cancel = CancellationToken::new();
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::PlanOnly;
+    phase_state.plan_action_prompt = reservation.plan_action_prompt.clone();
+    phase_state.plan_submission = Some(
+        crate::plan::validate_submission_json(
+            r#"{
+                "state":"ready",
+                "title":"SQLite migration",
+                "goal":"Migrate the Session store to SQLite",
+                "steps":[{"id":"migrate","title":"Implement the SQLite migration"}],
+                "acceptance_criteria":["The workspace remains available after migration."],
+                "completion_checks":[{"id":"workspace","step_id":"migrate","covers":[{"section":"acceptance_criteria","index":0}],"kind":"workspace_path","path":".","expected_path_type":"directory"}]
+            }"#,
+        )
+        .expect("feedback replacement submission should validate"),
+    );
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    assert!(matches!(
+        run_finish_phase(&ctx, &mut phase_state).await,
+        AgentPhaseControl::Break
+    ));
+    assert!(!phase_state.run_failed);
+    let (terminal_snapshot, outcome) = take_terminal_persistence_record(&session_id)
+        .await
+        .expect("feedback terminal transaction should be captured");
+    let final_plan = terminal_snapshot
+        .pending_plan
+        .as_ref()
+        .expect("replacement plan should be committed");
+    assert_eq!(final_plan.id, "plan_feedback_terminal");
+    assert_eq!(final_plan.revision, 4);
+    assert_eq!(final_plan.status, crate::plan::PlanStatus::Ready);
+    assert_eq!(outcome.plan_id.as_deref(), Some("plan_feedback_terminal"));
+    assert_eq!(outcome.plan_revision, Some(4));
+    assert!(std::iter::from_fn(|| live_rx.try_recv().ok()).any(|event| {
+        event["type"] == "plan_ready"
+            && event["plan_id"] == "plan_feedback_terminal"
+            && event["revision"] == 4
+    }));
+
+    release_agent_run_reservation(&state, &session_id, &reservation).await;
+}
+
 #[test]
 fn plan_action_context_is_an_ephemeral_user_message() {
     let mut messages = vec![ChatMessage {
@@ -2042,6 +2278,22 @@ async fn refreshed_stale_override_runs_tools_and_completes_only_reported_steps()
     )
     .await;
     assert!(!refresh_outcome.run_failed);
+    let (refresh_terminal_snapshot, refresh_terminal_outcome) =
+        take_terminal_persistence_record(&session_id)
+            .await
+            .expect("refresh terminal producer should freeze its Session snapshot");
+    assert_eq!(
+        refresh_terminal_snapshot
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.revision),
+        Some(3)
+    );
+    assert_eq!(
+        refresh_terminal_outcome.plan_id.as_deref(),
+        Some("plan_refreshed_stale")
+    );
+    assert_eq!(refresh_terminal_outcome.plan_revision, Some(3));
 
     let refreshed_plan = state.sessions.lock().await[&session_id]
         .pending_plan
@@ -2593,6 +2845,7 @@ async fn stale_override_cannot_complete_against_a_reinterpreted_refresh_contract
             event["type"] == "error" && event["code"] == "plan_completion_contract_failed"
         })
         .expect("the immutable completion gate should report its failed check");
+    assert_eq!(contract_error["run_terminal"].as_bool(), Some(true));
     assert_eq!(contract_error["plan_id"], "plan_stale_contract");
     assert_eq!(contract_error["revision"], 2);
     assert_eq!(
@@ -3658,7 +3911,7 @@ async fn switch_session_broadcasts_session_list_when_session_set_changes() {
 
     assert_eq!(session_id, new_session_id);
 
-    switch_socket_session(
+    let created_fresh = switch_socket_session(
         &state,
         &tx,
         &current_session_ref,
@@ -3670,7 +3923,7 @@ async fn switch_session_broadcasts_session_list_when_session_set_changes() {
     .await
     .expect("session switch should succeed");
 
-    if result.session_list_changed {
+    if result.session_list_changed || created_fresh {
         broadcast_session_list_payload(&state).await;
     }
     ws_send(
@@ -4220,7 +4473,18 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
 
     {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+        let mut session = test_session(&session_id, "Main", None);
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some("stop this active run".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        });
+        sessions.insert(session_id.clone(), session);
     }
 
     let outcome = run_agent_session(
@@ -4244,6 +4508,66 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
     assert_eq!(done_event["type"].as_str(), Some("done"));
     assert_eq!(done_event["phase"].as_str(), Some("stopped"));
     assert_eq!(done_event["reason"].as_str(), Some("user_stop"));
+}
+
+#[tokio::test]
+async fn stopped_run_with_ambiguous_anchor_emits_one_live_incomplete_terminal() {
+    let state = Arc::new(test_app_state());
+    let session_id = "stopped-ambiguous-anchor".to_string();
+    let cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(true));
+    let (live_tx, mut live_rx) = mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let (_inbound_tx, mut inbound_rx) = mpsc::channel::<String>(4);
+    let duplicate = ChatMessage {
+        role: "user".into(),
+        content: Some("stop this duplicate input".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(7),
+    };
+    let mut session = test_session(&session_id, "Stopped ambiguous", None);
+    session.messages.push(duplicate.clone());
+    session.messages.push(duplicate);
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        1,
+        &cancel,
+        &live_tx,
+        &mut inbound_rx,
+        &stop_requested,
+        AgentRunMode::Execute,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(outcome.run_stopped);
+    assert!(outcome.run_failed);
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    let terminal = events
+        .iter()
+        .filter(|event| event["run_terminal"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0]["code"], "terminal_identity_unavailable");
+    assert_eq!(terminal[0]["phase"], "incomplete");
+    assert!(!events.iter().any(|event| event["type"] == "done"));
+    assert!(
+        take_terminal_persistence_record(&session_id)
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -4375,7 +4699,18 @@ async fn run_agent_session_prioritizes_stop_request_over_cancel() {
 
     {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+        let mut session = test_session(&session_id, "Main", None);
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some("stop even if the connection is also cancelled".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(2),
+        });
+        sessions.insert(session_id.clone(), session);
     }
 
     let outcome = run_agent_session(
@@ -4417,6 +4752,16 @@ async fn run_agent_session_stop_preserves_interventions_after_trimming_incomplet
     let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
 
     let mut session = test_session(&session_id, "Main", None);
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("run both tool calls".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(3),
+    });
     session.messages.push(ChatMessage {
         role: "assistant".into(),
         content: None,
@@ -4503,13 +4848,45 @@ async fn run_agent_session_stop_preserves_interventions_after_trimming_incomplet
         .get(&session_id)
         .cloned()
         .expect("session should exist");
-    assert_eq!(persisted.messages.len(), 2);
+    assert_eq!(persisted.messages.len(), 3);
     assert_eq!(persisted.messages[0].role, "system");
     assert_eq!(persisted.messages[1].role, "user");
     assert_eq!(
         persisted.messages[1].content.as_deref(),
+        Some("run both tool calls")
+    );
+    assert_eq!(persisted.messages[2].role, "user");
+    assert_eq!(
+        persisted.messages[2].content.as_deref(),
         Some("follow-up detail")
     );
+}
+
+#[tokio::test]
+async fn active_run_stop_relay_is_bound_to_the_exact_stop_generation() {
+    let old_stop = Arc::new(AtomicBool::new(false));
+    let replacement_stop = Arc::new(AtomicBool::new(false));
+    let run_cancel = CancellationToken::new();
+    let relay_shutdown = CancellationToken::new();
+    let relay = tokio::spawn(relay_active_run_stop_to_cancellation(
+        Arc::clone(&old_stop),
+        run_cancel.clone(),
+        relay_shutdown.clone(),
+    ));
+
+    replacement_stop.store(true, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        !run_cancel.is_cancelled(),
+        "a replacement generation must not cancel the active run"
+    );
+
+    old_stop.store(true, Ordering::Relaxed);
+    tokio::time::timeout(Duration::from_secs(1), run_cancel.cancelled())
+        .await
+        .expect("the exact stop generation should cancel promptly");
+    relay_shutdown.cancel();
+    relay.await.expect("stop relay should finish cleanly");
 }
 
 #[tokio::test]
@@ -4570,12 +4947,15 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -4659,6 +5039,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     }
 }
@@ -4796,9 +5177,119 @@ async fn wait_for_completion_verifier_stop(gate: &CompletionVerifierTestGate) {
     .expect("completion verifier should stop cooperatively");
 }
 
+async fn wait_for_finish_phase_gate(gate: &FinishPhaseTestGate) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !gate.started.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Finish phase test gate should start");
+}
+
+struct FinishPhaseGateRelease(Arc<FinishPhaseTestGate>);
+
+impl Drop for FinishPhaseGateRelease {
+    fn drop(&mut self) {
+        self.0.release.store(true, Ordering::Relaxed);
+    }
+}
+
+struct RuntimeOutcomeGateRelease(Arc<crate::storage::RunOutcomeCommitTestGate>);
+
+impl Drop for RuntimeOutcomeGateRelease {
+    fn drop(&mut self) {
+        self.0.allow_commit();
+        self.0.allow_response();
+    }
+}
+
+async fn wait_for_runtime_outcome_gate(condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real SQLite terminal barrier should be reached");
+}
+
+fn terminal_merge_test_outcome(
+    session: &Session,
+    run_id: &str,
+    status: &str,
+    phase: &str,
+) -> crate::TopLevelRunOutcome {
+    crate::TopLevelRunOutcome {
+        diagnostic: None,
+        session_id: session.id.clone(),
+        run_id: run_id.to_string(),
+        run_connection_id: "terminal-merge-connection".to_string(),
+        status: status.to_string(),
+        phase: phase.to_string(),
+        reason: Some(phase.to_string()),
+        duration_ms: 45,
+        start_message_index: 1,
+        end_message_index: session.messages.len().saturating_sub(1),
+        plan_id: session.pending_plan.as_ref().map(|plan| plan.id.clone()),
+        plan_revision: session.pending_plan.as_ref().map(|plan| plan.revision),
+        started_at: 100,
+        finished_at: 101,
+    }
+}
+
 struct RuntimeLoopTestArtifactsGuard {
     session_id: String,
     workspace: PathBuf,
+}
+
+struct ManagedSessionArtifactsGuard {
+    session_id: String,
+}
+
+struct ReflectionRuntimeReset;
+
+impl Drop for ReflectionRuntimeReset {
+    fn drop(&mut self) {
+        refresh_reflection_runtime(false);
+    }
+}
+
+impl ManagedSessionArtifactsGuard {
+    fn new(session_id: &str) -> Self {
+        let workspace = crate::session_workspace_path(session_id);
+        if let Some(session_root) = workspace.parent() {
+            let _ = std::fs::remove_dir_all(session_root);
+        }
+        let session_path = crate::session_store::sessions_dir().join(format!("{session_id}.json"));
+        for path in [
+            session_path.clone(),
+            session_path.with_extension("json.tmp"),
+            session_path.with_extension("json.lingclaw-save-backup"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        Self {
+            session_id: session_id.to_string(),
+        }
+    }
+}
+
+impl Drop for ManagedSessionArtifactsGuard {
+    fn drop(&mut self) {
+        let session_path =
+            crate::session_store::sessions_dir().join(format!("{}.json", self.session_id));
+        for path in [
+            session_path.clone(),
+            session_path.with_extension("json.tmp"),
+            session_path.with_extension("json.lingclaw-save-backup"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(session_root) = crate::session_workspace_path(&self.session_id).parent() {
+            let _ = std::fs::remove_dir_all(session_root);
+        }
+    }
 }
 
 impl RuntimeLoopTestArtifactsGuard {
@@ -4859,12 +5350,15 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(true),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -5017,6 +5511,7 @@ async fn run_analyze_phase_emits_start_then_auto_trace_for_auto_rounds() {
     assert_eq!(auto_trace["provider"].as_str(), Some("openai"));
     assert!(auto_trace["selected_think"].as_str().is_some());
     assert_eq!(error["type"].as_str(), Some("error"));
+    assert_eq!(error["run_terminal"].as_bool(), Some(true));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -5096,6 +5591,7 @@ async fn run_analyze_phase_emits_post_hook_think_in_auto_trace() {
             .any(|value| value.as_str() == Some("hook_think_override"))
     }));
     assert_eq!(error["type"].as_str(), Some("error"));
+    assert_eq!(error["run_terminal"].as_bool(), Some(true));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -6094,19 +6590,6 @@ async fn refreshed_revision_replaces_evidence_only_when_submission_succeeds() {
         .await
         .insert(session_id.clone(), session);
 
-    let cancel = CancellationToken::new();
-    let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
-        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
-    let ctx = AgentRunCtx {
-        state: &state,
-        config: state.config(),
-        model: state.config().model.clone(),
-        current_session_id: &session_id,
-        cancel: &cancel,
-        live_tx: &live_tx,
-        run_cancel: &run_cancel,
-    };
     let mut phase_state = phase_state_for_analyze_test();
     phase_state.run_mode = AgentRunMode::PlanOnly;
     phase_state.replace_plan_evidence = true;
@@ -6128,7 +6611,15 @@ async fn refreshed_revision_replaces_evidence_only_when_submission_succeeds() {
         .react_ctx
         .transition_to_finish(agent::FinishReason::Complete);
 
-    let events = register_pending_plan(&ctx, &mut phase_state).await;
+    let events = {
+        let mut sessions = state.sessions.lock().await;
+        register_pending_plan(
+            sessions
+                .get_mut(&session_id)
+                .expect("planning Session should remain loaded"),
+            &mut phase_state,
+        )
+    };
 
     assert!(!events.is_empty());
     let sessions = state.sessions.lock().await;
@@ -6187,19 +6678,6 @@ async fn pruned_plan_message_anchors_do_not_reuse_an_existing_revision() {
         .await
         .insert(session_id.clone(), session);
 
-    let cancel = CancellationToken::new();
-    let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
-        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
-    let ctx = AgentRunCtx {
-        state: &state,
-        config: state.config(),
-        model: state.config().model.clone(),
-        current_session_id: &session_id,
-        cancel: &cancel,
-        live_tx: &live_tx,
-        run_cancel: &run_cancel,
-    };
     let mut phase_state = phase_state_for_analyze_test();
     phase_state.run_mode = AgentRunMode::PlanOnly;
     phase_state.plan_submission = Some(
@@ -6219,7 +6697,15 @@ async fn pruned_plan_message_anchors_do_not_reuse_an_existing_revision() {
         .react_ctx
         .transition_to_finish(agent::FinishReason::Complete);
 
-    let events = register_pending_plan(&ctx, &mut phase_state).await;
+    let events = {
+        let mut sessions = state.sessions.lock().await;
+        register_pending_plan(
+            sessions
+                .get_mut(&session_id)
+                .expect("planning Session should remain loaded"),
+            &mut phase_state,
+        )
+    };
 
     assert!(!events.is_empty());
     let sessions = state.sessions.lock().await;
@@ -6327,7 +6813,11 @@ async fn run_finish_phase_plan_only_compatibility_fallback_registers_legacy_plan
     let mut config = test_config();
     config.structured_memory = true;
     let state = Arc::new(test_app_state_with_config(config.clone()));
-    let queue = crate::memory::MemoryUpdateQueue::spawn(config, state.sessions.clone());
+    let queue = crate::memory::MemoryUpdateQueue::spawn(
+        config,
+        state.sessions.clone(),
+        state.auxiliary_tasks.clone(),
+    );
     {
         let mut guard = state.memory_queue.lock().expect("memory queue lock");
         *guard = Some(queue.clone());
@@ -6574,19 +7064,6 @@ async fn structured_plan_reuses_the_submit_plan_assistant_message() {
         .await
         .insert(session_id.clone(), session);
 
-    let cancel = CancellationToken::new();
-    let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
-        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
-    let ctx = AgentRunCtx {
-        state: &state,
-        config: state.config(),
-        model: state.config().model.clone(),
-        current_session_id: &session_id,
-        cancel: &cancel,
-        live_tx: &live_tx,
-        run_cancel: &run_cancel,
-    };
     let mut phase_state = phase_state_for_analyze_test();
     phase_state.run_mode = AgentRunMode::PlanOnly;
     phase_state.plan_submission = Some(
@@ -6606,7 +7083,15 @@ async fn structured_plan_reuses_the_submit_plan_assistant_message() {
         .react_ctx
         .transition_to_finish(agent::FinishReason::Complete);
 
-    let events = register_pending_plan(&ctx, &mut phase_state).await;
+    let events = {
+        let mut sessions = state.sessions.lock().await;
+        register_pending_plan(
+            sessions
+                .get_mut(&session_id)
+                .expect("planning Session should remain loaded"),
+            &mut phase_state,
+        )
+    };
 
     assert!(!events.is_empty());
     let sessions = state.sessions.lock().await;
@@ -6734,6 +7219,16 @@ async fn run_finish_phase_does_not_report_completion_when_persistence_fails() {
     );
     let mut session = test_session(&session_id, "Finish Persist Failure", None);
     session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("finish the persisted plan".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
         role: "assistant".into(),
         content: Some("completed response".into()),
         images: None,
@@ -6818,6 +7313,16 @@ async fn run_finish_phase_marks_unreported_execution_steps_failed() {
         crate::generate_random_session_id().expect("random session id")
     );
     let mut session = test_session(&session_id, "Unreported execution", None);
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("execute every approved plan step".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
     session.messages.push(ChatMessage {
         role: "assistant".into(),
         content: Some("The plan is complete.".into()),
@@ -6919,6 +7424,211 @@ async fn run_finish_phase_marks_unreported_execution_steps_failed() {
 }
 
 #[tokio::test]
+async fn finish_missing_or_ambiguous_anchor_emits_one_live_terminal_without_outcome() {
+    for (suffix, messages) in [
+        (
+            "missing",
+            vec![ChatMessage {
+                role: "assistant".into(),
+                content: Some("there is no originating user message".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: Some(1),
+            }],
+        ),
+        (
+            "ambiguous",
+            vec![
+                ChatMessage {
+                    role: "user".into(),
+                    content: Some("identical run input".into()),
+                    images: None,
+                    thinking: None,
+                    anthropic_thinking_blocks: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Some(2),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: Some("identical run input".into()),
+                    images: None,
+                    thinking: None,
+                    anthropic_thinking_blocks: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Some(2),
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: Some("ambiguous terminal result".into()),
+                    images: None,
+                    thinking: None,
+                    anthropic_thinking_blocks: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Some(3),
+                },
+            ],
+        ),
+    ] {
+        let state = Arc::new(test_app_state());
+        let session_id = format!("terminal-anchor-live-{suffix}");
+        let mut session = test_session(&session_id, "Terminal anchor", None);
+        session.messages.extend(messages);
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), session);
+        let cancel = CancellationToken::new();
+        let run_cancel = CancellationToken::new();
+        let (live_tx, mut live_rx) = mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+        let ctx = AgentRunCtx {
+            state: &state,
+            config: state.config(),
+            model: state.config().model.clone(),
+            current_session_id: &session_id,
+            cancel: &cancel,
+            live_tx: &live_tx,
+            run_cancel: &run_cancel,
+        };
+        let mut phase_state = phase_state_for_analyze_test();
+        if suffix == "ambiguous" {
+            phase_state.terminal_message_anchor =
+                RunMessageAnchor::from_messages(&state.sessions.lock().await[&session_id].messages)
+                    .ok();
+        }
+        phase_state
+            .react_ctx
+            .transition_to_finish(agent::FinishReason::Complete);
+
+        assert!(matches!(
+            run_finish_phase(&ctx, &mut phase_state).await,
+            AgentPhaseControl::Break
+        ));
+        assert!(phase_state.run_failed);
+        let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+        let terminal = events
+            .iter()
+            .filter(|event| event["run_terminal"] == true)
+            .collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1, "{suffix} should emit one terminal");
+        assert_eq!(terminal[0]["type"], "error");
+        assert_eq!(terminal[0]["code"], "terminal_identity_unavailable");
+        assert_eq!(terminal[0]["phase"], "incomplete");
+        assert!(!events.iter().any(|event| event["type"] == "done"));
+        assert!(
+            take_terminal_persistence_record(&session_id)
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn finish_concurrent_anchor_rewrite_emits_one_terminal_without_generic_duplicate() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "terminal-anchor-concurrent-{}",
+        crate::generate_random_session_id().expect("random Session id")
+    );
+    let workspace = temp_workspace("terminal-anchor-concurrent");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should exist");
+    let mut session = test_session(&session_id, "Concurrent terminal anchor", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("original terminal anchor".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("final response".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(2),
+        },
+    ]);
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx) = mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let gate = Arc::new(FinishPhaseTestGate::new(
+        FinishPhaseTestStage::PostSessionMutation,
+    ));
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.cycle_workspace = workspace;
+    phase_state.completion_evidence.finish_gate = Some(Arc::clone(&gate));
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let rewrite = async {
+        wait_for_finish_phase_gate(&gate).await;
+        let _release = FinishPhaseGateRelease(Arc::clone(&gate));
+        let mut sessions = state.sessions.lock().await;
+        let user = sessions
+            .get_mut(&session_id)
+            .and_then(|session| {
+                session
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.role == "user")
+            })
+            .expect("originating user message should exist");
+        user.content = Some("concurrently rewritten anchor".into());
+    };
+    let (control, ()) = tokio::join!(run_finish_phase(&ctx, &mut phase_state), rewrite);
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(phase_state.run_failed);
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    let terminal = events
+        .iter()
+        .filter(|event| event["run_terminal"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 1, "anchor failure must have one terminal");
+    assert_eq!(terminal[0]["code"], "terminal_identity_unavailable");
+    assert_eq!(terminal[0]["phase"], "incomplete");
+    assert!(!events.iter().any(|event| {
+        event["content"] == "The final Agent state could not be saved." || event["type"] == "done"
+    }));
+    assert!(
+        take_terminal_persistence_record(&session_id)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn run_finish_phase_stop_cancels_a_slow_completion_verifier_without_terminal_write() {
     let state = Arc::new(test_app_state());
     let session_id = format!(
@@ -7002,6 +7712,1962 @@ async fn run_finish_phase_stop_cancels_a_slow_completion_verifier_without_termin
 }
 
 #[tokio::test]
+async fn run_finish_phase_stop_wins_at_every_post_verifier_blocking_boundary() {
+    for (index, stage) in [
+        FinishPhaseTestStage::OnFinishHook,
+        FinishPhaseTestStage::Usage,
+        FinishPhaseTestStage::BetweenHookEvents,
+        FinishPhaseTestStage::BetweenPlanEvents,
+        FinishPhaseTestStage::PostSessionMutation,
+        FinishPhaseTestStage::PreTerminalCommit,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state = Arc::new(test_app_state());
+        let session_id = format!(
+            "finish-post-verifier-stop-{index}-{}",
+            crate::generate_random_session_id().expect("random session id")
+        );
+        let workspace = temp_workspace(&format!("finish-post-verifier-stop-{index}"));
+        let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+        std::fs::create_dir_all(&workspace).expect("workspace should be created");
+        let plan = completion_verifier_test_plan(&format!("plan_finish_stop_{index}"));
+        let mut session = test_session(&session_id, "Finish post-verifier stop", None);
+        session.workspace = workspace.clone();
+        session.working_directory = workspace.clone();
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some(format!("finish the approved plan at stage {stage:?}")),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(30 + index as u64),
+        });
+        session.pending_plan = Some(plan.clone());
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), session);
+
+        let cancel = CancellationToken::new();
+        let run_cancel = CancellationToken::new();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 180 + index as u64,
+                cancel: run_cancel.clone(),
+                stop_requested: Arc::clone(&stop_requested),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+            mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+        let ctx = AgentRunCtx {
+            state: &state,
+            config: state.config(),
+            model: state.config().model.clone(),
+            current_session_id: &session_id,
+            cancel: &cancel,
+            live_tx: &live_tx,
+            run_cancel: &run_cancel,
+        };
+        let gate = Arc::new(FinishPhaseTestGate::new(stage));
+        let mut phase_state = phase_state_for_analyze_test();
+        phase_state.run_mode = AgentRunMode::Execute;
+        phase_state.cycle_workspace = workspace.clone();
+        phase_state.approved_plan = Some(plan);
+        phase_state.completion_evidence.finish_gate = Some(Arc::clone(&gate));
+        phase_state
+            .react_ctx
+            .transition_to_finish(agent::FinishReason::Complete);
+
+        let trigger = async {
+            wait_for_finish_phase_gate(&gate).await;
+            stop_requested.store(true, Ordering::Relaxed);
+        };
+        assert!(
+            session_store::load_session_from_storage_result(&session_id)
+                .expect("test storage lookup should succeed")
+                .is_none()
+        );
+        let (control, ()) = tokio::join!(run_finish_phase(&ctx, &mut phase_state), trigger);
+
+        assert!(matches!(control, AgentPhaseControl::Break), "{stage:?}");
+        assert!(phase_state.run_stopped, "{stage:?}");
+        assert!(!phase_state.run_failed, "{stage:?}");
+        let current_plan = state.sessions.lock().await[&session_id]
+            .pending_plan
+            .clone()
+            .expect("approved plan should remain available");
+        assert_eq!(
+            current_plan.status,
+            crate::plan::PlanStatus::Executing,
+            "{stage:?}"
+        );
+        assert!(current_plan.finished_at.is_none(), "{stage:?}");
+        assert_eq!(
+            phase_state.completion_evidence.terminal_linearization,
+            TerminalLinearizationState::PreCommit,
+            "{stage:?} must not choose a natural terminal transaction"
+        );
+        assert!(
+            session_store::load_session_from_storage_result(&session_id)
+                .expect("test storage lookup should succeed")
+                .is_none(),
+            "{stage:?} must not perform an independent pre-terminal Session save"
+        );
+        assert!(
+            std::iter::from_fn(|| live_rx.try_recv().ok()).all(|event| {
+                event["type"] != "done"
+                    && event["type"] != "plan_state"
+                    && !(event["type"] == "error" && event["run_terminal"] == true)
+            }),
+            "{stage:?} emitted a late terminal or Plan event"
+        );
+        state.active_runs.lock().await.remove(&session_id);
+    }
+}
+
+#[tokio::test]
+async fn run_finish_phase_natural_terminal_wins_after_database_commit_is_chosen() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "finish-post-commit-stop-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("finish-post-commit-stop");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let plan = completion_verifier_test_plan("plan_finish_post_commit_stop");
+    let mut session = test_session(&session_id, "Finish post-commit stop", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("finish the approved plan before the late stop".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(40),
+    });
+    session.pending_plan = Some(plan.clone());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    state.active_runs.lock().await.insert(
+        session_id.clone(),
+        SessionRunBinding {
+            connection_id: 191,
+            cancel: run_cancel.clone(),
+            stop_requested: Arc::clone(&stop_requested),
+            deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+        },
+    );
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let gate = Arc::new(FinishPhaseTestGate::new(
+        FinishPhaseTestStage::PostCommitBeforeAck,
+    ));
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::Execute;
+    phase_state.cycle_workspace = workspace.clone();
+    phase_state.approved_plan = Some(plan);
+    phase_state.completion_evidence.finish_gate = Some(Arc::clone(&gate));
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let trigger = async {
+        wait_for_finish_phase_gate(&gate).await;
+        assert_eq!(
+            state.sessions.lock().await[&session_id]
+                .pending_plan
+                .as_ref()
+                .map(|plan| plan.status),
+            Some(crate::plan::PlanStatus::Executing),
+            "in-memory readers must not observe Plan completion before commit acknowledgement"
+        );
+        assert!(live_rx.try_recv().is_err());
+        stop_requested.store(true, Ordering::Relaxed);
+        gate.release.store(true, Ordering::Relaxed);
+    };
+    let (control, ()) = tokio::join!(run_finish_phase(&ctx, &mut phase_state), trigger);
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(!phase_state.run_stopped);
+    assert!(!phase_state.run_failed);
+    assert_eq!(
+        phase_state.completion_evidence.terminal_linearization,
+        TerminalLinearizationState::Committed
+    );
+    assert_eq!(
+        state.sessions.lock().await[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Completed)
+    );
+    let (_, outcome) = take_terminal_persistence_record(&session_id)
+        .await
+        .expect("the natural terminal transaction should be recorded");
+    assert_eq!(outcome.status, "completed");
+    let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "plan_state" && event["plan"]["status"] == "completed"
+        })
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "done" && event["phase"] == "finish")
+    );
+    stop_requested.store(false, Ordering::Relaxed);
+    state.active_runs.lock().await.remove(&session_id);
+}
+
+#[test]
+fn terminal_session_patch_preserves_concurrent_non_run_fields_and_rejects_a_new_tail() {
+    let session_id = "terminal-field-merge";
+    let mut base = test_session(session_id, "Original name", None);
+    base.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("finish this run".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(10),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("run result".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(11),
+        },
+    ]);
+    base.pending_plan = Some(completion_verifier_test_plan("terminal-field-merge-plan"));
+
+    let mut terminal = base.clone();
+    let terminal_plan = terminal.pending_plan.as_mut().expect("plan should exist");
+    terminal_plan.status = crate::plan::PlanStatus::Completed;
+    terminal_plan.finished_at = Some(30);
+    terminal.updated_at = 30;
+    let anchor = RunMessageAnchor::from_messages(&base.messages)
+        .expect("run user anchor should be captured");
+    let patch = TerminalSessionPatch::new(&base, &terminal, &anchor)
+        .expect("terminal patch should be constructible");
+
+    let mut latest = base.clone();
+    latest.name = "Renamed while Finish waited".into();
+    latest.model_override = Some("provider/new-model".into());
+    latest.think_level = "high".into();
+    latest.input_tokens = 900;
+    latest.todos = crate::todos::TodoSnapshot {
+        revision: 4,
+        items: vec![crate::todos::TodoItem {
+            id: "keep".into(),
+            content: "Keep concurrent Todo".into(),
+            status: crate::todos::TodoStatus::InProgress,
+        }],
+        last_updated_by: crate::todos::TodoUpdatedBy::User,
+        updated_at: 40,
+    };
+    latest.updated_at = 40;
+
+    let merged = patch
+        .apply_to_latest(&latest)
+        .expect("unrelated concurrent fields should merge");
+    assert_eq!(merged.name, "Renamed while Finish waited");
+    assert_eq!(merged.model_override.as_deref(), Some("provider/new-model"));
+    assert_eq!(merged.think_level, "high");
+    assert_eq!(merged.input_tokens, 900);
+    assert_eq!(merged.todos.revision, 4);
+    assert_eq!(
+        merged.pending_plan.as_ref().map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Completed)
+    );
+    assert!(terminal_patch_values_match(
+        &merged.messages,
+        &terminal.messages
+    ));
+    assert_eq!(merged.updated_at, 40);
+
+    let mut next_run_started = latest;
+    next_run_started.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("next run must not enter the old boundary".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(12),
+    });
+    assert!(
+        patch.apply_to_latest(&next_run_started).is_err(),
+        "a changed run-owned tail must fail closed instead of dropping or adopting it"
+    );
+
+    let mut different_plan_generation = next_run_started;
+    different_plan_generation.messages.pop();
+    different_plan_generation
+        .pending_plan
+        .as_mut()
+        .expect("plan should still exist")
+        .revision += 1;
+    assert!(
+        patch.apply_to_latest(&different_plan_generation).is_err(),
+        "a different Plan revision must not be overwritten by an old terminal patch"
+    );
+}
+
+#[test]
+fn run_message_anchor_survives_prefix_compression_duplicates_and_image_url_normalization() {
+    let older = ChatMessage {
+        role: "user".into(),
+        content: Some("repeat this request".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(100),
+    };
+    let current = ChatMessage {
+        role: "user".into(),
+        content: Some("repeat this request".into()),
+        images: Some(vec![crate::ImageAttachment {
+            url: "https://signed.example/temporary".into(),
+            name: Some("request.png".into()),
+            mime_type: Some("image/png".into()),
+            s3_object_key: Some("uploads/request.png".into()),
+            s3_config_id: Some("s3-current".into()),
+            cache_path: None,
+            data: None,
+        }]),
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(200),
+    };
+    let original = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("system".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        older,
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("older answer".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(101),
+        },
+        current.clone(),
+    ];
+    let anchor = RunMessageAnchor::from_messages(&original)
+        .expect("current user message should be anchored");
+    assert_eq!(anchor.resolve(&original).unwrap(), 3);
+
+    let mut normalized_current = current.clone();
+    normalized_current.images.as_mut().unwrap()[0].url.clear();
+    let compressed = vec![
+        original[0].clone(),
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("compressed history summary".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(150),
+        },
+        normalized_current.clone(),
+    ];
+    assert_eq!(
+        anchor
+            .resolve(&compressed)
+            .expect("compressed suffix should retain the anchor"),
+        2
+    );
+
+    let mut missing = compressed.clone();
+    missing.remove(2);
+    assert!(anchor.resolve(&missing).is_err());
+
+    let mut ambiguous = compressed;
+    ambiguous.push(normalized_current);
+    assert!(
+        anchor.resolve(&ambiguous).is_err(),
+        "an exact duplicate identity must fail closed instead of guessing"
+    );
+}
+
+#[test]
+fn stopped_terminal_patch_trims_only_the_run_tail_and_preserves_concurrent_fields() {
+    let mut base = test_session("terminal-stopped-merge", "Stopped merge", None);
+    base.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("stop after this tool starts".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(20),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("unfinished tool call".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(21),
+        },
+    ]);
+    base.pending_plan = Some(completion_verifier_test_plan("terminal-stopped-plan"));
+    let mut stopped = base.clone();
+    stopped.messages.truncate(2);
+    let stopped_plan = stopped.pending_plan.as_mut().expect("plan should exist");
+    stopped_plan.status = crate::plan::PlanStatus::Stopped;
+    stopped_plan.finished_at = Some(50);
+    stopped.updated_at = 50;
+    let anchor = RunMessageAnchor::from_messages(&base.messages)
+        .expect("stopped user anchor should be captured");
+    let patch = TerminalSessionPatch::new(&base, &stopped, &anchor)
+        .expect("stopped patch should be constructible");
+
+    let mut latest = base;
+    latest.show_reasoning = false;
+    latest.working_directory = temp_workspace("terminal-stopped-rebind");
+    latest.todos.revision = 3;
+    latest.updated_at = 60;
+    let merged = patch
+        .apply_to_latest(&latest)
+        .expect("stopped patch should preserve non-run fields");
+    assert!(terminal_patch_values_match(
+        &merged.messages,
+        &stopped.messages
+    ));
+    assert!(!merged.show_reasoning);
+    assert_eq!(merged.working_directory, latest.working_directory);
+    assert_eq!(merged.todos.revision, 3);
+    assert_eq!(
+        merged.pending_plan.as_ref().map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Stopped)
+    );
+    assert_eq!(merged.updated_at, 60);
+}
+
+#[tokio::test]
+async fn finish_merges_a_todo_committed_after_candidate_preparation() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "finish-todo-merge-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let workspace = temp_workspace("finish-todo-merge");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let plan = completion_verifier_test_plan("finish-todo-merge-plan");
+    let mut session = test_session(&session_id, "Finish Todo merge", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.pending_plan = Some(plan.clone());
+    session.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("complete the approved plan".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(70),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("approved result complete".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(71),
+        },
+    ]);
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let gate = Arc::new(FinishPhaseTestGate::new(
+        FinishPhaseTestStage::PostSessionMutation,
+    ));
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::Execute;
+    phase_state.cycle_workspace = workspace;
+    phase_state.approved_plan = Some(plan);
+    phase_state.completion_evidence.finish_gate = Some(Arc::clone(&gate));
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let concurrent_todo = async {
+        wait_for_finish_phase_gate(&gate).await;
+        let _release = FinishPhaseGateRelease(Arc::clone(&gate));
+        let response = crate::todos::replace_session_todos(
+            &state,
+            &session_id,
+            crate::todos::TodoReplaceRequest {
+                base_revision: 0,
+                items: vec![crate::todos::TodoItem {
+                    id: "concurrent".into(),
+                    content: "Committed while Finish waits".into(),
+                    status: crate::todos::TodoStatus::Pending,
+                }],
+            },
+            crate::todos::TodoUpdateOrigin::User,
+        )
+        .await
+        .expect("concurrent Todo update should persist");
+        assert!(response.ok);
+    };
+    let (control, ()) = tokio::join!(run_finish_phase(&ctx, &mut phase_state), concurrent_todo);
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(!phase_state.run_failed);
+    let current = state.sessions.lock().await[&session_id].clone();
+    assert_eq!(current.todos.revision, 1);
+    assert_eq!(current.todos.items[0].id, "concurrent");
+    assert_eq!(
+        current.pending_plan.as_ref().map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Completed)
+    );
+    let persisted = crate::session_store::load_session_snapshot_from_path(
+        &crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    )
+    .expect("terminal snapshot should persist");
+    assert_eq!(persisted.todos.revision, 1);
+    assert_eq!(persisted.todos.items[0].id, "concurrent");
+    assert_eq!(
+        persisted.pending_plan.as_ref().map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Completed)
+    );
+}
+
+#[tokio::test]
+async fn terminal_merge_real_sqlite_preserves_concurrent_fields_and_run_boundaries() {
+    let home = temp_workspace("terminal-merge-real-sqlite");
+    std::fs::create_dir_all(&home).expect("database home should be created");
+    let database = crate::storage::Database::open(home.join("lingclaw.db"))
+        .await
+        .expect("real SQLite database should open");
+
+    let mut base = test_session("terminal-sqlite-complete", "Complete merge", None);
+    base.version = crate::SESSION_VERSION;
+    base.working_directory = home.clone();
+    base.workspace = home.clone();
+    base.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("complete transactionally".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(101),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("completed result".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(102),
+        },
+    ]);
+    base.pending_plan = Some(completion_verifier_test_plan("terminal-sqlite-plan"));
+    database
+        .save_session(&base)
+        .await
+        .expect("base Session should persist");
+    let expected = database
+        .load_session(&base.id)
+        .await
+        .expect("base Session should load")
+        .expect("base Session should exist");
+    let mut terminal = expected.clone();
+    let plan = terminal.pending_plan.as_mut().expect("plan should exist");
+    plan.status = crate::plan::PlanStatus::Completed;
+    plan.finished_at = Some(110);
+    terminal.updated_at = 110;
+    let anchor = RunMessageAnchor::from_messages(&expected.messages)
+        .expect("SQLite run anchor should be captured");
+    let patch = TerminalSessionPatch::new(&expected, &terminal, &anchor)
+        .expect("completed patch should be constructed");
+
+    let rebound = home.join("rebound-working-directory");
+    std::fs::create_dir_all(&rebound).expect("rebound directory should exist");
+    let mut independently_committed = expected.clone();
+    independently_committed.name = "Concurrent rename".into();
+    independently_committed.model_override = Some("provider/concurrent-model".into());
+    independently_committed.think_level = "xhigh".into();
+    independently_committed.working_directory = rebound.clone();
+    independently_committed.workspace_kind = crate::SessionWorkspaceKind::Directory;
+    independently_committed.input_tokens = 1234;
+    independently_committed.output_tokens = 567;
+    independently_committed.todos = crate::todos::TodoSnapshot {
+        revision: 8,
+        items: vec![crate::todos::TodoItem {
+            id: "sqlite-todo".into(),
+            content: "Preserve the independently committed Todo".into(),
+            status: crate::todos::TodoStatus::Completed,
+        }],
+        last_updated_by: crate::todos::TodoUpdatedBy::User,
+        updated_at: 120,
+    };
+    independently_committed.updated_at = 120;
+    database
+        .save_session(&independently_committed)
+        .await
+        .expect("concurrent writer should persist first");
+
+    let latest = database
+        .load_session(&base.id)
+        .await
+        .expect("latest Session should load")
+        .expect("latest Session should exist");
+    let merged = patch
+        .apply_to_latest(&latest)
+        .expect("terminal fields should merge into the latest Session");
+    database
+        .save_session_with_run_outcome(
+            &merged,
+            terminal_merge_test_outcome(
+                &merged,
+                "run-terminal-sqlite-complete",
+                "completed",
+                "finish",
+            ),
+        )
+        .await
+        .expect("terminal Session and outcome should commit atomically");
+
+    let stored = database
+        .load_session(&base.id)
+        .await
+        .expect("committed Session should load")
+        .expect("committed Session should exist");
+    assert_eq!(stored.name, "Concurrent rename");
+    assert_eq!(
+        stored.model_override.as_deref(),
+        Some("provider/concurrent-model")
+    );
+    assert_eq!(stored.think_level, "xhigh");
+    assert_eq!(stored.working_directory, rebound);
+    assert_eq!(
+        stored.workspace_kind,
+        crate::SessionWorkspaceKind::Directory
+    );
+    assert_eq!(stored.input_tokens, 1234);
+    assert_eq!(stored.output_tokens, 567);
+    assert_eq!(stored.todos.revision, 8);
+    assert_eq!(
+        stored.pending_plan.as_ref().map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Completed)
+    );
+    let outcomes = database
+        .load_run_outcomes(&base.id)
+        .await
+        .expect("terminal outcome should load");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, "completed");
+
+    let mut stopped_base = expected.clone();
+    stopped_base.id = "terminal-sqlite-stopped".into();
+    stopped_base.name = "Stopped merge".into();
+    stopped_base.pending_plan = Some(completion_verifier_test_plan(
+        "terminal-sqlite-stopped-plan",
+    ));
+    database
+        .save_session(&stopped_base)
+        .await
+        .expect("stopped base should persist");
+    let stopped_expected = database
+        .load_session(&stopped_base.id)
+        .await
+        .expect("stopped base should load")
+        .expect("stopped base should exist");
+    let mut stopped_terminal = stopped_expected.clone();
+    stopped_terminal.messages.pop();
+    let plan = stopped_terminal
+        .pending_plan
+        .as_mut()
+        .expect("stopped plan should exist");
+    plan.status = crate::plan::PlanStatus::Stopped;
+    plan.finished_at = Some(130);
+    let stopped_anchor = RunMessageAnchor::from_messages(&stopped_expected.messages)
+        .expect("stopped SQLite anchor should be captured");
+    let stopped_patch =
+        TerminalSessionPatch::new(&stopped_expected, &stopped_terminal, &stopped_anchor)
+            .expect("stopped patch should be constructed");
+    let mut stopped_concurrent = stopped_expected.clone();
+    stopped_concurrent.todos.revision = 9;
+    stopped_concurrent.model_override = Some("provider/stopped-concurrent".into());
+    database
+        .save_session(&stopped_concurrent)
+        .await
+        .expect("stopped concurrent writer should persist");
+    let stopped_latest = database
+        .load_session(&stopped_base.id)
+        .await
+        .expect("stopped latest Session should load")
+        .expect("stopped latest Session should exist");
+    let stopped_merged = stopped_patch
+        .apply_to_latest(&stopped_latest)
+        .expect("stopped fields should merge");
+    database
+        .save_session_with_run_outcome(
+            &stopped_merged,
+            terminal_merge_test_outcome(
+                &stopped_merged,
+                "run-terminal-sqlite-stopped",
+                "stopped",
+                "stopped",
+            ),
+        )
+        .await
+        .expect("stopped outcome should commit");
+    let stored_stopped = database
+        .load_session(&stopped_base.id)
+        .await
+        .expect("stopped Session should load")
+        .expect("stopped Session should exist");
+    assert_eq!(
+        stored_stopped.messages.len(),
+        stopped_terminal.messages.len()
+    );
+    assert_eq!(stored_stopped.todos.revision, 9);
+    assert_eq!(
+        stored_stopped.model_override.as_deref(),
+        Some("provider/stopped-concurrent")
+    );
+    assert_eq!(
+        stored_stopped.pending_plan.as_ref().map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Stopped)
+    );
+
+    let mut boundary_base = expected;
+    boundary_base.id = "terminal-sqlite-boundary".into();
+    boundary_base.pending_plan = Some(completion_verifier_test_plan(
+        "terminal-sqlite-boundary-plan",
+    ));
+    database
+        .save_session(&boundary_base)
+        .await
+        .expect("boundary base should persist");
+    let boundary_expected = database
+        .load_session(&boundary_base.id)
+        .await
+        .expect("boundary base should load")
+        .expect("boundary base should exist");
+    let mut boundary_terminal = boundary_expected.clone();
+    boundary_terminal
+        .pending_plan
+        .as_mut()
+        .expect("boundary plan should exist")
+        .status = crate::plan::PlanStatus::Completed;
+    let boundary_anchor = RunMessageAnchor::from_messages(&boundary_expected.messages)
+        .expect("boundary anchor should be captured");
+    let boundary_patch =
+        TerminalSessionPatch::new(&boundary_expected, &boundary_terminal, &boundary_anchor)
+            .expect("boundary patch should be constructed");
+    let mut next_run = boundary_expected.clone();
+    next_run.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("deferred next-run message".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(140),
+    });
+    database
+        .save_session(&next_run)
+        .await
+        .expect("next-run message should persist first");
+    let next_latest = database
+        .load_session(&boundary_base.id)
+        .await
+        .expect("next-run Session should load")
+        .expect("next-run Session should exist");
+    assert!(
+        boundary_patch.apply_to_latest(&next_latest).is_err(),
+        "an old terminal patch must not adopt or erase a next-run message"
+    );
+    assert!(
+        database
+            .load_run_outcomes(&boundary_base.id)
+            .await
+            .expect("boundary outcomes should load")
+            .is_empty()
+    );
+
+    database
+        .close_for_test()
+        .await
+        .expect("real SQLite connection should close");
+    std::fs::remove_dir_all(&home).expect("real SQLite test home should be removable");
+}
+
+#[tokio::test]
+async fn terminal_sqlite_response_delay_keeps_later_writers_behind_the_persist_gate() {
+    let home = temp_workspace("terminal-response-gate-real-sqlite");
+    std::fs::create_dir_all(&home).expect("database home should be created");
+    let database = crate::storage::Database::open(home.join("lingclaw.db"))
+        .await
+        .expect("real SQLite database should open");
+    let mut session = test_session("terminal-response-gate", "Response gate", None);
+    session.version = crate::SESSION_VERSION;
+    session.working_directory = home.clone();
+    session.workspace = home.clone();
+    session.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("commit before releasing the gate".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(201),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("committed result".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(202),
+        },
+    ]);
+    session.pending_plan = Some(completion_verifier_test_plan("terminal-response-gate-plan"));
+    database
+        .save_session(&session)
+        .await
+        .expect("base Session should persist");
+    let mut terminal = database
+        .load_session(&session.id)
+        .await
+        .expect("base Session should load")
+        .expect("base Session should exist");
+    terminal
+        .pending_plan
+        .as_mut()
+        .expect("terminal plan should exist")
+        .status = crate::plan::PlanStatus::Completed;
+
+    let database_gate = Arc::new(crate::storage::RunOutcomeCommitTestGate::default());
+    let _database_gate_release = RuntimeOutcomeGateRelease(Arc::clone(&database_gate));
+    database_gate.allow_commit();
+    let persist_gate = crate::session_store::session_persist_gate(&session.id);
+    let terminal_task = {
+        let database = database.clone();
+        let terminal = terminal.clone();
+        let database_gate = Arc::clone(&database_gate);
+        let persist_gate = Arc::clone(&persist_gate);
+        tokio::spawn(async move {
+            let _guard = persist_gate.lock().await;
+            database
+                .save_session_with_run_outcome_test_gated(
+                    &terminal,
+                    terminal_merge_test_outcome(
+                        &terminal,
+                        "run-terminal-response-gate",
+                        "completed",
+                        "finish",
+                    ),
+                    database_gate,
+                )
+                .await
+        })
+    };
+    wait_for_runtime_outcome_gate(|| database_gate.committed()).await;
+
+    let writer_attempted = Arc::new(tokio::sync::Notify::new());
+    let writer_acquired = Arc::new(tokio::sync::Notify::new());
+    let writer_task = {
+        let database = database.clone();
+        let session_id = session.id.clone();
+        let persist_gate = Arc::clone(&persist_gate);
+        let writer_attempted = Arc::clone(&writer_attempted);
+        let writer_acquired = Arc::clone(&writer_acquired);
+        tokio::spawn(async move {
+            writer_attempted.notify_one();
+            let _guard = persist_gate.lock().await;
+            writer_acquired.notify_one();
+            let mut latest = database
+                .load_session(&session_id)
+                .await?
+                .ok_or_else(|| crate::storage::StorageError::new("missing Session"))?;
+            latest.model_override = Some("provider/after-terminal".into());
+            latest.think_level = "high".into();
+            latest.todos = crate::todos::TodoSnapshot {
+                revision: 2,
+                items: vec![crate::todos::TodoItem {
+                    id: "after-terminal".into(),
+                    content: "Writer waited for terminal acknowledgement".into(),
+                    status: crate::todos::TodoStatus::Pending,
+                }],
+                last_updated_by: crate::todos::TodoUpdatedBy::User,
+                updated_at: 220,
+            };
+            database.save_session(&latest).await
+        })
+    };
+    writer_attempted.notified().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), writer_acquired.notified())
+            .await
+            .is_err(),
+        "a later writer must remain blocked until the terminal database response returns"
+    );
+
+    database_gate.allow_response();
+    terminal_task
+        .await
+        .expect("terminal task should join")
+        .expect("terminal transaction should succeed");
+    writer_task
+        .await
+        .expect("writer task should join")
+        .expect("writer should save after the gate releases");
+
+    let stored = database
+        .load_session(&session.id)
+        .await
+        .expect("final Session should load")
+        .expect("final Session should exist");
+    assert_eq!(
+        stored.pending_plan.as_ref().map(|plan| plan.status),
+        Some(crate::plan::PlanStatus::Completed)
+    );
+    assert_eq!(
+        stored.model_override.as_deref(),
+        Some("provider/after-terminal")
+    );
+    assert_eq!(stored.think_level, "high");
+    assert_eq!(stored.todos.revision, 2);
+    assert_eq!(
+        database
+            .load_run_outcomes(&session.id)
+            .await
+            .expect("outcome should load")
+            .len(),
+        1
+    );
+
+    database
+        .close_for_test()
+        .await
+        .expect("response-gate SQLite connection should close");
+    std::fs::remove_dir_all(&home).expect("response-gate test home should be removable");
+}
+
+#[tokio::test]
+async fn auxiliary_usage_waits_for_terminal_ack_is_idempotent_and_survives_reopen() {
+    let home = temp_workspace("auxiliary-usage-terminal-gate");
+    std::fs::create_dir_all(&home).expect("database home should be created");
+    let database_path = home.join("lingclaw.db");
+    let database = crate::storage::Database::open(database_path.clone())
+        .await
+        .expect("real SQLite database should open");
+    let mut session = test_session("auxiliary-usage-terminal-gate", "Aux Usage", None);
+    session.version = crate::SESSION_VERSION;
+    session.workspace = home.clone();
+    session.working_directory = home.clone();
+    session.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("finish before auxiliary usage".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(301),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("terminal result".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(302),
+        },
+    ]);
+    database
+        .save_session(&session)
+        .await
+        .expect("base Session should persist");
+    let sessions = Arc::new(Mutex::new(HashMap::from([(
+        session.id.clone(),
+        session.clone(),
+    )])));
+
+    let database_gate = Arc::new(crate::storage::RunOutcomeCommitTestGate::default());
+    let _database_gate_release = RuntimeOutcomeGateRelease(Arc::clone(&database_gate));
+    database_gate.allow_commit();
+    let persist_gate = crate::session_store::session_persist_gate(&session.id);
+    let terminal_task = {
+        let database = database.clone();
+        let session = session.clone();
+        let database_gate = Arc::clone(&database_gate);
+        let persist_gate = Arc::clone(&persist_gate);
+        tokio::spawn(async move {
+            let _guard = persist_gate.lock().await;
+            database
+                .save_session_with_run_outcome_test_gated(
+                    &session,
+                    terminal_merge_test_outcome(
+                        &session,
+                        "run-auxiliary-usage-terminal-gate",
+                        "completed",
+                        "finish",
+                    ),
+                    database_gate,
+                )
+                .await
+        })
+    };
+    wait_for_runtime_outcome_gate(|| database_gate.committed()).await;
+
+    let reflection_update = crate::context::UsageUpdate {
+        input_tokens: 11,
+        output_tokens: 7,
+        input_source: "provider".into(),
+        output_source: "provider".into(),
+        labels: crate::context::build_usage_labels(
+            11,
+            7,
+            Some("mock-provider"),
+            Some(crate::context::USAGE_ROLE_REFLECTION),
+        ),
+    };
+    let memory_update = crate::context::UsageUpdate {
+        input_tokens: 5,
+        output_tokens: 3,
+        input_source: "provider".into(),
+        output_source: "provider".into(),
+        labels: crate::context::build_usage_labels(
+            5,
+            3,
+            Some("mock-provider"),
+            Some(crate::context::USAGE_ROLE_MEMORY),
+        ),
+    };
+    let reflection_attempted = Arc::new(tokio::sync::Notify::new());
+    let memory_attempted = Arc::new(tokio::sync::Notify::new());
+    let reflection_task = {
+        let database = database.clone();
+        let sessions = Arc::clone(&sessions);
+        let session_id = session.id.clone();
+        let update = reflection_update.clone();
+        let attempted = Arc::clone(&reflection_attempted);
+        tokio::spawn(async move {
+            attempted.notify_one();
+            crate::session_store::persist_auxiliary_usage_update_with_database(
+                database,
+                sessions,
+                session_id,
+                "reflection-provider-call-1".into(),
+                update,
+            )
+            .await
+        })
+    };
+    let memory_task = {
+        let database = database.clone();
+        let sessions = Arc::clone(&sessions);
+        let session_id = session.id.clone();
+        let update = memory_update.clone();
+        let attempted = Arc::clone(&memory_attempted);
+        tokio::spawn(async move {
+            attempted.notify_one();
+            crate::session_store::persist_auxiliary_usage_update_with_database(
+                database,
+                sessions,
+                session_id,
+                "memory-provider-call-1".into(),
+                update,
+            )
+            .await
+        })
+    };
+    reflection_attempted.notified().await;
+    memory_attempted.notified().await;
+    tokio::task::yield_now().await;
+    assert!(!reflection_task.is_finished());
+    assert!(!memory_task.is_finished());
+    assert_eq!(sessions.lock().await[&session.id].input_tokens, 0);
+
+    database_gate.allow_response();
+    terminal_task
+        .await
+        .expect("terminal task should join")
+        .expect("terminal transaction should succeed");
+    assert_eq!(
+        reflection_task
+            .await
+            .expect("reflection Usage task should join")
+            .expect("reflection Usage should persist"),
+        crate::storage::AuxiliaryUsageApplyOutcome::Applied,
+    );
+    assert_eq!(
+        memory_task
+            .await
+            .expect("memory Usage task should join")
+            .expect("memory Usage should persist"),
+        crate::storage::AuxiliaryUsageApplyOutcome::Applied,
+    );
+
+    let in_memory = sessions.lock().await[&session.id].clone();
+    assert_eq!(in_memory.input_tokens, 16);
+    assert_eq!(in_memory.output_tokens, 10);
+    assert_eq!(
+        in_memory
+            .total_label_usage
+            .get(&crate::context::usage_role_label(
+                crate::context::USAGE_ROLE_REFLECTION
+            )),
+        Some(&[11, 7])
+    );
+    assert_eq!(
+        in_memory
+            .total_label_usage
+            .get(&crate::context::usage_role_label(
+                crate::context::USAGE_ROLE_MEMORY
+            )),
+        Some(&[5, 3])
+    );
+
+    assert_eq!(
+        crate::session_store::persist_auxiliary_usage_update_with_database(
+            database.clone(),
+            Arc::clone(&sessions),
+            session.id.clone(),
+            "reflection-provider-call-1".into(),
+            reflection_update,
+        )
+        .await
+        .expect("a duplicate operation should be recognized"),
+        crate::storage::AuxiliaryUsageApplyOutcome::Duplicate,
+    );
+    assert_eq!(sessions.lock().await[&session.id].input_tokens, 16);
+
+    database
+        .close_for_test()
+        .await
+        .expect("SQLite connection should close immediately after Usage success");
+    let reopened = crate::storage::Database::open(database_path)
+        .await
+        .expect("database should reopen after immediate shutdown");
+    let usage = reopened
+        .load_usage_snapshot(&session.id, &prompts::current_local_snapshot().today())
+        .await
+        .expect("Usage snapshot should load")
+        .expect("Usage snapshot should exist");
+    assert_eq!(usage.total_input, 16);
+    assert_eq!(usage.total_output, 10);
+    assert_eq!(
+        usage.total_labels.get(&crate::context::usage_role_label(
+            crate::context::USAGE_ROLE_REFLECTION
+        )),
+        Some(&[11, 7])
+    );
+    assert_eq!(
+        usage.total_labels.get(&crate::context::usage_role_label(
+            crate::context::USAGE_ROLE_MEMORY
+        )),
+        Some(&[5, 3])
+    );
+    reopened
+        .close_for_test()
+        .await
+        .expect("reopened SQLite connection should close");
+    std::fs::remove_dir_all(&home).expect("auxiliary Usage test home should be removable");
+}
+
+#[tokio::test]
+async fn auxiliary_usage_failure_protects_storage_without_changing_memory() {
+    let home = temp_workspace("auxiliary-usage-failure");
+    std::fs::create_dir_all(&home).expect("database home should be created");
+    let database = crate::storage::Database::open(home.join("lingclaw.db"))
+        .await
+        .expect("real SQLite database should open");
+    let mut session = test_session("auxiliary-usage-failure", "Aux failure", None);
+    session.version = crate::SESSION_VERSION;
+    session.workspace = home.clone();
+    session.working_directory = home.clone();
+    database
+        .save_session(&session)
+        .await
+        .expect("base Session should persist");
+    let sessions = Arc::new(Mutex::new(HashMap::from([(
+        session.id.clone(),
+        session.clone(),
+    )])));
+    let result = crate::session_store::persist_auxiliary_usage_update_with_database(
+        database.clone(),
+        Arc::clone(&sessions),
+        session.id.clone(),
+        "overflowing-auxiliary-operation".into(),
+        crate::context::UsageUpdate {
+            input_tokens: u64::MAX,
+            output_tokens: 1,
+            input_source: "provider".into(),
+            output_source: "provider".into(),
+            labels: HashMap::new(),
+        },
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        database.status().mode,
+        crate::storage::StorageMode::Protected
+    );
+    let in_memory = sessions.lock().await[&session.id].clone();
+    assert_eq!(in_memory.input_tokens, 0);
+    assert_eq!(in_memory.output_tokens, 0);
+
+    database
+        .close_for_test()
+        .await
+        .expect("failed Usage database should close");
+    std::fs::remove_dir_all(&home).expect("failed Usage test home should be removable");
+}
+
+#[tokio::test]
+async fn auxiliary_usage_missing_is_a_domain_outcome_and_unloaded_sessions_persist() {
+    let home = temp_workspace("auxiliary-usage-domain-outcomes");
+    std::fs::create_dir_all(&home).expect("database home should be created");
+    let database = crate::storage::Database::open(home.join("lingclaw.db"))
+        .await
+        .expect("real SQLite database should open");
+    let mut session = test_session("auxiliary-usage-unloaded", "Unloaded Usage", None);
+    session.version = crate::SESSION_VERSION;
+    session.workspace = home.clone();
+    session.working_directory = home.clone();
+    database
+        .save_session(&session)
+        .await
+        .expect("base Session should persist");
+    let sessions = Arc::new(Mutex::new(HashMap::new()));
+    let update = crate::context::UsageUpdate {
+        input_tokens: 9,
+        output_tokens: 4,
+        input_source: "provider".into(),
+        output_source: "provider".into(),
+        labels: crate::context::build_usage_labels(
+            9,
+            4,
+            Some("mock-provider"),
+            Some(crate::context::USAGE_ROLE_MEMORY),
+        ),
+    };
+
+    assert_eq!(
+        crate::session_store::persist_auxiliary_usage_update_with_database(
+            database.clone(),
+            Arc::clone(&sessions),
+            session.id.clone(),
+            "unloaded-session-operation".into(),
+            update.clone(),
+        )
+        .await
+        .expect("unloaded Session Usage should persist"),
+        crate::storage::AuxiliaryUsageApplyOutcome::Applied,
+    );
+    assert!(sessions.lock().await.is_empty());
+    let persisted = database
+        .load_usage_snapshot(&session.id, &prompts::current_local_snapshot().today())
+        .await
+        .expect("Usage snapshot should load")
+        .expect("unloaded Session Usage should exist");
+    assert_eq!((persisted.total_input, persisted.total_output), (9, 4));
+
+    assert_eq!(
+        crate::session_store::persist_auxiliary_usage_update_with_database(
+            database.clone(),
+            Arc::clone(&sessions),
+            "deleted-session".into(),
+            "late-deleted-session-operation".into(),
+            update,
+        )
+        .await
+        .expect("missing Session is a normal domain result"),
+        crate::storage::AuxiliaryUsageApplyOutcome::Missing,
+    );
+    assert_eq!(database.status().mode, crate::storage::StorageMode::Healthy);
+    assert!(
+        database
+            .load_usage_snapshot(
+                "deleted-session",
+                &prompts::current_local_snapshot().today()
+            )
+            .await
+            .expect("missing Usage lookup should succeed")
+            .is_none()
+    );
+
+    database
+        .close_for_test()
+        .await
+        .expect("domain outcome database should close");
+    std::fs::remove_dir_all(&home).expect("domain outcome test home should be removable");
+}
+
+#[tokio::test]
+async fn successful_memory_provider_race_is_drained_before_session_workspace_deletion() {
+    let (api_base, provider, _provider_guard) = spawn_blocking_auxiliary_provider(
+        r#"{"update_facts":[{"key":"drained","value":"yes"}],"delete_facts":[]}"#,
+    )
+    .await;
+    let mut config = test_config();
+    config.api_base = api_base;
+    config.model = "memory-barrier-model".to_string();
+    config.structured_memory = true;
+    config.max_llm_retries = 0;
+    let state = Arc::new(test_app_state_with_config(config.clone()));
+    let session_id = format!(
+        "memory-delete-race-{}",
+        crate::generate_random_session_id().expect("random Session id")
+    );
+    let _artifacts = ManagedSessionArtifactsGuard::new(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("managed workspace should exist");
+    let mut session = test_session(&session_id, "Memory delete race", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("Remember the deletion barrier".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("I will remember it".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(2),
+        },
+    ]);
+    crate::session_store::save_session_to_disk(&session)
+        .await
+        .expect("Session should persist");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session.clone());
+    let queue = crate::memory::MemoryUpdateQueue::spawn(
+        config.clone(),
+        Arc::clone(&state.sessions),
+        state.auxiliary_tasks.clone(),
+    );
+    {
+        let mut memory_queue = state.memory_queue.lock().expect("memory queue lock");
+        *memory_queue = Some(queue.clone());
+    }
+
+    // Keep the Usage stage behind the exact Session gate. The Provider-stage
+    // barrier proves the real response succeeded before deletion closes the
+    // allocation; Usage must still commit, while the later private write must
+    // be rejected by the closed lifecycle.
+    let persist_gate = crate::session_store::session_persist_gate(&session_id);
+    let persist_guard = persist_gate.lock().await;
+    let provider_succeeded = Arc::new(tokio::sync::Notify::new());
+    let release_provider_stage = Arc::new(tokio::sync::Notify::new());
+    queue.enqueue_with_test_controls(
+        session_id.clone(),
+        workspace.clone(),
+        config.model.clone(),
+        Arc::new(config),
+        crate::memory::prefilter_for_memory(&session.messages),
+        crate::memory::MemoryUpdateTestControls {
+            usage_database: None,
+            post_provider_gate: Some((
+                Arc::clone(&provider_succeeded),
+                Arc::clone(&release_provider_stage),
+            )),
+            post_usage_gate: None,
+            force_private_save_failure: false,
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(6), provider.arrived.notified())
+        .await
+        .expect("Memory Provider request should arrive");
+    provider.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), provider_succeeded.notified())
+        .await
+        .expect("successful Provider response should reach the Usage boundary");
+
+    let delete_state = Arc::clone(&state);
+    let delete_session_id = session_id.clone();
+    let mut deletion = tokio::spawn(async move {
+        crate::session_control::delete_session_with_safety_checks(
+            &delete_state,
+            &delete_session_id,
+            Some(MAIN_SESSION_ID),
+        )
+        .await
+    });
+    let lifecycle_closed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .auxiliary_tasks
+                .permit(
+                    &session_id,
+                    crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+                )
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let deletion_waited_for_usage = !deletion.is_finished();
+
+    release_provider_stage.notify_one();
+    drop(persist_guard);
+    let delete_result = (&mut deletion)
+        .await
+        .expect("deletion task should join")
+        .expect("Session deletion should succeed after Usage drains");
+    queue.shutdown_and_wait().await;
+
+    assert!(lifecycle_closed, "deletion must close new registrations");
+    assert!(
+        deletion_waited_for_usage,
+        "deletion must await the post-Provider Usage stage"
+    );
+    assert!(delete_result.contains("Deleted"));
+    assert_eq!(provider.requests.lock().await.len(), 1);
+    assert!(
+        !workspace.join("structured_memory.json").exists(),
+        "a lifecycle closed before the private-write boundary must suppress the write"
+    );
+    assert!(
+        !workspace.exists(),
+        "the drained task must not recreate a deleted workspace"
+    );
+    assert_eq!(state.auxiliary_tasks.task_count(), 0);
+}
+
+#[tokio::test]
+async fn memory_provider_usage_survives_feature_disable_before_private_write() {
+    let (api_base, provider, _provider_guard) = spawn_blocking_auxiliary_provider(
+        r#"{"update_facts":[{"key":"disabled","value":"no late write"}],"delete_facts":[]}"#,
+    )
+    .await;
+    let mut config = test_config();
+    config.api_base = api_base;
+    config.model = "memory-disable-model".to_string();
+    config.structured_memory = true;
+    config.max_llm_retries = 0;
+    let state = Arc::new(test_app_state_with_config(config.clone()));
+    let session_id = format!(
+        "memory-disable-race-{}",
+        crate::generate_random_session_id().expect("random Session id")
+    );
+    let workspace = temp_workspace("memory-disable-race");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should exist");
+    let mut session = test_session(&session_id, "Memory disable race", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Remember the feature-disable boundary".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(1),
+    });
+    crate::session_store::save_session_to_disk(&session)
+        .await
+        .expect("Session should persist");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session.clone());
+    let queue = crate::memory::MemoryUpdateQueue::spawn(
+        config.clone(),
+        Arc::clone(&state.sessions),
+        state.auxiliary_tasks.clone(),
+    );
+    *state.memory_queue.lock().expect("Memory queue lock") = Some(queue.clone());
+    let provider_succeeded = Arc::new(tokio::sync::Notify::new());
+    let release_provider_stage = Arc::new(tokio::sync::Notify::new());
+    queue.enqueue_with_test_controls(
+        session_id.clone(),
+        workspace.clone(),
+        config.model.clone(),
+        Arc::new(config.clone()),
+        crate::memory::prefilter_for_memory(&session.messages),
+        crate::memory::MemoryUpdateTestControls {
+            usage_database: None,
+            post_provider_gate: Some((
+                Arc::clone(&provider_succeeded),
+                Arc::clone(&release_provider_stage),
+            )),
+            post_usage_gate: None,
+            force_private_save_failure: false,
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(6), provider.arrived.notified())
+        .await
+        .expect("Memory Provider request should arrive");
+    provider.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), provider_succeeded.notified())
+        .await
+        .expect("Provider should succeed before feature disable");
+
+    let disable_state = Arc::clone(&state);
+    let mut disabled = config;
+    disabled.structured_memory = false;
+    let mut disable = tokio::spawn(async move {
+        disable_state.sync_memory_queue(&disabled).await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .auxiliary_tasks
+                .permit(
+                    &session_id,
+                    crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+                )
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("feature disable should invalidate the Memory cycle");
+    assert!(
+        !disable.is_finished(),
+        "feature disable must drain the task"
+    );
+    release_provider_stage.notify_one();
+    (&mut disable)
+        .await
+        .expect("feature disable should finish cleanly");
+
+    let in_memory = state.sessions.lock().await[&session_id].clone();
+    let persisted = crate::session_store::load_session_from_disk(&session_id)
+        .expect("persisted Session should remain");
+    assert_eq!((in_memory.input_tokens, in_memory.output_tokens), (17, 9));
+    assert_eq!((persisted.input_tokens, persisted.output_tokens), (17, 9));
+    assert!(!workspace.join("structured_memory.json").exists());
+    assert!(!workspace.join("structured_memory.audit.jsonl").exists());
+    assert_eq!(state.auxiliary_tasks.task_count(), 0);
+}
+
+#[tokio::test]
+async fn successful_reflection_provider_race_is_drained_before_session_workspace_deletion() {
+    let _reflection_guard = reflection_test_guard().lock().await;
+    let _runtime_reset = ReflectionRuntimeReset;
+    refresh_reflection_runtime(true);
+    let reflection_generation = reflection_runtime_generation();
+    let (api_base, provider, _provider_guard) =
+        spawn_blocking_auxiliary_provider("- Keep lifecycle ownership explicit").await;
+    let mut config = test_config();
+    config.api_base = api_base;
+    config.model = "reflection-barrier-model".to_string();
+    config.daily_reflection = true;
+    config.max_llm_retries = 0;
+    let state = Arc::new(test_app_state_with_config(config.clone()));
+    let session_id = format!(
+        "reflection-delete-race-{}",
+        crate::generate_random_session_id().expect("random Session id")
+    );
+    let _artifacts = ManagedSessionArtifactsGuard::new(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("managed workspace should exist");
+    let mut session = test_session(&session_id, "Reflection delete race", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("Reflect on this completed task".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("The task completed".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(2),
+        },
+    ]);
+    crate::session_store::save_session_to_disk(&session)
+        .await
+        .expect("Session should persist");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session.clone());
+
+    let reached_post_provider = Arc::new(tokio::sync::Notify::new());
+    let release_post_provider = Arc::new(tokio::sync::Notify::new());
+    let permit = state
+        .auxiliary_tasks
+        .permit(
+            &session_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Reflection,
+        )
+        .expect("Reflection permit should be available");
+    let reflection = state
+        .auxiliary_tasks
+        .spawn(permit, {
+            let state = Arc::clone(&state);
+            let config = Arc::new(config);
+            let session_id = session_id.clone();
+            let workspace = workspace.clone();
+            let messages = session.messages.clone();
+            let provider_gate = (
+                Arc::clone(&reached_post_provider),
+                Arc::clone(&release_post_provider),
+            );
+            move |task_context| async move {
+                run_post_execution_reflection(PostExecutionReflectionInput {
+                    config,
+                    http: state.http.clone(),
+                    sessions: Arc::clone(&state.sessions),
+                    session_id,
+                    workspace,
+                    model: "reflection-barrier-model".to_string(),
+                    messages,
+                    policy_generation: reflection_generation,
+                    cycles: 4,
+                    tool_calls: 2,
+                    provider_timeout: Duration::from_secs(30),
+                    task_context,
+                    provider_succeeded_gate: Some(provider_gate),
+                })
+                .await
+            }
+        })
+        .expect("Reflection task should be supervised");
+    tokio::time::timeout(Duration::from_secs(3), provider.arrived.notified())
+        .await
+        .expect("Reflection Provider request should arrive");
+    provider.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), reached_post_provider.notified())
+        .await
+        .expect("Reflection Provider should succeed before deletion");
+
+    let delete_state = Arc::clone(&state);
+    let delete_session_id = session_id.clone();
+    let mut deletion = tokio::spawn(async move {
+        crate::session_control::delete_session_with_safety_checks(
+            &delete_state,
+            &delete_session_id,
+            Some(MAIN_SESSION_ID),
+        )
+        .await
+    });
+    let lifecycle_closed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .auxiliary_tasks
+                .permit(
+                    &session_id,
+                    crate::auxiliary_tasks::AuxiliaryTaskKind::Reflection,
+                )
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let deletion_waited_for_reflection = !deletion.is_finished();
+
+    release_post_provider.notify_one();
+    let reflection_written = reflection
+        .wait()
+        .await
+        .expect("Reflection supervisor should finish")
+        .expect("Reflection task should not fail");
+    let delete_result = (&mut deletion)
+        .await
+        .expect("deletion task should join")
+        .expect("Session deletion should succeed after Reflection drains");
+
+    assert!(lifecycle_closed, "deletion must close new registrations");
+    assert!(
+        deletion_waited_for_reflection,
+        "deletion must await the post-Provider Reflection stage"
+    );
+    assert!(
+        !reflection_written,
+        "a cancelled Reflection must not write after the Session closes"
+    );
+    assert!(delete_result.contains("Deleted"));
+    assert_eq!(provider.requests.lock().await.len(), 1);
+    assert!(!workspace.exists());
+    assert_eq!(state.auxiliary_tasks.task_count(), 0);
+}
+
+#[tokio::test]
+async fn graceful_auxiliary_shutdown_drains_post_provider_usage_before_returning() {
+    let _reflection_guard = reflection_test_guard().lock().await;
+    let _runtime_reset = ReflectionRuntimeReset;
+    refresh_reflection_runtime(true);
+    let reflection_generation = reflection_runtime_generation();
+    let (api_base, provider, _provider_guard) =
+        spawn_blocking_auxiliary_provider("- Persist Usage before shutdown returns").await;
+    let mut config = test_config();
+    config.api_base = api_base;
+    config.model = "reflection-shutdown-model".to_string();
+    config.daily_reflection = true;
+    config.max_llm_retries = 0;
+    let state = Arc::new(test_app_state_with_config(config.clone()));
+    let session_id = format!(
+        "reflection-shutdown-{}",
+        crate::generate_random_session_id().expect("random Session id")
+    );
+    let workspace = temp_workspace("reflection-shutdown");
+    let _artifacts = RuntimeLoopTestArtifactsGuard::new(&session_id, &workspace);
+    std::fs::create_dir_all(&workspace).expect("workspace should exist");
+    let mut session = test_session(&session_id, "Reflection shutdown", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace.clone();
+    session.messages.extend([
+        ChatMessage {
+            role: "user".into(),
+            content: Some("Finish this task and reflect".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("Task finished".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(2),
+        },
+    ]);
+    crate::session_store::save_session_to_disk(&session)
+        .await
+        .expect("Session should persist");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session.clone());
+
+    let reached_post_provider = Arc::new(tokio::sync::Notify::new());
+    let release_post_provider = Arc::new(tokio::sync::Notify::new());
+    let permit = state
+        .auxiliary_tasks
+        .permit(
+            &session_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Reflection,
+        )
+        .expect("Reflection permit should be available");
+    let reflection = state
+        .auxiliary_tasks
+        .spawn(permit, {
+            let state = Arc::clone(&state);
+            let config = Arc::new(config);
+            let session_id = session_id.clone();
+            let workspace = workspace.clone();
+            let messages = session.messages.clone();
+            let provider_gate = (
+                Arc::clone(&reached_post_provider),
+                Arc::clone(&release_post_provider),
+            );
+            move |task_context| async move {
+                run_post_execution_reflection(PostExecutionReflectionInput {
+                    config,
+                    http: state.http.clone(),
+                    sessions: Arc::clone(&state.sessions),
+                    session_id,
+                    workspace,
+                    model: "reflection-shutdown-model".to_string(),
+                    messages,
+                    policy_generation: reflection_generation,
+                    cycles: 4,
+                    tool_calls: 2,
+                    provider_timeout: Duration::from_secs(30),
+                    task_context,
+                    provider_succeeded_gate: Some(provider_gate),
+                })
+                .await
+            }
+        })
+        .expect("Reflection task should be supervised");
+    tokio::time::timeout(Duration::from_secs(3), provider.arrived.notified())
+        .await
+        .expect("Reflection Provider request should arrive");
+    provider.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), reached_post_provider.notified())
+        .await
+        .expect("Reflection Provider should succeed before shutdown");
+
+    let shutdown_state = Arc::clone(&state);
+    let mut shutdown = tokio::spawn(async move {
+        shutdown_state.shutdown_auxiliary_tasks().await;
+    });
+    let accepting_closed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .auxiliary_tasks
+                .permit(
+                    &session_id,
+                    crate::auxiliary_tasks::AuxiliaryTaskKind::Reflection,
+                )
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let shutdown_waited = !shutdown.is_finished();
+
+    release_post_provider.notify_one();
+    let reflection_written = reflection
+        .wait()
+        .await
+        .expect("Reflection supervisor should finish")
+        .expect("Reflection task should not fail");
+    (&mut shutdown)
+        .await
+        .expect("graceful auxiliary shutdown should join");
+
+    let in_memory = state.sessions.lock().await[&session_id].clone();
+    let persisted = crate::session_store::load_session_from_disk(&session_id)
+        .expect("persisted Session should exist");
+    assert!(accepting_closed);
+    assert!(shutdown_waited, "shutdown must drain the registered task");
+    assert!(
+        !reflection_written,
+        "shutdown must suppress the late file write"
+    );
+    assert_eq!((in_memory.input_tokens, in_memory.output_tokens), (17, 9));
+    assert_eq!((persisted.input_tokens, persisted.output_tokens), (17, 9));
+    assert!(!workspace.join("memory").exists());
+    assert_eq!(state.auxiliary_tasks.task_count(), 0);
+}
+
+#[tokio::test]
 async fn run_finish_phase_shutdown_cancels_a_slow_completion_verifier_without_failure_event() {
     let state = Arc::new(test_app_state());
     let session_id = format!(
@@ -7081,6 +9747,16 @@ async fn run_finish_phase_completion_deadline_fails_closed_without_late_events()
     let mut session = test_session(&session_id, "Finish contract timeout", None);
     session.workspace = workspace.clone();
     session.working_directory = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("verify and finish this plan".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
     session.pending_plan = Some(plan.clone());
     state
         .sessions
@@ -7142,6 +9818,7 @@ async fn run_finish_phase_completion_deadline_fails_closed_without_late_events()
             event["type"] == "error" && event["code"] == "plan_completion_contract_failed"
         })
         .expect("deadline should emit one stable contract failure");
+    assert_eq!(error["run_terminal"].as_bool(), Some(true));
     assert_eq!(
         error["checks"][0]["check_id"],
         "completion-contract-timeout"
@@ -7183,6 +9860,16 @@ async fn run_finish_phase_completion_verifier_can_finish_normally_after_a_slow_s
     let mut session = test_session(&session_id, "Finish contract normal", None);
     session.workspace = workspace.clone();
     session.working_directory = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("verify and finish this plan".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
     session.pending_plan = Some(plan.clone());
     state
         .sessions
@@ -7237,6 +9924,117 @@ async fn run_finish_phase_completion_verifier_can_finish_normally_after_a_slow_s
             .iter()
             .any(|event| { event["type"] == "done" && event["phase"] == "finish" })
     );
+}
+
+#[tokio::test]
+async fn terminal_snapshot_is_frozen_before_a_delayed_dispatcher_and_next_input_save() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "terminal-source-freeze-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Terminal source freeze", None);
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("first run input".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(11),
+    });
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some("first run result".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(12),
+    });
+    let old_message_count = session.messages.len();
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    // Keep the receiver unread until after the next input is saved. This is
+    // the production ordering that used to let the async dispatcher sample a
+    // newer Session for the old terminal event.
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    assert!(matches!(
+        run_finish_phase(&ctx, &mut phase_state).await,
+        AgentPhaseControl::Break
+    ));
+    {
+        let persist_gate = crate::session_store::session_persist_gate(&session_id);
+        let _persist_guard = persist_gate.lock().await;
+        let next_snapshot = {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.get_mut(&session_id).expect("Session should exist");
+            session.messages.push(ChatMessage {
+                role: "user".into(),
+                content: Some("next run input".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: Some(13),
+            });
+            session.clone()
+        };
+        crate::session_store::save_session_to_disk_locked(&next_snapshot)
+            .await
+            .expect("next input should save without being overwritten");
+    }
+
+    let (terminal_snapshot, outcome) = take_terminal_persistence_record(&session_id)
+        .await
+        .expect("the terminal producer should freeze its own Session snapshot");
+    assert_eq!(terminal_snapshot.messages.len(), old_message_count);
+    assert_eq!(outcome.end_message_index + 1, old_message_count);
+    assert!(
+        terminal_snapshot
+            .messages
+            .iter()
+            .all(|message| { message.content.as_deref() != Some("next run input") })
+    );
+    let persisted = crate::session_store::load_session_snapshot_from_path(
+        &crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    )
+    .expect("the later Session save should remain intact");
+    assert!(
+        persisted
+            .messages
+            .iter()
+            .any(|message| { message.content.as_deref() == Some("next run input") })
+    );
+    assert_eq!(live_rx.recv().await.unwrap()["type"], "done");
+
+    crate::session_store::delete_session_from_storage(&session_id)
+        .await
+        .expect("test Session should be removed");
 }
 
 #[tokio::test]
@@ -7599,6 +10397,18 @@ async fn run_analyze_phase_emits_context_pruned_after_before_analyze_compression
             timestamp: None,
         });
     }
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("investigate the timeout loop and explain the blockers".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    let terminal_message_anchor = RunMessageAnchor::from_messages(&session.messages)
+        .expect("the direct Analyze fixture should capture its run-start message anchor");
     {
         let mut sessions = state.sessions.lock().await;
         sessions.insert(session_id.clone(), session);
@@ -7618,6 +10428,7 @@ async fn run_analyze_phase_emits_context_pruned_after_before_analyze_compression
         run_cancel: &run_cancel,
     };
     let mut phase_state = phase_state_for_analyze_test();
+    phase_state.terminal_message_anchor = Some(terminal_message_anchor);
     phase_state.working_state.seed_from_query(Some(
         "investigate the timeout loop and explain the blockers",
     ));
@@ -7717,12 +10528,15 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -7864,12 +10678,15 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -7993,6 +10810,7 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::NoMeaningfulProgress,
         stagnation_streak: 4,
         error_streak: 3,
+        unresolved_tool_targets: HashSet::new(),
         recent_tool_history: vec![agent::ToolResultEntry {
             id: "tool-1".into(),
             name: "read_file".into(),
@@ -8008,6 +10826,8 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -8144,12 +10964,15 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -8264,12 +11087,15 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -8441,12 +11267,15 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -8542,12 +11371,15 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -8714,12 +11546,15 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -8837,12 +11672,15 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -8998,12 +11836,15 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor: None,
+        terminal_plan_identity: None,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -9596,6 +12437,84 @@ fn drain_busy_socket_messages_applies_think_command_without_queueing_it() {
 }
 
 #[test]
+fn drain_busy_socket_messages_marks_think_failures_nonterminal_and_keeps_run_active() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    let state = std::sync::Arc::new(test_app_state_with_config(config));
+    let session_id = MAIN_SESSION_ID.to_string();
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let run_cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
+    let mut pending = Vec::new();
+
+    rt.block_on(async {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), test_session(&session_id, "Main", None));
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: run_cancel.clone(),
+                stop_requested: Arc::clone(&stop_requested),
+                deferred_interventions: Arc::clone(&deferred_interventions),
+            },
+        );
+        inbound_tx
+            .send("/think high".to_string())
+            .await
+            .expect("think command should be queued");
+        inbound_tx
+            .send("continue after the command failure".to_string())
+            .await
+            .expect("intervention should be queued");
+
+        let stopped = drain_busy_socket_messages(
+            &state,
+            &session_id,
+            &mut inbound_rx,
+            &mut pending,
+            &live_tx,
+            &run_cancel,
+        )
+        .await;
+
+        assert!(!stopped);
+        assert!(state.active_runs.lock().await.contains_key(&session_id));
+    });
+
+    assert!(!run_cancel.is_cancelled());
+    assert!(!stop_requested.load(Ordering::Relaxed));
+    assert_eq!(
+        pending,
+        vec!["continue after the command failure".to_string()]
+    );
+
+    let error_event = live_rx
+        .try_recv()
+        .expect("failed busy command should emit an error");
+    assert_eq!(error_event["type"], "error");
+    assert_eq!(error_event["run_terminal"], false);
+    assert!(
+        error_event["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("Failed to persist think level"))
+    );
+
+    let progress_event = live_rx
+        .try_recv()
+        .expect("the following intervention should still be accepted");
+    assert_eq!(progress_event["type"], "progress");
+    assert!(live_rx.try_recv().is_err());
+}
+
+#[test]
 fn persist_pending_interventions_appends_user_messages() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = std::sync::Arc::new(test_app_state());
@@ -10074,20 +12993,6 @@ fn try_claim_reflection_requires_minimum_cycles() {
 }
 
 #[test]
-fn cancel_active_reflections_cancels_registered_tasks() {
-    let _guard = reflection_test_guard().blocking_lock();
-    cancel_active_reflections();
-
-    let cancel = CancellationToken::new();
-    let _task_id = register_active_reflection(cancel.clone());
-    assert!(!cancel.is_cancelled());
-
-    cancel_active_reflections();
-
-    assert!(cancel.is_cancelled());
-}
-
-#[test]
 fn reflection_runtime_generation_invalidates_stale_tasks_after_disable() {
     let _guard = reflection_test_guard().blocking_lock();
 
@@ -10149,29 +13054,50 @@ async fn stale_reflection_generation_returns_before_work_or_write() {
         .await
         .expect("workspace should be created");
 
-    let outcome = run_post_execution_reflection(PostExecutionReflectionInput {
-        config: Arc::new(test_config()),
-        http: reqwest::Client::new(),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        session_id: "main".to_string(),
-        workspace: workspace.clone(),
-        model: "gpt-4o-mini".to_string(),
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: Some("hello".into()),
-            images: None,
-            thinking: None,
-            anthropic_thinking_blocks: None,
-            tool_calls: None,
-            tool_call_id: None,
-            timestamp: None,
-        }],
-        policy_generation: stale_generation,
-        cycles: 3,
-        tool_calls: 1,
-    })
-    .await
-    .expect("stale reflection should short-circuit successfully");
+    let registry = crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true);
+    let permit = registry
+        .permit(
+            "main",
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Reflection,
+        )
+        .expect("reflection permit should be available");
+    let task = registry
+        .spawn(permit, {
+            let workspace = workspace.clone();
+            move |task_context| async move {
+                run_post_execution_reflection(PostExecutionReflectionInput {
+                    config: Arc::new(test_config()),
+                    http: reqwest::Client::new(),
+                    sessions: Arc::new(Mutex::new(HashMap::new())),
+                    session_id: "main".to_string(),
+                    workspace,
+                    model: "gpt-4o-mini".to_string(),
+                    messages: vec![ChatMessage {
+                        role: "user".into(),
+                        content: Some("hello".into()),
+                        images: None,
+                        thinking: None,
+                        anthropic_thinking_blocks: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        timestamp: None,
+                    }],
+                    policy_generation: stale_generation,
+                    cycles: 3,
+                    tool_calls: 1,
+                    provider_timeout: Duration::from_secs(1),
+                    task_context,
+                    provider_succeeded_gate: None,
+                })
+                .await
+            }
+        })
+        .expect("reflection task should be supervised");
+    let outcome = task
+        .wait()
+        .await
+        .expect("reflection supervisor should finish")
+        .expect("stale reflection should short-circuit successfully");
 
     assert!(!outcome);
     let today = prompts::current_local_snapshot().today();
@@ -10275,4 +13201,185 @@ fn reflection_model_or_fallback_chain() {
         config.reflection_model_or("primary-model"),
         "reflection-llm"
     );
+}
+
+#[tokio::test]
+async fn round21_hard_cap_settles_planning_and_executing_plan() {
+    for status in [
+        crate::plan::PlanStatus::Planning,
+        crate::plan::PlanStatus::Executing,
+    ] {
+        let state = Arc::new(test_app_state());
+        let id = format!("hard-cap-{}", crate::generate_random_session_id().unwrap());
+        let mut session = test_session(&id, "Hard cap", None);
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some("hard cap request".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(21),
+        });
+        let mut plan = completion_verifier_test_plan("hard-cap-plan");
+        plan.status = status;
+        session.pending_plan = Some(plan.clone());
+        state.sessions.lock().await.insert(id.clone(), session);
+        let cancel = CancellationToken::new();
+        let run_cancel = CancellationToken::new();
+        let (live_tx, mut live_rx) = mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+        let ctx = AgentRunCtx {
+            state: &state,
+            config: state.config(),
+            model: state.config().model.clone(),
+            current_session_id: &id,
+            cancel: &cancel,
+            live_tx: &live_tx,
+            run_cancel: &run_cancel,
+        };
+        let mut phase = phase_state_for_analyze_test();
+        phase.round = AGENT_HARD_CAP_ROUNDS;
+        phase.terminal_plan_identity = Some((plan.id.clone(), plan.revision));
+        if status == crate::plan::PlanStatus::Planning {
+            phase.run_mode = AgentRunMode::PlanOnly;
+        } else {
+            phase.approved_plan = Some(plan.clone());
+        }
+        assert!(matches!(
+            run_analyze_phase(&ctx, &mut phase).await,
+            AgentPhaseControl::Break
+        ));
+        let final_plan = state.sessions.lock().await[&id]
+            .pending_plan
+            .clone()
+            .unwrap();
+        assert_eq!(final_plan.status, crate::plan::PlanStatus::Failed);
+        assert_eq!(final_plan.progress.len(), plan.progress.len());
+        let mut events = Vec::new();
+        while let Ok(event) = live_rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.iter().filter(|e| e["type"] == "done").count(), 1);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "plan_state" && e["plan"]["status"] == "failed")
+        );
+        let _ =
+            std::fs::remove_file(crate::session_store::sessions_dir().join(format!("{id}.json")));
+    }
+}
+
+#[tokio::test]
+async fn round21_hard_cap_generation_failure_and_precommit_stop_never_publish_a_failed_plan() {
+    for scenario in ["generation", "storage", "stop"] {
+        let state = Arc::new(test_app_state());
+        let id = format!(
+            "cap-{scenario}-{}",
+            crate::generate_random_session_id().unwrap()
+        );
+        let mut session = test_session(&id, "Hard cap isolation", None);
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some("cap isolation".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(21),
+        });
+        let mut plan = completion_verifier_test_plan("cap-isolation-plan");
+        if scenario == "generation" {
+            plan.revision += 1;
+        }
+        session.pending_plan = Some(plan.clone());
+        state.sessions.lock().await.insert(id.clone(), session);
+        let failure_path = crate::session_store::sessions_dir().join(format!("{id}.json.tmp"));
+        if scenario == "storage" {
+            std::fs::create_dir_all(&failure_path).unwrap();
+        }
+        let cancel = CancellationToken::new();
+        let run_cancel = CancellationToken::new();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        state.active_runs.lock().await.insert(
+            id.clone(),
+            SessionRunBinding {
+                connection_id: 21,
+                cancel: run_cancel.clone(),
+                stop_requested: stop_requested.clone(),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        let (live_tx, mut live_rx) = mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+        let ctx = AgentRunCtx {
+            state: &state,
+            config: state.config(),
+            model: state.config().model.clone(),
+            current_session_id: &id,
+            cancel: &cancel,
+            live_tx: &live_tx,
+            run_cancel: &run_cancel,
+        };
+        let mut phase = phase_state_for_analyze_test();
+        phase.round = AGENT_HARD_CAP_ROUNDS;
+        phase.terminal_plan_identity = Some((
+            plan.id.clone(),
+            if scenario == "generation" {
+                plan.revision - 1
+            } else {
+                plan.revision
+            },
+        ));
+        phase.approved_plan = Some(plan.clone());
+        let gate = Arc::new(FinishPhaseTestGate::new(
+            FinishPhaseTestStage::PreTerminalCommit,
+        ));
+        if scenario == "stop" {
+            phase.completion_evidence.finish_gate = Some(gate.clone());
+            let trigger = async {
+                wait_for_finish_phase_gate(&gate).await;
+                stop_requested.store(true, Ordering::Relaxed);
+                run_cancel.cancel();
+            };
+            tokio::join!(run_analyze_phase(&ctx, &mut phase), trigger);
+        } else {
+            run_analyze_phase(&ctx, &mut phase).await;
+        }
+        let actual = state.sessions.lock().await[&id]
+            .pending_plan
+            .clone()
+            .unwrap();
+        assert_eq!(actual.status, plan.status, "{scenario}");
+        assert_eq!(actual.revision, plan.revision);
+        let events = std::iter::from_fn(|| live_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .all(|e| e["type"] != "done" && e["type"] != "plan_state"),
+            "{scenario}: {events:?}"
+        );
+        if scenario == "generation" {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e["code"] == "terminal_identity_unavailable")
+                    .count(),
+                1
+            );
+        }
+        if scenario == "stop" {
+            assert!(phase.run_stopped);
+            assert_eq!(
+                phase.completion_evidence.terminal_linearization,
+                TerminalLinearizationState::PreCommit
+            );
+        }
+        if scenario == "storage" {
+            std::fs::remove_dir_all(&failure_path).unwrap();
+        }
+        let _ =
+            std::fs::remove_file(crate::session_store::sessions_dir().join(format!("{id}.json")));
+    }
 }

@@ -1,4 +1,5 @@
 import { dom, state } from './state.js';
+import { getComposerTransportSocket, sendComposerTransportMessage } from './composerTransport.js';
 import { INPUT_HISTORY_MAX } from './constants.js';
 import { canSendWhileBusy } from './utils.js';
 import { syncToolDrawerBounds, scrollDown } from './scroll.js';
@@ -442,7 +443,10 @@ function handleSlashCommandKeydown(e: KeyboardEvent): boolean {
 }
 
 export function send() {
-  if (!state.ws || state.ws.readyState !== 1) return;
+  if (!getComposerTransportSocket()) {
+    syncComposerAvailability();
+    return;
+  }
   if (
     state.sessionSwitchInFlight ||
     state.sessionIdentityMutationInFlight ||
@@ -484,7 +488,7 @@ export function send() {
       return;
     }
     if (!areGroupMessageTargetsModelReady(text)) return;
-    state.ws.send(
+    const sent = sendComposerTransportMessage(
       JSON.stringify({
         type: 'group_message',
         text,
@@ -494,6 +498,10 @@ export function send() {
         run_mode: 'execute',
       }),
     );
+    if (!sent) {
+      syncComposerAvailability();
+      return;
+    }
     if (!state.busy) {
       setBusy(true);
     }
@@ -525,6 +533,10 @@ export function send() {
     const modelGateBypassed = canBypassComposerModelGate(commandText);
     if (state.imageUploadInFlight && !modelGateBypassed) return;
     if (!isComposerModelReady() && !modelGateBypassed) return;
+    if (!sendCmd(commandText)) {
+      syncComposerAvailability();
+      return;
+    }
     if (commandName === '/switch') {
       if (targetSessionId) {
         beginComposerSessionTransition(true, targetSessionId);
@@ -538,7 +550,6 @@ export function send() {
       // restores Plan mode when the reset did not commit.
       setPlanMode(false);
     }
-    sendCmd(commandText);
     pushInputHistory(commandText);
     dom.input.value = '';
     dom.input.style.height = 'auto';
@@ -561,6 +572,16 @@ export function send() {
   const hasImages = state.pendingImages.length > 0;
   const effectiveImages = state.busy ? [] : state.pendingImages.slice();
 
+  const payload: { text: string; plan_mode: boolean; images?: typeof state.pendingImages } = {
+    text: text || '',
+    plan_mode: state.planModeEnabled,
+  };
+  if (hasImages) payload.images = state.pendingImages;
+  if (!sendComposerTransportMessage(JSON.stringify(payload))) {
+    syncComposerAvailability();
+    return;
+  }
+
   const el = addMsg('user', text || '(image)', undefined);
   if (effectiveImages.length > 0) {
     renderUserImageThumbnails(el, effectiveImages);
@@ -571,17 +592,9 @@ export function send() {
     setBusy(true);
   }
 
-  const payload: { text: string; plan_mode: boolean; images?: typeof state.pendingImages } = {
-    text: text || '',
-    plan_mode: state.planModeEnabled,
-  };
   if (hasImages) {
-    payload.images = state.pendingImages;
-    state.ws.send(JSON.stringify(payload));
     state.pendingImages = [];
     renderImagePreviews();
-  } else {
-    state.ws.send(JSON.stringify(payload));
   }
   pushInputHistory(text);
   dom.input.value = '';
@@ -602,26 +615,33 @@ export function pushInputHistory(text) {
 }
 
 export function stopAgent() {
-  if (!state.busy || !state.ws || state.ws.readyState !== 1) return;
-  if (state.activeGroupId) {
-    state.ws.send(JSON.stringify({ type: 'group_stop' }));
-    return;
-  }
-  state.ws.send('/stop');
+  if (!state.busy) return;
+  if (
+    !sendComposerTransportMessage(
+      state.activeGroupId ? JSON.stringify({ type: 'group_stop' }) : '/stop',
+    )
+  )
+    syncComposerAvailability();
 }
 
-export function sendCmd(cmd) {
+export function sendCmd(cmd): boolean {
   const normalizedCmd = normalizeSlashCommandText(cmd.trim());
   if (state.activeGroupId) {
     addSystem(tr('group.slashUnsupported'));
-    return;
+    return false;
   }
-  if ((!canSendWhileBusy(normalizedCmd) && state.busy) || !state.ws || state.ws.readyState !== 1) {
-    return;
+  if ((!canSendWhileBusy(normalizedCmd) && state.busy) || !getComposerTransportSocket()) {
+    syncComposerAvailability();
+    return false;
   }
-  if (state.storageMode === 'protected' && !canSendWhileStorageProtected(normalizedCmd)) return;
+  if (state.storageMode === 'protected' && !canSendWhileStorageProtected(normalizedCmd))
+    return false;
+  if (!sendComposerTransportMessage(normalizedCmd)) {
+    syncComposerAvailability();
+    return false;
+  }
   setBusy(true);
-  state.ws.send(normalizedCmd);
+  return true;
 }
 
 export function initInputListeners(options: InputListenerOptions = {}) {

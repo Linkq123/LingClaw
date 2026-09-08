@@ -1089,9 +1089,9 @@ async fn process_openai_responses_stream_event(
                     event
                         .get("message")
                         .and_then(Value::as_str)
-                        .map(str::to_string)
+                        .map(|message| provider_api_error("OpenAI Responses", message))
                 })
-                .unwrap_or_else(|| event.to_string());
+                .unwrap_or_else(|| provider_api_error("OpenAI Responses", &event.to_string()));
             return Err(detail);
         }
         "response.incomplete" => {
@@ -2488,7 +2488,10 @@ fn summarize_response_body(body: &str) -> String {
     )
 }
 
-fn parse_json_response<T: DeserializeOwned>(provider: &str, body: &str) -> Result<T, String> {
+fn parse_json_response<T: DeserializeOwned>(
+    provider: &'static str,
+    body: &str,
+) -> Result<T, String> {
     serde_json::from_str(body).map_err(|e| {
         format!(
             "{provider} decode error: {e} - body: {}",
@@ -2497,7 +2500,19 @@ fn parse_json_response<T: DeserializeOwned>(provider: &str, body: &str) -> Resul
     })
 }
 
-fn provider_json_error(provider: &str, data: &Value) -> Option<String> {
+// Upstream fields must stay behind a fixed protocol label. Diagnostic, retry,
+// and capability consumers reserve bare transport prefixes for send_with_retry;
+// even a root SSE message may contain any of those prefixes verbatim.
+fn provider_api_error(provider: &'static str, detail: &str) -> String {
+    let detail = if detail.is_empty() {
+        "unknown error"
+    } else {
+        detail
+    };
+    format!("{provider} API error: {detail}")
+}
+
+fn provider_json_error(provider: &'static str, data: &Value) -> Option<String> {
     let error = data.get("error")?;
     if error.is_null() {
         return None;
@@ -2527,11 +2542,7 @@ fn provider_json_error(provider: &str, data: &Value) -> Option<String> {
         }
         _ => error.to_string(),
     };
-    if detail.is_empty() {
-        Some(format!("{provider} API error: unknown error"))
-    } else {
-        Some(format!("{provider} API error: {detail}"))
-    }
+    Some(provider_api_error(provider, &detail))
 }
 
 fn response_content_type(resp: &reqwest::Response) -> Option<String> {
@@ -2546,7 +2557,7 @@ fn is_html_response_content_type(content_type: &str) -> bool {
 }
 
 async fn validate_stream_response(
-    provider: &str,
+    provider: &'static str,
     expected_stream: &str,
     resp: reqwest::Response,
 ) -> Result<reqwest::Response, String> {
@@ -4132,6 +4143,7 @@ async fn send_with_retry(
                 tokio::time::sleep(delay).await;
                 continue;
             }
+            Err(e) if e.is_builder() => return Err(format!("Provider configuration error: {e}")),
             Err(e) => return Err(format!("HTTP error: {e}")),
         }
     }

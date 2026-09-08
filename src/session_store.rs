@@ -17,8 +17,10 @@ use std::{
 };
 
 use crate::{
-    Config, Session, SessionWorkspaceKind, config_dir_path, context_input_budget_for_model,
-    estimate_tokens_for_provider, format_token_count, format_usage_block, prompts,
+    Config, Session, SessionWorkspaceKind, config_dir_path,
+    context::{UsageUpdate, apply_usage_update},
+    context_input_budget_for_model, estimate_tokens_for_provider, format_token_count,
+    format_usage_block, prompts,
 };
 
 use super::{AppState, ChatMessage};
@@ -121,6 +123,7 @@ type PersistedSessionCacheLock = OnceLock<Mutex<HashMap<String, PersistedSession
 static PERSISTED_SESSION_CACHE: PersistedSessionCacheLock = OnceLock::new();
 static SESSION_SAVE_WRITES: AtomicU64 = AtomicU64::new(0);
 static SESSION_SAVE_SKIPS: AtomicU64 = AtomicU64::new(0);
+static AUXILIARY_USAGE_OPERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 type SessionPersistGateLock = OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 static SESSION_PERSIST_GATES: SessionPersistGateLock = OnceLock::new();
 
@@ -146,6 +149,15 @@ pub(crate) fn session_persist_gate(session_id: &str) -> Arc<tokio::sync::Mutex<(
         .entry(gate_key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+pub(crate) fn new_auxiliary_usage_operation_id(kind: &str) -> String {
+    let sequence = AUXILIARY_USAGE_OPERATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(sequence as u128);
+    format!("{kind}-{nanos:x}-{sequence:x}")
 }
 
 #[cfg(test)]
@@ -654,6 +666,152 @@ async fn reset_session_context_on_disk_inner(session: &Session) -> Result<(), St
 
 pub(crate) async fn save_session_to_disk_locked(session: &Session) -> Result<(), String> {
     save_session_to_disk_inner(session).await
+}
+
+/// Atomically persist one immutable top-level terminal fact with the exact
+/// Session snapshot whose message positions it references. The caller must
+/// hold this Session's `session_persist_gate` for the whole call.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) async fn save_session_with_run_outcome_locked(
+    session: &Session,
+    outcome: crate::TopLevelRunOutcome,
+) -> Result<(), String> {
+    #[cfg(not(test))]
+    {
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .save_session_with_run_outcome(session, outcome)
+            .await
+            .map_err(|error| error.to_string())?;
+        SESSION_SAVE_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    {
+        // Unit tests retain the legacy JSON Session shim. The production-only
+        // terminal table is exercised by storage and real-daemon integration
+        // tests; still persist the same frozen Session snapshot here so phase
+        // tests retain their normal failure and ordering behavior.
+        let _ = outcome;
+        save_session_to_disk_inner(session).await
+    }
+}
+
+async fn persist_auxiliary_usage_update_with_database_task(
+    database: crate::storage::Database,
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, Session>>>,
+    session_id: String,
+    operation_id: String,
+    update: UsageUpdate,
+) -> Result<crate::storage::AuxiliaryUsageApplyOutcome, String> {
+    let persist_gate = session_persist_gate(&session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let today = prompts::current_local_snapshot().today();
+    let outcome = database
+        .apply_auxiliary_usage_delta(&session_id, &operation_id, &today, update.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    if outcome == crate::storage::AuxiliaryUsageApplyOutcome::Applied {
+        let mut sessions = sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            apply_usage_update(session, &update);
+        }
+    }
+    Ok(outcome)
+}
+
+/// Persist Memory/Reflection token usage under the same Session gate as a
+/// terminal transaction. The runtime-owned task keeps the database future and
+/// in-memory synchronization alive even when the originating background
+/// caller is cancelled after the provider request completed.
+#[cfg(not(test))]
+pub(crate) async fn persist_auxiliary_usage_update(
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, Session>>>,
+    session_id: String,
+    operation_id: String,
+    update: UsageUpdate,
+) -> Result<crate::storage::AuxiliaryUsageApplyOutcome, String> {
+    let database = crate::storage::Database::global()
+        .map_err(|error| error.to_string())?
+        .clone();
+    persist_auxiliary_usage_update_with_database_task(
+        database,
+        sessions,
+        session_id,
+        operation_id,
+        update,
+    )
+    .await
+}
+
+#[cfg(test)]
+static TEST_AUXILIARY_USAGE_OPERATIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) async fn persist_auxiliary_usage_update(
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, Session>>>,
+    session_id: String,
+    operation_id: String,
+    update: UsageUpdate,
+) -> Result<crate::storage::AuxiliaryUsageApplyOutcome, String> {
+    let persist_gate = session_persist_gate(&session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let operation_key = format!("{session_id}\0{operation_id}");
+    {
+        let mut operations = TEST_AUXILIARY_USAGE_OPERATIONS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !operations.insert(operation_key.clone()) {
+            return Ok(crate::storage::AuxiliaryUsageApplyOutcome::Duplicate);
+        }
+    }
+    let (previous, updated) = {
+        let mut sessions = sessions.lock().await;
+        let Some(session) = sessions.get_mut(&session_id) else {
+            TEST_AUXILIARY_USAGE_OPERATIONS
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&operation_key);
+            return Ok(crate::storage::AuxiliaryUsageApplyOutcome::Missing);
+        };
+        let previous = session.clone();
+        apply_usage_update(session, &update);
+        (previous, session.clone())
+    };
+    if let Err(error) = save_session_to_disk_locked(&updated).await {
+        let mut sessions = sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            *session = previous;
+        }
+        TEST_AUXILIARY_USAGE_OPERATIONS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&operation_key);
+        return Err(error);
+    }
+    Ok(crate::storage::AuxiliaryUsageApplyOutcome::Applied)
+}
+
+#[cfg(test)]
+pub(crate) async fn persist_auxiliary_usage_update_with_database(
+    database: crate::storage::Database,
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, Session>>>,
+    session_id: String,
+    operation_id: String,
+    update: UsageUpdate,
+) -> Result<crate::storage::AuxiliaryUsageApplyOutcome, String> {
+    persist_auxiliary_usage_update_with_database_task(
+        database,
+        sessions,
+        session_id,
+        operation_id,
+        update,
+    )
+    .await
 }
 
 pub(crate) fn load_session_model_preferences_result(
@@ -1297,7 +1455,8 @@ pub(crate) fn build_history_payload_with_s3(
                                 &tc.function.name,
                                 &tc.function.arguments
                             ),
-                            "id":tc.id
+                            "id":tc.id,
+                            "message_index": message_index,
                         }));
                     }
                 }
@@ -1330,6 +1489,7 @@ pub(crate) fn build_history_payload_with_s3(
                         "result":c,
                         "id":tool_call_id,
                         "is_error": session.failed_tool_results.contains(tool_call_id),
+                        "message_index": message_index,
                     });
                     if let Some(images) = msg.images.as_ref() {
                         let public_images = images

@@ -21,6 +21,7 @@ import {
 } from '../src/composerAvailability.js';
 import { dom, initDomRefs, state } from '../src/state.js';
 import { setLanguage, translateDom } from '../src/i18n.js';
+import { prepareComposerTransportFixture } from './composerTransportFixture.js';
 
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -319,6 +320,7 @@ describe('local image upload lifecycle', () => {
     state.imageUploadInFlight = false;
     state.uploadToken = 'upload-token';
     state.uploadTokenPromise = null;
+    prepareComposerTransportFixture();
   });
 
   afterEach(() => {

@@ -10,6 +10,7 @@ use std::{
     io::{self, Stdout, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -56,6 +57,8 @@ const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const LONG_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GROUP_REFRESH_MAX_ATTEMPTS: u8 = 3;
+const GROUP_REFRESH_RETRY_BASE: Duration = Duration::from_millis(250);
 
 pub(crate) fn print_help() {
     println!("LingClaw terminal workspace");
@@ -606,6 +609,13 @@ fn image_identity(image: &Value) -> String {
     format!("json:{image}")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionIdentityProtocol {
+    Strict,
+    Legacy,
+    Unavailable,
+}
+
 struct App {
     language: UiLanguage,
     theme: UiTheme,
@@ -613,6 +623,12 @@ struct App {
     sessions: Vec<SessionSummary>,
     groups: Vec<GroupSummary>,
     groups_enabled: bool,
+    groups_refresh_cycle: GroupRefreshCycleToken,
+    groups_refresh_pending: bool,
+    groups_refresh_in_flight: Option<GroupRefreshBinding>,
+    groups_refresh_retry_binding: Option<GroupRefreshBinding>,
+    groups_refresh_attempts: u8,
+    groups_refresh_retry_at: Option<tokio::time::Instant>,
     active_group: Option<String>,
     active_group_runs: HashSet<String>,
     group_target_mode: String,
@@ -626,6 +642,10 @@ struct App {
     scroll: u16,
     inspector_scroll: u16,
     busy: bool,
+    direct_run_active: bool,
+    direct_run_identity: Option<String>,
+    execution_identity_protocol: ExecutionIdentityProtocol,
+    legacy_execution_socket_generation: Option<u64>,
     connected: bool,
     storage_writable: bool,
     plan_mode: bool,
@@ -693,6 +713,12 @@ impl App {
             sessions,
             groups: Vec::new(),
             groups_enabled,
+            groups_refresh_cycle: GroupRefreshCycleToken::new(),
+            groups_refresh_pending: false,
+            groups_refresh_in_flight: None,
+            groups_refresh_retry_binding: None,
+            groups_refresh_attempts: 0,
+            groups_refresh_retry_at: None,
             active_group: None,
             active_group_runs: HashSet::new(),
             group_target_mode: "all".to_string(),
@@ -706,6 +732,10 @@ impl App {
             scroll: 0,
             inspector_scroll: 0,
             busy: false,
+            direct_run_active: false,
+            direct_run_identity: None,
+            execution_identity_protocol: ExecutionIdentityProtocol::Strict,
+            legacy_execution_socket_generation: None,
             connected: false,
             storage_writable: true,
             plan_mode: false,
@@ -797,9 +827,33 @@ impl App {
     }
 }
 
+fn clear_group_refresh_schedule(app: &mut App) {
+    app.groups_refresh_in_flight = None;
+    app.groups_refresh_retry_binding = None;
+    app.groups_refresh_attempts = 0;
+    app.groups_refresh_retry_at = None;
+}
+
+fn begin_group_refresh_cycle(app: &mut App, pending: bool) {
+    // Pointer identity avoids integer wraparound: an old task/result retains
+    // its Arc allocation until it is dropped, so a later cycle cannot compare
+    // equal while that stale authority still exists.
+    app.groups_refresh_cycle = GroupRefreshCycleToken::new();
+    app.groups_refresh_pending = pending;
+    clear_group_refresh_schedule(app);
+}
+
+fn invalidate_group_refresh_cycle(app: &mut App) {
+    let pending = app.groups_refresh_pending;
+    begin_group_refresh_cycle(app, pending);
+}
+
 fn reset_target_scoped_state(app: &mut App) {
+    invalidate_group_refresh_cycle(app);
     app.active_group_runs.clear();
     app.busy = false;
+    app.direct_run_active = false;
+    app.direct_run_identity = None;
     app.connected = false;
     app.plan_mode = false;
     app.active_plan = None;
@@ -914,6 +968,48 @@ enum SocketEventAction {
     None,
     ReconnectMain,
     RefreshGroups,
+    CloseExecutionProtocol,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GroupRefreshBinding {
+    socket_generation: u64,
+    session_id: String,
+    active_group: Option<String>,
+    cycle: GroupRefreshCycleToken,
+}
+
+#[derive(Clone)]
+struct GroupRefreshCycleToken(Arc<()>);
+
+impl GroupRefreshCycleToken {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl std::fmt::Debug for GroupRefreshCycleToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("GroupRefreshCycleToken")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for GroupRefreshCycleToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for GroupRefreshCycleToken {}
+
+#[derive(Debug)]
+struct NegotiatedGroupRefresh {
+    binding: GroupRefreshBinding,
+    attempt: u8,
+    result: Result<Vec<GroupSummary>, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1869,12 +1965,22 @@ fn acknowledge_outbound_send(app: &mut App) {
 
 fn mark_socket_connected(app: &mut App) {
     app.socket_generation = app.socket_generation.wrapping_add(1).max(1);
+    if app.execution_identity_protocol == ExecutionIdentityProtocol::Legacy
+        && app.legacy_execution_socket_generation.is_none()
+    {
+        app.legacy_execution_socket_generation = Some(app.socket_generation);
+    }
     app.connected = true;
 }
 
 fn mark_socket_disconnected(app: &mut App) {
     app.connected = false;
-    if app.pending_outbound_write.is_some() {
+    if app.execution_identity_protocol == ExecutionIdentityProtocol::Legacy {
+        restore_pending_outbound(app);
+        app.busy = false;
+        app.direct_run_active = false;
+        app.direct_run_identity = None;
+    } else if app.pending_outbound_write.is_some() {
         app.outbound_reconnect_pending = true;
     }
 }
@@ -1939,7 +2045,8 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
     terminal.draw(|frame| render_starting(frame, &options))?;
     let port = ensure_daemon(&client, options.port).await?;
     let base = format!("http://127.0.0.1:{port}");
-    let groups_enabled = fetch_group_feature(&client, &base).await?;
+    let client_capabilities = fetch_client_capabilities(&client, &base).await?;
+    let groups_enabled = client_capabilities.groups_enabled;
     let sessions = fetch_sessions(&client, &base, None).await?;
 
     terminal.clear()?;
@@ -1956,6 +2063,7 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
         groups_enabled,
         image_protocol,
     );
+    app.execution_identity_protocol = client_capabilities.execution_identity_protocol;
     if config_needs_repair {
         app.status = tr(
             &app,
@@ -1971,7 +2079,20 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
     if groups_enabled {
         app.groups = fetch_groups(&client, &base).await.unwrap_or_default();
     }
-    let mut socket = Some(connect_socket(&base, &app.session.id, None).await?);
+    let (group_refresh_tx, mut group_refresh_rx) =
+        mpsc::unbounded_channel::<NegotiatedGroupRefresh>();
+    let initial_session_id = app.session.id.clone();
+    let mut socket = Some(
+        connect_socket_for_app_with_group_refresh(
+            &client,
+            &base,
+            &initial_session_id,
+            None,
+            &mut app,
+            Some(&group_refresh_tx),
+        )
+        .await?,
+    );
     mark_socket_connected(&mut app);
     let mut events = EventStream::new();
     let mut reconnect_tick = tokio::time::interval(Duration::from_secs(1));
@@ -1992,6 +2113,7 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
             &mut image_preview_context,
         );
         terminal.draw(|frame| render(frame, &mut app))?;
+        let group_refresh_retry_at = app.groups_refresh_retry_at;
         tokio::select! {
             terminal_event = events.next() => {
                 match terminal_event {
@@ -2052,7 +2174,17 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
                                     app.group_target_mode = "all".to_string();
                                     app.group_targets.clear();
                                     reset_target_scoped_state(&mut app);
-                                    match connect_socket(&base, &app.session.id, None).await {
+                                    let target_session_id = app.session.id.clone();
+                                    match connect_socket_for_app_with_group_refresh(
+                                        &client,
+                                        &base,
+                                        &target_session_id,
+                                        None,
+                                        &mut app,
+                                        Some(&group_refresh_tx),
+                                    )
+                                    .await
+                                    {
                                         Ok(connected) => {
                                             socket = Some(connected);
                                             mark_socket_connected(&mut app);
@@ -2079,7 +2211,16 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
                                     if let Some(mut current) = socket.take() {
                                         let _ = current.close(None).await;
                                     }
-                                    match connect_socket(&base, "main", Some(&group_id)).await {
+                                    match connect_socket_for_app_with_group_refresh(
+                                        &client,
+                                        &base,
+                                        "main",
+                                        Some(&group_id),
+                                        &mut app,
+                                        Some(&group_refresh_tx),
+                                    )
+                                    .await
+                                    {
                                         Ok(connected) => {
                                             socket = Some(connected);
                                             mark_socket_connected(&mut app);
@@ -2174,12 +2315,13 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
                                                 "features": { "groups": next },
                                             }),
                                         );
-                                        apply_socket_event_action(
+                                        apply_socket_event_action_with_group_refresh(
                                             socket_action,
                                             &client,
                                             &mut socket,
                                             &base,
                                             &mut app,
+                                            Some(&group_refresh_tx),
                                         )
                                         .await;
                                         if app.status.is_empty() {
@@ -2229,7 +2371,17 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
                                             .iter()
                                             .position(|item| crate::session_ids_match(&item.id, &app.session.id))
                                             .unwrap_or(0);
-                                        match connect_socket(&base, &app.session.id, None).await {
+                                        let target_session_id = app.session.id.clone();
+                                        match connect_socket_for_app_with_group_refresh(
+                                            &client,
+                                            &base,
+                                            &target_session_id,
+                                            None,
+                                            &mut app,
+                                            Some(&group_refresh_tx),
+                                        )
+                                        .await
+                                        {
                                             Ok(connected) => {
                                                 socket = Some(connected);
                                                 mark_socket_connected(&mut app);
@@ -2262,7 +2414,16 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
                                         }
                                         app.nav_index = app.sessions.len()
                                             + app.groups.iter().position(|group| group.id == group_id).unwrap_or(0);
-                                        match connect_socket(&base, "main", Some(&group_id)).await {
+                                        match connect_socket_for_app_with_group_refresh(
+                                            &client,
+                                            &base,
+                                            "main",
+                                            Some(&group_id),
+                                            &mut app,
+                                            Some(&group_refresh_tx),
+                                        )
+                                        .await
+                                        {
                                             Ok(connected) => {
                                                 socket = Some(connected);
                                                 mark_socket_connected(&mut app);
@@ -2301,12 +2462,13 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
                         match serde_json::from_str::<Value>(&text) {
                             Ok(value) => {
                                 let socket_action = apply_socket_event(&mut app, value);
-                                apply_socket_event_action(
+                                apply_socket_event_action_with_group_refresh(
                                     socket_action,
                                     &client,
                                     &mut socket,
                                     &base,
                                     &mut app,
+                                    Some(&group_refresh_tx),
                                 )
                                 .await;
                             }
@@ -2396,8 +2558,41 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
                     image_preview_task = None;
                 }
             }
-            _ = reconnect_tick.tick(), if socket.is_none() => {
-                match connect_socket(&base, &app.session.id, app.active_group.as_deref()).await {
+            group_refresh = group_refresh_rx.recv() => {
+                if let Some(group_refresh) = group_refresh {
+                    apply_negotiated_group_refresh(&mut app, group_refresh);
+                }
+            }
+            _ = async {
+                if let Some(deadline) = group_refresh_retry_at {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                schedule_due_group_refresh_retry(
+                    &client,
+                    &base,
+                    &mut app,
+                    &group_refresh_tx,
+                    socket.is_some(),
+                    tokio::time::Instant::now(),
+                );
+            }
+            _ = reconnect_tick.tick(), if socket.is_none()
+                && app.execution_identity_protocol == ExecutionIdentityProtocol::Strict => {
+                let reconnect_session_id = app.session.id.clone();
+                let reconnect_group_id = app.active_group.clone();
+                match connect_socket_for_app_with_group_refresh(
+                    &client,
+                    &base,
+                    &reconnect_session_id,
+                    reconnect_group_id.as_deref(),
+                    &mut app,
+                    Some(&group_refresh_tx),
+                )
+                .await
+                {
                     Ok(connected) => {
                         socket = Some(connected);
                         mark_socket_connected(&mut app);
@@ -2423,12 +2618,13 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
                             app.connected = false;
                             app.status = reconnect_status(&app, &error.to_string());
                         } else {
-                            apply_socket_event_action(
+                            apply_socket_event_action_with_group_refresh(
                                 feature_action,
                                 &client,
                                 &mut socket,
                                 &base,
                                 &mut app,
+                                Some(&group_refresh_tx),
                             )
                             .await;
                         }
@@ -2448,6 +2644,29 @@ pub(crate) async fn run(args: &[String]) -> TuiResult<()> {
 }
 
 fn reconnect_status(app: &App, error: &str) -> String {
+    match app.execution_identity_protocol {
+        ExecutionIdentityProtocol::Legacy => {
+            return tr(
+                app,
+                "旧版 daemon 无法安全重连执行事件；请重新启动 TUI，或使用当前 LingClaw 重启 daemon。",
+                "This older daemon cannot reconnect execution events safely; restart the TUI, or restart the daemon with the current LingClaw version.",
+            )
+            .to_string();
+        }
+        ExecutionIdentityProtocol::Unavailable => {
+            let message = tr(
+                app,
+                "无法协商安全的执行事件协议；请重启 TUI 或 daemon 后重试。",
+                "Could not negotiate a safe execution-event protocol; restart the TUI or daemon and try again.",
+            );
+            return if error.is_empty() {
+                message.to_string()
+            } else {
+                format!("{message} {error}")
+            };
+        }
+        ExecutionIdentityProtocol::Strict => {}
+    }
     let message = tr(app, "连接已断开，正在重连…", "Disconnected; reconnecting…");
     if error.is_empty() {
         message.to_string()
@@ -2556,18 +2775,48 @@ fn build_upload_client() -> TuiResult<Client> {
         .build()?)
 }
 
-async fn fetch_group_feature(client: &Client, base: &str) -> TuiResult<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClientCapabilities {
+    groups_enabled: bool,
+    execution_identity_protocol: ExecutionIdentityProtocol,
+}
+
+async fn fetch_client_capabilities(client: &Client, base: &str) -> TuiResult<ClientCapabilities> {
     let value: Value = client
         .get(format!("{base}/api/client-config"))
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .map_err(|error| format!("could not negotiate daemon capabilities: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("could not negotiate daemon capabilities: {error}"))?
         .json()
-        .await?;
-    Ok(value
-        .pointer("/features/groups")
-        .and_then(Value::as_bool)
-        .unwrap_or(false))
+        .await
+        .map_err(|error| format!("could not decode daemon capabilities: {error}"))?;
+    let execution_identity_protocol = match value.pointer("/protocols/execution_identity") {
+        None => ExecutionIdentityProtocol::Legacy,
+        Some(version) if version.as_u64() == Some(crate::EXECUTION_IDENTITY_PROTOCOL_VERSION) => {
+            ExecutionIdentityProtocol::Strict
+        }
+        Some(version) => {
+            return Err(format!(
+                "unsupported daemon execution identity protocol: {version}; restart the daemon with this LingClaw version"
+            )
+            .into());
+        }
+    };
+    Ok(ClientCapabilities {
+        groups_enabled: value
+            .pointer("/features/groups")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        execution_identity_protocol,
+    })
+}
+
+async fn fetch_group_feature(client: &Client, base: &str) -> TuiResult<bool> {
+    Ok(fetch_client_capabilities(client, base)
+        .await?
+        .groups_enabled)
 }
 
 fn apply_group_reconnect_feature_probe(app: &mut App, groups_enabled: bool) -> SocketEventAction {
@@ -2605,6 +2854,151 @@ async fn fetch_groups(client: &Client, base: &str) -> TuiResult<Vec<GroupSummary
         .json()
         .await?;
     Ok(response.groups)
+}
+
+fn group_refresh_binding(app: &App, socket_generation: u64) -> GroupRefreshBinding {
+    GroupRefreshBinding {
+        socket_generation,
+        session_id: app.session.id.clone(),
+        active_group: app.active_group.clone(),
+        cycle: app.groups_refresh_cycle.clone(),
+    }
+}
+
+fn schedule_negotiated_group_refresh(
+    client: &Client,
+    base: &str,
+    binding: GroupRefreshBinding,
+    attempt: u8,
+    sender: &mpsc::UnboundedSender<NegotiatedGroupRefresh>,
+) {
+    let client = client.clone();
+    let base = base.to_string();
+    let sender = sender.clone();
+    tokio::spawn(async move {
+        let result = fetch_groups(&client, &base)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = sender.send(NegotiatedGroupRefresh {
+            binding,
+            attempt,
+            result,
+        });
+    });
+}
+
+fn group_refresh_retry_delay(attempt: u8) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(6) as u32;
+    GROUP_REFRESH_RETRY_BASE * (1_u32 << exponent)
+}
+
+fn schedule_pending_group_refresh(
+    client: &Client,
+    base: &str,
+    app: &mut App,
+    socket_generation: u64,
+    sender: &mpsc::UnboundedSender<NegotiatedGroupRefresh>,
+) {
+    if !app.groups_refresh_pending {
+        return;
+    }
+    let binding = group_refresh_binding(app, socket_generation);
+    if app.groups_refresh_in_flight.as_ref() == Some(&binding) {
+        return;
+    }
+    if app.groups_refresh_retry_binding.as_ref() != Some(&binding) {
+        app.groups_refresh_retry_binding = Some(binding.clone());
+        app.groups_refresh_attempts = 0;
+        app.groups_refresh_retry_at = None;
+    } else if app
+        .groups_refresh_retry_at
+        .is_some_and(|deadline| deadline > tokio::time::Instant::now())
+    {
+        return;
+    }
+    if app.groups_refresh_attempts >= GROUP_REFRESH_MAX_ATTEMPTS {
+        return;
+    }
+    let attempt = app.groups_refresh_attempts.saturating_add(1);
+    schedule_negotiated_group_refresh(client, base, binding.clone(), attempt, sender);
+    app.groups_refresh_attempts = attempt;
+    app.groups_refresh_retry_at = None;
+    app.groups_refresh_in_flight = Some(binding);
+}
+
+fn apply_negotiated_group_refresh_at(
+    app: &mut App,
+    refresh: NegotiatedGroupRefresh,
+    now: tokio::time::Instant,
+) -> bool {
+    if app.groups_refresh_in_flight.as_ref() != Some(&refresh.binding) {
+        return false;
+    }
+    app.groups_refresh_in_flight = None;
+    let current = app.groups_enabled
+        && app.socket_generation == refresh.binding.socket_generation
+        && app.session.id == refresh.binding.session_id
+        && app.active_group == refresh.binding.active_group
+        && app.groups_refresh_cycle == refresh.binding.cycle;
+    if !current {
+        return false;
+    }
+    match refresh.result {
+        Ok(groups) => {
+            app.groups = groups;
+            app.groups_refresh_pending = false;
+            app.groups_refresh_retry_binding = None;
+            app.groups_refresh_attempts = 0;
+            app.groups_refresh_retry_at = None;
+            if refresh.attempt > 1 {
+                app.status = tr(app, "群聊列表已恢复", "The Group list has recovered").to_string();
+            }
+        }
+        Err(error) => {
+            app.status = error;
+            app.groups_refresh_pending = true;
+            app.groups_refresh_retry_binding = Some(refresh.binding);
+            app.groups_refresh_attempts = refresh.attempt;
+            app.groups_refresh_retry_at = (refresh.attempt < GROUP_REFRESH_MAX_ATTEMPTS)
+                .then(|| now + group_refresh_retry_delay(refresh.attempt));
+        }
+    }
+    true
+}
+
+fn apply_negotiated_group_refresh(app: &mut App, refresh: NegotiatedGroupRefresh) -> bool {
+    apply_negotiated_group_refresh_at(app, refresh, tokio::time::Instant::now())
+}
+
+fn take_due_group_refresh_retry(app: &mut App, now: tokio::time::Instant) -> bool {
+    let Some(deadline) = app.groups_refresh_retry_at else {
+        return false;
+    };
+    if deadline > now {
+        return false;
+    }
+    app.groups_refresh_retry_at = None;
+    app.groups_enabled
+        && app.groups_refresh_pending
+        && app.groups_refresh_in_flight.is_none()
+        && app.groups_refresh_retry_binding.as_ref()
+            == Some(&group_refresh_binding(app, app.socket_generation))
+}
+
+fn schedule_due_group_refresh_retry(
+    client: &Client,
+    base: &str,
+    app: &mut App,
+    sender: &mpsc::UnboundedSender<NegotiatedGroupRefresh>,
+    connection_available: bool,
+    now: tokio::time::Instant,
+) -> bool {
+    if !take_due_group_refresh_retry(app, now) || !connection_available || !app.connected {
+        return false;
+    }
+    let socket_generation = app.socket_generation;
+    schedule_pending_group_refresh(client, base, app, socket_generation, sender);
+    true
 }
 
 async fn checked_json(response: reqwest::Response) -> TuiResult<Value> {
@@ -3200,6 +3594,85 @@ async fn connect_socket(base: &str, session: &str, group: Option<&str>) -> TuiRe
     Ok(socket)
 }
 
+#[cfg(test)]
+async fn connect_socket_for_app(
+    client: &Client,
+    base: &str,
+    session: &str,
+    group: Option<&str>,
+    app: &mut App,
+) -> TuiResult<Socket> {
+    connect_socket_for_app_with_group_refresh(client, base, session, group, app, None).await
+}
+
+async fn connect_socket_for_app_with_group_refresh(
+    client: &Client,
+    base: &str,
+    session: &str,
+    group: Option<&str>,
+    app: &mut App,
+    group_refresh_sender: Option<&mpsc::UnboundedSender<NegotiatedGroupRefresh>>,
+) -> TuiResult<Socket> {
+    let capabilities = match fetch_client_capabilities(client, base).await {
+        Ok(capabilities) => capabilities,
+        Err(error) => {
+            app.execution_identity_protocol = ExecutionIdentityProtocol::Unavailable;
+            restore_pending_outbound(app);
+            app.connected = false;
+            app.busy = false;
+            app.direct_run_active = false;
+            app.direct_run_identity = None;
+            return Err(error);
+        }
+    };
+
+    app.execution_identity_protocol = capabilities.execution_identity_protocol;
+    if capabilities.execution_identity_protocol == ExecutionIdentityProtocol::Legacy
+        && app.socket_generation > 0
+    {
+        restore_pending_outbound(app);
+        app.connected = false;
+        app.busy = false;
+        app.direct_run_active = false;
+        app.direct_run_identity = None;
+        return Err(tr(
+            app,
+            "旧版 daemon 无法安全建立第二个执行事件连接；请重新启动 TUI，或使用当前 LingClaw 重启 daemon。",
+            "This older daemon cannot open a second execution-event connection safely; restart the TUI, or restart the daemon with the current LingClaw version.",
+        )
+        .to_string()
+        .into());
+    }
+
+    if app.groups_enabled != capabilities.groups_enabled {
+        let feature_action = apply_socket_event(
+            app,
+            json!({
+                "type": "feature_status",
+                "features": {"groups": capabilities.groups_enabled}
+            }),
+        );
+        if group.is_some()
+            && (!capabilities.groups_enabled || feature_action == SocketEventAction::ReconnectMain)
+        {
+            return Err(tr(
+                app,
+                "群聊已由配置关闭，未建立过期的 Group 连接",
+                "Groups were disabled by configuration; the stale Group connection was not opened",
+            )
+            .to_string()
+            .into());
+        }
+    }
+    let socket = connect_socket(base, session, group).await?;
+    if let Some(sender) = group_refresh_sender {
+        let next_generation = app.socket_generation.wrapping_add(1).max(1);
+        schedule_pending_group_refresh(client, base, app, next_generation, sender);
+    }
+    Ok(socket)
+}
+
+#[cfg(test)]
 async fn apply_socket_event_action(
     action: SocketEventAction,
     client: &Client,
@@ -3207,17 +3680,66 @@ async fn apply_socket_event_action(
     base: &str,
     app: &mut App,
 ) {
+    apply_socket_event_action_with_group_refresh(action, client, socket, base, app, None).await;
+}
+
+async fn apply_socket_event_action_with_group_refresh(
+    action: SocketEventAction,
+    client: &Client,
+    socket: &mut Option<Socket>,
+    base: &str,
+    app: &mut App,
+    group_refresh_sender: Option<&mpsc::UnboundedSender<NegotiatedGroupRefresh>>,
+) {
     match action {
         SocketEventAction::None => {}
-        SocketEventAction::RefreshGroups => match fetch_groups(client, base).await {
-            Ok(groups) => app.groups = groups,
-            Err(error) => app.status = error.to_string(),
-        },
+        SocketEventAction::RefreshGroups => {
+            if let Some(sender) = group_refresh_sender {
+                schedule_pending_group_refresh(client, base, app, app.socket_generation, sender);
+            } else {
+                match fetch_groups(client, base).await {
+                    Ok(groups) => {
+                        app.groups = groups;
+                        app.groups_refresh_pending = false;
+                        app.groups_refresh_in_flight = None;
+                        app.groups_refresh_retry_binding = None;
+                        app.groups_refresh_attempts = 0;
+                        app.groups_refresh_retry_at = None;
+                    }
+                    Err(error) => {
+                        app.status = error.to_string();
+                        app.groups_refresh_pending = true;
+                        app.groups_refresh_in_flight = None;
+                        app.groups_refresh_retry_binding = None;
+                        app.groups_refresh_attempts = 0;
+                        app.groups_refresh_retry_at = None;
+                    }
+                }
+            }
+        }
+        SocketEventAction::CloseExecutionProtocol => {
+            if let Some(mut current) = socket.take() {
+                let _ = current.close(None).await;
+            }
+            app.connected = false;
+            app.execution_identity_protocol = ExecutionIdentityProtocol::Unavailable;
+            app.status = execution_identity_missing_status(app);
+        }
         SocketEventAction::ReconnectMain => {
             if let Some(mut current) = socket.take() {
                 let _ = current.close(None).await;
             }
-            match connect_socket(base, &app.session.id, None).await {
+            let target_session_id = app.session.id.clone();
+            match connect_socket_for_app_with_group_refresh(
+                client,
+                base,
+                &target_session_id,
+                None,
+                app,
+                group_refresh_sender,
+            )
+            .await
+            {
                 Ok(connected) => {
                     *socket = Some(connected);
                     mark_socket_connected(app);
@@ -4887,6 +5409,42 @@ fn restore_pending_outbound(app: &mut App) {
     app.outbound_reconnect_pending = false;
 }
 
+fn socket_event_run_identity(app: &App, value: &Value) -> Option<String> {
+    if let Some(identity) = value
+        .get("run_connection_id")
+        .and_then(Value::as_str)
+        .filter(|identity| !identity.is_empty())
+    {
+        return Some(identity.to_string());
+    }
+    if app.execution_identity_protocol == ExecutionIdentityProtocol::Legacy
+        && app.legacy_execution_socket_generation == Some(app.socket_generation)
+    {
+        return Some(format!("legacy-socket-{}", app.socket_generation));
+    }
+    None
+}
+
+fn execution_identity_missing_status(app: &App) -> String {
+    tr(
+        app,
+        "daemon 未提供必需的执行身份；请重新启动 TUI 或 daemon 后再运行任务。",
+        "The daemon omitted the required execution identity; restart the TUI or daemon before running more work.",
+    )
+    .to_string()
+}
+
+fn fail_close_execution_protocol_event(app: &mut App) -> SocketEventAction {
+    restore_pending_outbound(app);
+    app.execution_identity_protocol = ExecutionIdentityProtocol::Unavailable;
+    app.connected = false;
+    app.direct_run_active = false;
+    app.direct_run_identity = None;
+    app.busy = !app.active_group_runs.is_empty();
+    app.status = execution_identity_missing_status(app);
+    SocketEventAction::CloseExecutionProtocol
+}
+
 fn apply_socket_event(app: &mut App, value: Value) -> SocketEventAction {
     let mut action = SocketEventAction::None;
     let event_type = value
@@ -4982,6 +5540,8 @@ fn apply_socket_event(app: &mut App, value: Value) -> SocketEventAction {
             // stale local run state first; an immediately following `start` event
             // restores it when the daemon still has an active round.
             app.busy = false;
+            app.direct_run_active = false;
+            app.direct_run_identity = None;
             app.lines.clear();
             app.last_image_url = None;
             let messages = value
@@ -5014,12 +5574,20 @@ fn apply_socket_event(app: &mut App, value: Value) -> SocketEventAction {
             replace_history_user_messages(app, messages);
         }
         "start" => {
-            settle_pending_outbound(app);
-            app.busy = true;
+            if let Some(run_identity) = socket_event_run_identity(app, &value) {
+                settle_pending_outbound(app);
+                app.busy = true;
+                app.direct_run_active = true;
+                app.direct_run_identity = Some(run_identity);
+            } else {
+                return fail_close_execution_protocol_event(app);
+            }
         }
         "group_history" => {
             app.lines.clear();
             app.active_group_runs.clear();
+            app.direct_run_active = false;
+            app.direct_run_identity = None;
             app.last_image_url = None;
             let messages = value
                 .get("messages")
@@ -5231,8 +5799,13 @@ fn apply_socket_event(app: &mut App, value: Value) -> SocketEventAction {
                 .pointer("/features/groups")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            if was_enabled != enabled {
+                begin_group_refresh_cycle(app, enabled);
+            }
             app.groups_enabled = enabled;
             if !enabled {
+                app.groups_refresh_pending = false;
+                clear_group_refresh_schedule(app);
                 let was_in_group = app.active_group.is_some();
                 if was_in_group {
                     // The Group target is being removed. Settle its in-flight
@@ -5247,6 +5820,8 @@ fn apply_socket_event(app: &mut App, value: Value) -> SocketEventAction {
                 app.group_target_mode = "all".to_string();
                 app.group_targets.clear();
                 app.busy = false;
+                app.direct_run_active = false;
+                app.direct_run_identity = None;
                 if was_in_group {
                     if let Some((index, main)) = app
                         .sessions
@@ -5286,6 +5861,8 @@ fn apply_socket_event(app: &mut App, value: Value) -> SocketEventAction {
                     app.storage_writable = false;
                     restore_pending_outbound(app);
                     app.busy = false;
+                    app.direct_run_active = false;
+                    app.direct_run_identity = None;
                     app.active_group_runs.clear();
                     app.quit_armed = false;
                     app.status = tr(
@@ -5310,12 +5887,47 @@ fn apply_socket_event(app: &mut App, value: Value) -> SocketEventAction {
             }
         }
         "done" | "stopped" => {
-            settle_pending_outbound(app);
-            app.busy = false;
+            let run_identity = socket_event_run_identity(app, &value);
+            if run_identity.is_none()
+                && app.direct_run_active
+                && app.execution_identity_protocol != ExecutionIdentityProtocol::Legacy
+            {
+                return fail_close_execution_protocol_event(app);
+            }
+            let matches_active_run = app.direct_run_active
+                && run_identity.is_some()
+                && run_identity.as_deref() == app.direct_run_identity.as_deref();
+            if matches_active_run {
+                settle_pending_outbound(app);
+                app.busy = !app.active_group_runs.is_empty();
+                app.direct_run_active = false;
+                app.direct_run_identity = None;
+            }
         }
         "error" => {
+            let had_pending_outbound = app.pending_outbound_write.is_some();
             restore_pending_outbound(app);
-            app.busy = false;
+            let run_terminal = value.get("run_terminal").and_then(Value::as_bool) == Some(true);
+            let run_identity = socket_event_run_identity(app, &value);
+            if run_terminal
+                && run_identity.is_none()
+                && (app.direct_run_active || had_pending_outbound)
+                && app.execution_identity_protocol != ExecutionIdentityProtocol::Legacy
+            {
+                app.push("error", event_content(&value), LineKind::Error);
+                return fail_close_execution_protocol_event(app);
+            }
+            let terminal_matches_active_run = run_terminal
+                && app.direct_run_active
+                && run_identity.is_some()
+                && run_identity.as_deref() == app.direct_run_identity.as_deref();
+            if terminal_matches_active_run {
+                app.direct_run_active = false;
+                app.direct_run_identity = None;
+                app.busy = !app.active_group_runs.is_empty();
+            } else if !app.direct_run_active {
+                app.busy = !app.active_group_runs.is_empty();
+            }
             app.push("error", event_content(&value), LineKind::Error);
         }
         "system" => {

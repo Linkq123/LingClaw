@@ -1,4 +1,5 @@
 // ── Shared types ──
+import type { RunDiagnostic } from './runDiagnostics.js';
 
 export interface ImageAttachment {
   url: string;
@@ -23,6 +24,31 @@ export interface HistoryMessage {
   duration_ms?: number;
   thinking?: string;
   subagent_snapshot?: SubagentHistorySnapshot;
+  run_outcomes?: TopLevelRunOutcome[];
+}
+
+export interface TopLevelRunOutcome {
+  session_id: string;
+  run_id: string;
+  run_connection_id: string;
+  status:
+    | 'completed'
+    | 'failed'
+    | 'blocked'
+    | 'waiting_user'
+    | 'partial'
+    | 'stopped'
+    | 'incomplete';
+  phase: string;
+  reason?: string | null;
+  diagnostic?: RunDiagnostic | null;
+  duration_ms: number;
+  start_message_index: number;
+  end_message_index: number;
+  plan_id?: string | null;
+  plan_revision?: number | null;
+  started_at: number;
+  finished_at: number;
 }
 
 export interface SubagentToolHistorySnapshot {
@@ -233,6 +259,8 @@ export interface SystemEvent {
   type: 'system' | 'success' | 'error' | 'progress';
   content: string;
   code?: string;
+  run_terminal?: boolean;
+  run_connection_id?: string;
 }
 
 export interface ReactPhaseEvent {
@@ -244,9 +272,21 @@ export interface ReactPhaseEvent {
 export interface StartEvent {
   type: 'start';
   run_mode?: 'execute' | 'plan_only';
+  run_connection_id?: string;
 }
 export interface DoneEvent {
   type: 'done';
+  run_connection_id?: string;
+  phase?: string;
+  reason?: string;
+  cycles?: number;
+  tool_calls?: number;
+  daily_input_tokens?: number;
+  daily_output_tokens?: number;
+  total_input_tokens?: number;
+  total_output_tokens?: number;
+  round_input_tokens?: number;
+  round_output_tokens?: number;
 }
 export interface ViewStateEvent {
   type: 'view_state';

@@ -44,7 +44,7 @@ flowchart TB
 
 - Agent run 使用启动边界取得的不可变 `Config` 和有效 Session model 快照，配置热更新不会让进行中的 run 落入另一模型。
 - HTTP 级 LLM 重试只处理瞬态连接、超时、429 和 5xx；Agent cycle 是更高一层的决策循环。
-- `/stop` 和服务关闭会取消当前 run，并向正在执行的工具和 Sub-agent 传播；各层 hard cap 与超时在各自边界终止工作。浏览器断开只解除连接，不会停止仍在运行的 active run。
+- `/stop` 和服务关闭会取消当前 run，并向正在执行的工具和 Sub-agent 传播。Finish 验证后的 `OnFinish` hook、Usage 聚合、persist gate 与 run-owned 终态 patch 准备仍处于精确 run 的 `PreCommit` 可取消阶段，hook/Plan 事件只缓存、不广播；数据库任务入队前做最后一次 Stop 仲裁。Stop 在此之前胜出时，唯一事务只提交 `stopped` Plan/Session/outcome，不会发送完成错误、Plan/hook 事件、Memory/Reflection 工作或自然 `done`。自然终态一旦进入 `CommitChosen`，就不可通过 `select!` 丢弃 `tokio-rusqlite` future，而是等待同一事务明确提交 Session、Plan 与 outcome 后再更新内存和广播；其后到达的 Stop 不会覆盖该事实或污染下一 run。各层 hard cap 与超时在各自边界终止工作。浏览器断开只解除连接，不会停止仍在运行的 active run。
 - Busy 时收到的普通用户文本作为 delayed intervention 排队，在下一次 Analyze 前注入，不强行截断当前 tool transaction。
 - Plan Mode 使用独立 `PlanOnly` 边界，只暴露显式只读能力；Group 在协议边界拒绝 `plan_only`。批准后用持久化 `plan_id + revision` 开始正常 run，批准动作不写入虚假 user message。
 
@@ -60,9 +60,25 @@ SQLite v5 把生命周期拆为 `session_plans`、不可变 `session_plan_revisi
 
 ### Execution Stack
 
-后端保持细粒度 live events，前端按一次顶层 run 聚合 Reasoning、Tool、Task Plan、Sub-agent 和 Orchestration。跨多个 ReAct cycle 的步骤仍属于同一执行栈。Tool result 通过 tool-call ID 更新原步骤，而不是创建重复卡片。
+历史 Plan 生命周期协调覆盖当前及旧 revision，但只作用于同一 Session、已验证 run 与精确 Plan/revision 的栈；已 Discard 的 revision 会清除其关联等待视图，不修改原始 run fact。恢复解析器在同一 History generation 内按需加载目标 assistant 锚点所在页，保持时间线顺序，并阻止旧分页动画帧覆盖新一轮滚动或焦点。重挂载 Plan 时保留已挂载 revision 的 disclosure 和草稿。
 
-历史记录没有可靠开始时间时，前端不伪造耗时。类型过滤后无可见步骤的执行栈会隐藏，并关闭相关 Inspector/Modal。
+`run_diagnostics.rs` 定义封闭错误码及固定安全文案。Provider 诊断只识别本地 transport 生成的状态前缀和本地 request-builder 错误，不扫描上游正文。错误码复用 SQLite v7 终态的有界 `reason` 列，与 Session/Plan 在原事务内提交；读取时恢复匹配的 `diagnostic.code`，写入时拒绝类别与原因不一致的事实。原始响应、头、URL 和凭据不进入诊断。旧未知原因不推断新类别，因此不需要 schema 或应用版本变更。
+
+Provider 适配器必须将上游自由文本放在固定协议标签之后，再向运行时返回错误；Responses 根级 SSE message、嵌套 error 和 incomplete reason 遵循同一来源边界。只有本地 `send_with_retry` 可生成裸 HTTP/连接/构造前缀。诊断、暂时错误重试和能力回退消费该封装，不能把 HTTP200 响应正文伪装的 transport 前缀当成真实来源；既有 previous_response_id 恢复仍保留其专用判断。
+
+Console 保持两侧 DOM 挂载，但 `[hidden]` 的工作台、portal 和 Console 必须真正退出布局及原生转场捕获。控制器同时观察 `ready`、`updateCallbackDone` 和 `finished`，原生失败进入有方向的 CSS fallback；过期 generation 不能应用布局、焦点或回退。
+
+后端保持细粒度 live events，前端按一次顶层 run 聚合 ReAct phase、Reasoning、Tool、执行提纲、Sub-agent 和 Orchestration。跨多个 ReAct cycle 的步骤仍属于同一执行栈。Tool result 通过 tool-call ID 更新原步骤，而不是创建重复卡片。只有明确的 `done phase=finish/reason=complete` 会进入可自动折叠的 `completed`；`system`/`progress` 不结束 run，停止、安全上限、失败和未知终态分别保留为 `stopped`、`incomplete`、`failed` 或 `partial`。精确身份匹配的 attention `done` 即使没有渲染任何过程步骤，也会通过身份化 helper 建立唯一终态栈及摘要、ARIA、耗时和恢复入口；无步骤的成功完成不生成空栈。顶层 `start`（含 live replay）、终态 `error` 和 `done` 都带服务器权威的 `run_connection_id`。WebUI/TUI 在**每个** WebSocket generation 前重新从 `/api/client-config` 协商 `protocols.execution_identity`，以连接意图 token 和 Session/Group 目标淘汰迟到响应，再将服务器身份与本地 client-run 序列共同绑定。WebUI 的统一读取截止同时覆盖响应头和 JSON body；每个连接意图持有独立 AbortController，新意图、取消、目标切换与 fail-close 会主动终止旧协商。Bootstrap 首次特性发现就是首个连接意图本身，不存在第二条 ownerless 请求；同一 token 必须在应用能力、按持久化 Group 重定向目标及创建 WebSocket 前持续有效。Group close 恢复使用独立有界 owner。字段缺失明确代表 legacy daemon：仅首个、未重连 socket generation 可为同连接无身份事件合成身份，断线、Session/Group 切换或第二连接必须 fail-closed 并提示刷新/重启；未知版本、请求/解码失败也在 `new WebSocket`/`connect_async` 前拒绝且停止自动重试。legacy 升级为严格协议后可由后续显式连接重新协商恢复。严格连接收到无身份顶层 `start` 时，会关闭产生该事件的准确 socket generation，撤销乐观 busy/stream/ReAct/timer/Plan action；若精确活动 run 已有过程栈，则先把该栈收口为可恢复的 `incomplete` 并保留用户手动展开状态，不留下 running DOM/ARIA 或 active 指针。TUI 只在身份合法后确认 pending outbound，legacy 断线则立即恢复未确认的文本、附件和 Plan mode；协商热开启 Groups 时，WebSocket 先建立，列表在后台获取。刷新同时绑定 socket generation、Session/Group 目标与独立 feature-cycle token；enable/disable 转换或目标重置会更换 token，重复同状态不会。token 依靠旧任务仍持有的分配生命周期保证无 wrap/ABA，因此同 socket、同目标重新启用时，旧结果不能匹配新 in-flight，也不能修改其 pending、attempt、retry、status 或列表。同一完整绑定只有一个在途请求；短暂失败采用有限退避重试，绑定失效会取消后续重试并拒绝迟到结果，新 generation 不受旧计时器阻塞。无身份或身份不匹配的迟到 `done` 只能更新与运行身份无关的 Usage 总数，不能创建幽灵栈、清除 busy 或结束新 run。由于部分运行失败路径不保证继续发送 `done`，后端仅在真正终结顶层运行的错误上发送 `run_terminal: true`；前端只在该标记和双重身份同时匹配时收口，`false` 或缺失字段均保守视为非终态。这样 busy `/think`、command hook、Plan action 与其他预检错误只增加错误卡，不会清除 busy/ReAct/timer 或 `live_round`。终态栈继续保留 client-run、server-run 与 Plan 关联，匹配的迟到 `plan_state` 或兼容 `done` 原位合并；storage protection 也只按精确活动 client run 完成并保存该栈，Plan action、Session/Group transition 或 Group-only busy 不得创建或篡改顶层执行栈。所有 attention 终态保持恢复入口，手动折叠状态始终优先；入口按稳定 Plan ID 或当前步骤动态解析，目标更换后不会变成死按钮。摘要按“动作 + 对象 + 结果”组织，并汇总进度、失败点、验证、产物与未解决项。
+
+每个顶层 reservation 生成一个跨 ReAct cycle 稳定、进程内唯一的 `run_id`；`start`、终态 `error` 和 `done` 同时携带它与 connection identity。终态生产协程在释放 reservation 或处理下一轮输入前，只在 gate 外准备精确 run 的消息尾/Plan 代际 patch；最终锁序固定为 `Session persist gate → sessions lock → 合并最新 Session → 释放 sessions lock → SQLite immediate transaction → 释放 gate`。因此先提交的 Todos/revision、模型/Effort、Usage、工作目录绑定及其他非 run 字段不会被旧整份 Session 覆盖，而新用户消息、不同 Plan 代际或其他 run-owned 尾部变化会 fail-closed。SQLite v7 的 `session_run_outcomes` 与合并后的 Session/最终 Plan 在同一事务中提交；内存也只在再次确认同一代际后发布这些 run-owned 字段。异步 live dispatcher 只维护 replay/转发，不会事后重取更晚的 Session。读取时在同一次数据库 read 中验证真实连续消息数与每条边界，越界或损坏会进入保护模式。History 将事实附在边界内最后一个可见消息的 `run_outcomes[]`，重启或重连后直接恢复；消息尾被重写时，涉及该尾部的事实会同步失效。旧 schema 数据或确实缺少事实的过程仍安全降级为 `incomplete`，不会从 transcript 形状猜成功，也不会伪造耗时。
+
+终态消息边界不是运行开始时缓存的数组下标。Reservation 会指纹化本轮精确 user message；BeforeAnalyze 自动压缩、前缀裁剪或签名图片 URL 规范化后，终态 patch 与 outcome 都重新解析同一锚点。锚点缺失或出现无法区分的重复时安全失败，不会把事实绑定到另一个相同文本的用户消息：运行时只发送一次绑定精确身份的 live terminal `error`（`phase=incomplete`、`code=terminal_identity_unavailable`），不发送 `done`，也不向 SQLite 猜写 outcome。客户端据此把精确 live stack 收口为可恢复的 incomplete；后续历史会保持 incomplete，直到另一轮安全提交有效事实。PlanOnly 刷新或反馈产生新 revision 时，outcome 从事务内最终 replacement Plan 取得 `plan_id + revision`，而不是沿用运行开始时的旧 revision。
+
+保存旧运行终态时，校验该 run 原消息区间的每个指纹与位置；区间外 system 提示更新或其他消息编辑不会使其失效，真正相交的修改、删除或移位才删除事实。普通运行在仍有未恢复工具/委派失败时原子提交 partial；同规范调用成功重试后可 completed。read_file 的行范围可修正，其他操作参数保持严格匹配。硬上限等异常结束通过同一 expected/replacement patch 收口当前 Plan，数据库确认前不发布 Plan。前端按 Session/run/Plan revision 查找仍挂载的已结束栈，done 后丢弃也能清除恢复提示，且不会改变原耗时。
+
+`stop_requested` 通过精确 run-generation 的 relay 持续传播到 `run_cancel`，因此 Provider stream、Tool、Sub-agent、Orchestration 和 Finish verifier 在长 future 中也会及时结束；停止后迟到 token/自然完成不能覆盖唯一 `stopped` 终态。Agent 级瞬态重试只发送结构化 `progress(kind=llm_retry, attempt, max_attempts)`，前端在同一栈中暂时显示 attempt，不把完整 Provider 错误复制成 system row；最终失败正文只由终态栈呈现一次。同一结构化 Tool action 与规范目标的后续成功会把旧失败标为 recovered、保留详情但移出 unresolved；不同目标不能互相抵消。Plan 的服务器 `discarded` 状态会把关联栈收口为中性终态并移除提问/恢复动作。结果与恢复文案保留稳定 i18n key/参数，切换语言时原位重算，不改变 run identity、手动 disclosure 或滚动位置。
+
+类型过滤后无可见步骤的成功执行栈会隐藏，但 attention 摘要与恢复入口继续可见。Reasoning 密度是独立的本地 Summary/Normal/Verbose 呈现状态；Summary 与 Normal 只把字符数、段落数等派生轨迹信息写入 DOM，完整 thinking 仅在 Verbose 中呈现。Auto Debug 使用聊天时间线之外、位于消息与 Composer 之间的可关闭布局 dock，而非覆盖最新内容的绝对定位浮层。内联长内容只由 execution-stack body 滚动；移到 body 层级的 Modal/Inspector 保留自己的有界滚动。Console 当前视图由唯一非 inert `h1` 标识，通用表单 label 与实际 control 通过稳定 id/`htmlFor`/`aria-labelledby` 关联。
 
 ## Backend 模块职责
 
@@ -73,6 +89,7 @@ SQLite v5 把生命周期拆为 `session_plans`、不可变 `session_plan_revisi
 | `runtime_loop.rs` | 顶层 Agent Analyze/Act/Observe/Finish |
 | `agent.rs` | phase、TaskIntent、WorkingState、Task Plan、Finish 判定 |
 | `providers.rs` | Provider 消息转换、请求、流解析和 usage |
+| `run_diagnostics.rs` | 封闭终端错误码与固定安全文案 |
 | `config.rs` | JSON/环境变量加载、校验、模型解析和显式模型状态 |
 | `commands.rs` | Slash Command |
 | `context.rs` | Token 估算、请求预算、裁剪 |
@@ -111,7 +128,7 @@ flowchart LR
 - Gemini 保留 `functionCall.id`、`functionResponse.id` 和真实 `thoughtSignature`，图片使用 `inlineData`。
 - Ollama 消费 NDJSON stream，按模型能力发送 `think` 和 images。
 
-Provider 的 reasoning effort 由统一 think level 和可选 `compat.thinkingFormat` 映射。辅助 Memory/Reflection/Context 调用进入相同 usage 记账，但不重放工具图片。
+Provider 的 reasoning effort 由统一 think level 和可选 `compat.thinkingFormat` 映射。辅助 Memory/Reflection/Context 调用进入相同 usage 记账，但不重放工具图片。Memory/Reflection 在 Provider 成功后以唯一 operation id 走 Session persist gate；SQLite 在同一事务写入幂等标记、总量、日量与 Provider/role label，确认后才更新内存。Memory 会在解析 Provider 提取 JSON 或尝试私有文件保存之前先提交这笔 Usage，因此解析与文件系统失败不会丢失已发生的计费。Session 未加载到内存时仍可完成持久增量；SQLite 中 Session 已缺失则是正常领域结果，不进入保护模式。App-owned auxiliary registry 把排队和运行中的任务同时绑定到 canonical Session allocation 与 Memory/Reflection enable cycle。删除会先关闭新注册、取消并等待精确 allocation，再获取 persist gate；功能热禁用、sticky storage protection 与 graceful shutdown 也会 drain 同一注册表。每次私有 Memory/Reflection/audit 写入都必须先通过注册表中的 operation-scoped 授权边界：取消先赢则不启动写入，写入先赢则任务保持受监管直至 teardown 等待完成。Provider 已成功时仍完成幂等 Usage 提交，因此 drain 完成后不会重建已删除的 Session home。
 
 ## 工具系统
 
@@ -177,9 +194,9 @@ Orchestrator 验证 DAG，按拓扑层并行运行，传播依赖结果并发送
 
 首次发现旧 `sessions/` 或 `groups/` 时，Runtime 在开始提供 HTTP 请求前完成严格迁移：读取 primary/`.tmp`、校验 ID/引用和哈希，把目录原子移动到 `backups/sqlite-migration-<timestamp>/`，再在一个 SQLite 事务中导入、校验并记录完成标记。两阶段 journal 支持崩溃续跑；成功后不再读取或写入旧 JSON，备份不会自动删除。Schema 升级前先创建一致性数据库备份。
 
-运行期 SQLite I/O、损坏或约束错误会把进程置为粘性的 `protected` 状态。Runtime 取消活动 Agent/Group run 并拒绝核心数据库写入，读取和独立 `.lingclaw.json` 保存仍可用。HTTP 返回稳定的 `503 storage_protected`，WebSocket 广播 `storage_status`；修复外部问题后需要重启进程。
+运行期 SQLite I/O、损坏或约束错误会把进程置为粘性的 `protected` 状态。首次转换时，Runtime 先按精确 `(session_id, connection_id)` 退休被取消 direct run 的 `live_round`，再通过取消令牌终止活动 Agent/Group run；已由新连接替换或不匹配的 replay 状态不受影响。该流程不设置用户拥有的 stop 标志、不触发 `/stop` hook，也不伪造 `user_stop` 终态。核心数据库写入随后被拒绝，读取和独立 `.lingclaw.json` 保存仍可用。HTTP 返回稳定的 `503 storage_protected`，WebSocket 广播 `storage_status`；修复外部问题后需要重启进程。
 
-每个 Session 同时拥有两个明确边界：`session_home` 固定在 `~/.lingclaw/<id>/workspace/`，保存 Persona、Memory、Skills、Agents、MCP policy 和缓存；`working_directory` 是文件、Shell、Git、图片、Plan evidence 与 MCP roots 的项目根。外部目录只读加载根级 `AGENTS.md`/`AGENT.md`，不能覆盖 LingClaw 工具安全策略。Session 删除先提交数据库事务（包括 Group 成员和投票清理），再只删除私有 Session Home；外部项目永不删除。
+每个 Session 同时拥有两个明确边界：`session_home` 固定在 `~/.lingclaw/<id>/workspace/`，保存 Persona、Memory、Skills、Agents、MCP policy 和缓存；`working_directory` 是文件、Shell、Git、图片、Plan evidence 与 MCP roots 的项目根。外部目录只读加载根级 `AGENTS.md`/`AGENT.md`，不能覆盖 LingClaw 工具安全策略。Session ready/recreate 与 socket binding 共用 canonical Session control lock（Windows 大小写别名映射到同一锁）。删除在该锁下先 drain 辅助任务、再等待 persist gate，并在拿到 gate 后重新核对精确 closed allocation 及活动 connection/run；锁保持到数据库与私有 Home 清理结束。因此排队中的重连要么先完成绑定并让删除失败，要么只会在删除完成后显式创建新 allocation。Session 删除先提交数据库事务（包括 Group 成员和投票清理），再只删除私有 Session Home；外部项目永不删除。
 
 ### Bootstrap prompt
 
@@ -236,6 +253,7 @@ Runtime 不从任意文本、stdout、路径或 URL 猜测图片。原始 Base64
 
 - `main.ts`：入口和 live event switchboard
 - `socket.ts`：连接、重连和 Session/Group 绑定
+- `composerTransport.ts`：当前连接意图、已协商 socket 代际、Session/Group 与历史准备状态以及统一发送门禁；仅同一 Session 的重连历史重放保留未发送附件
 - `input.ts`：Composer、Slash、mention、图片和 send/stop
 - `state.ts`：集中 UI state 与 DOM refs
 - `renderers/execution-stack.ts`：顶层过程聚合

@@ -1,5 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -7,13 +13,62 @@ use sha2::{Digest, Sha256};
 use super::{Database, StorageError};
 use crate::{
     ChatMessage, DailyUsageSnapshot, PendingPlan, Session, SessionWorkspaceKind,
-    SubagentHistorySnapshot,
+    SubagentHistorySnapshot, TopLevelRunOutcome,
+    context::UsageUpdate,
     plan::{PlanArtifact, PlanEvidence, PlanProgressStep, PlanStatus, PlanStepStatus},
     session_store::{SessionSummary, sanitized_non_system_message_count},
     todos::{TodoItem, TodoSnapshot, TodoStatus, TodoUpdatedBy},
 };
 
 const MAX_SYNCED_PLAN_REVISIONS: i64 = 50;
+const MAX_SAVED_RUN_OUTCOMES: i64 = 500;
+const MAX_AUXILIARY_USAGE_OPERATION_MARKERS: i64 = 4_096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuxiliaryUsageApplyOutcome {
+    Applied,
+    Duplicate,
+    Missing,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RunOutcomeCommitTestGate {
+    entered: AtomicBool,
+    allow_commit: AtomicBool,
+    fail_before_commit: AtomicBool,
+    committed: AtomicBool,
+    allow_response: AtomicBool,
+}
+
+#[cfg(test)]
+impl RunOutcomeCommitTestGate {
+    pub(crate) fn entered(&self) -> bool {
+        self.entered.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn allow_commit(&self) {
+        self.allow_commit.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn committed(&self) -> bool {
+        self.committed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn fail_before_commit(&self) {
+        self.fail_before_commit.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn allow_response(&self) {
+        self.allow_response.store(true, Ordering::Release);
+    }
+
+    fn wait_for(flag: &AtomicBool) {
+        while !flag.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
 
 #[derive(Clone)]
 struct StoredMessage {
@@ -437,6 +492,24 @@ fn save_prepared_session(
         .zip(stored.messages.iter())
         .take_while(|((_, fingerprint), message)| fingerprint == &message.fingerprint)
         .count();
+    // The write optimisation's common prefix is not a run's ownership boundary:
+    // refreshing the system prompt at position zero also rewrites unchanged
+    // later rows. Retain a fact only when every fingerprint in its original
+    // interval is still at exactly the same position. Never guess a new binding.
+    for outcome in query_run_outcomes(connection, &session.id, persisted_messages.len())? {
+        let unchanged = (outcome.start_message_index..=outcome.end_message_index).all(|index| {
+            stored
+                .messages
+                .get(index)
+                .is_some_and(|message| message.fingerprint == persisted_messages[index].1)
+        });
+        if !unchanged {
+            connection.execute(
+                "DELETE FROM session_run_outcomes WHERE session_id=?1 AND run_id=?2",
+                params![session.id, outcome.run_id],
+            )?;
+        }
+    }
     connection.execute(
         "DELETE FROM session_messages WHERE session_id=?1 AND position>=?2",
         params![session.id, i64::try_from(common_prefix).unwrap_or(i64::MAX)],
@@ -747,6 +820,224 @@ pub(super) fn save_session_record(
     save_prepared_session(connection, &stored)
 }
 
+fn validate_run_outcome(
+    outcome: &TopLevelRunOutcome,
+    message_count: usize,
+) -> Result<(), StorageError> {
+    if outcome.diagnostic
+        != crate::run_diagnostics::RunDiagnostic::from_reason(outcome.reason.as_deref())
+    {
+        return Err(StorageError::new(
+            "Terminal diagnostic does not match its durable reason code",
+        ));
+    }
+    if outcome.diagnostic.is_some() && outcome.status != "failed" {
+        return Err(StorageError::new(
+            "Terminal diagnostic requires a failed run outcome",
+        ));
+    }
+    validate_persisted_session_id(&outcome.session_id)?;
+    if outcome.run_id.is_empty() || outcome.run_id.len() > 160 {
+        return Err(StorageError::new("Invalid top-level run id"));
+    }
+    if outcome.run_connection_id.is_empty() || outcome.run_connection_id.len() > 64 {
+        return Err(StorageError::new("Invalid top-level run connection id"));
+    }
+    if !matches!(
+        outcome.status.as_str(),
+        "completed" | "failed" | "blocked" | "waiting_user" | "partial" | "stopped" | "incomplete"
+    ) {
+        return Err(StorageError::new(format!(
+            "Invalid top-level run status '{}'",
+            outcome.status
+        )));
+    }
+    if outcome.phase.is_empty() || outcome.phase.len() > 64 {
+        return Err(StorageError::new("Invalid top-level run phase"));
+    }
+    if outcome
+        .reason
+        .as_ref()
+        .is_some_and(|reason| reason.len() > 160)
+    {
+        return Err(StorageError::new("Top-level run reason is too long"));
+    }
+    if outcome.start_message_index > outcome.end_message_index
+        || outcome.end_message_index >= message_count
+    {
+        return Err(StorageError::new(
+            "Top-level run message boundary is invalid",
+        ));
+    }
+    if outcome.finished_at < outcome.started_at {
+        return Err(StorageError::new(
+            "Top-level run timestamps are out of order",
+        ));
+    }
+    if outcome
+        .plan_id
+        .as_ref()
+        .is_some_and(|plan_id| plan_id.len() > 256)
+    {
+        return Err(StorageError::new("Top-level run Plan id is too long"));
+    }
+    Ok(())
+}
+
+fn save_run_outcome_record(
+    connection: &rusqlite::Connection,
+    outcome: &TopLevelRunOutcome,
+    message_count: usize,
+) -> Result<(), StorageError> {
+    validate_run_outcome(outcome, message_count)?;
+    connection.execute(
+        r#"INSERT INTO session_run_outcomes(
+            session_id, run_id, run_connection_id, status, phase, reason,
+            duration_ms, start_message_index, end_message_index, plan_id,
+            plan_revision, started_at, finished_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ON CONFLICT(session_id, run_id) DO UPDATE SET
+            run_connection_id=excluded.run_connection_id,
+            status=excluded.status,
+            phase=excluded.phase,
+            reason=excluded.reason,
+            duration_ms=excluded.duration_ms,
+            start_message_index=excluded.start_message_index,
+            end_message_index=excluded.end_message_index,
+            plan_id=excluded.plan_id,
+            plan_revision=excluded.plan_revision,
+            started_at=excluded.started_at,
+            finished_at=excluded.finished_at"#,
+        params![
+            outcome.session_id,
+            outcome.run_id,
+            outcome.run_connection_id,
+            outcome.status,
+            outcome.phase,
+            outcome.reason,
+            to_i64(outcome.duration_ms, "run duration")?,
+            i64::try_from(outcome.start_message_index)
+                .map_err(|_| StorageError::new("Run start message index is too large"))?,
+            i64::try_from(outcome.end_message_index)
+                .map_err(|_| StorageError::new("Run end message index is too large"))?,
+            outcome.plan_id,
+            outcome.plan_revision.map(i64::from),
+            to_i64(outcome.started_at, "run started_at")?,
+            to_i64(outcome.finished_at, "run finished_at")?,
+        ],
+    )?;
+    connection.execute(
+        r#"DELETE FROM session_run_outcomes
+           WHERE session_id=?1 AND run_id IN (
+             SELECT run_id FROM session_run_outcomes
+             WHERE session_id=?1
+             ORDER BY finished_at DESC, run_id DESC
+             LIMIT -1 OFFSET ?2
+           )"#,
+        params![outcome.session_id, MAX_SAVED_RUN_OUTCOMES],
+    )?;
+    Ok(())
+}
+
+fn query_contiguous_session_message_count(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<usize, StorageError> {
+    let mut statement = connection
+        .prepare("SELECT position FROM session_messages WHERE session_id=?1 ORDER BY position")?;
+    let positions = statement
+        .query_map([session_id], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (expected_position, position) in positions.iter().enumerate() {
+        let expected_position = i64::try_from(expected_position)
+            .map_err(|_| StorageError::new("Too many persisted session messages"))?;
+        if *position != expected_position {
+            return Err(StorageError::new(format!(
+                "Invalid session message position {position}; expected {expected_position}"
+            )));
+        }
+    }
+    Ok(positions.len())
+}
+
+fn query_run_outcomes(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    message_count: usize,
+) -> Result<Vec<TopLevelRunOutcome>, StorageError> {
+    let mut statement = connection.prepare(
+        r#"SELECT session_id, run_id, run_connection_id, status, phase, reason,
+                  duration_ms, start_message_index, end_message_index, plan_id,
+                  plan_revision, started_at, finished_at
+           FROM session_run_outcomes WHERE session_id=?1
+           ORDER BY end_message_index, finished_at, run_id"#,
+    )?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                session_id,
+                run_id,
+                run_connection_id,
+                status,
+                phase,
+                reason,
+                duration_ms,
+                start_message_index,
+                end_message_index,
+                plan_id,
+                plan_revision,
+                started_at,
+                finished_at,
+            )| {
+                let outcome = TopLevelRunOutcome {
+                    diagnostic: crate::run_diagnostics::RunDiagnostic::from_reason(
+                        reason.as_deref(),
+                    ),
+                    session_id,
+                    run_id,
+                    run_connection_id,
+                    status,
+                    phase,
+                    reason,
+                    duration_ms: to_u64(duration_ms, "run duration")?,
+                    start_message_index: to_usize(start_message_index, "run start message index")?,
+                    end_message_index: to_usize(end_message_index, "run end message index")?,
+                    plan_id,
+                    plan_revision: plan_revision
+                        .map(|value| {
+                            u32::try_from(value)
+                                .map_err(|_| StorageError::new("Invalid run Plan revision"))
+                        })
+                        .transpose()?,
+                    started_at: to_u64(started_at, "run started_at")?,
+                    finished_at: to_u64(finished_at, "run finished_at")?,
+                };
+                validate_run_outcome(&outcome, message_count)?;
+                Ok(outcome)
+            },
+        )
+        .collect()
+}
+
 pub(super) fn canonical_session_id_record(
     connection: &rusqlite::Connection,
     id: &str,
@@ -784,6 +1075,82 @@ impl Database {
         .await
     }
 
+    pub(crate) async fn save_session_with_run_outcome(
+        &self,
+        session: &Session,
+        outcome: TopLevelRunOutcome,
+    ) -> Result<(), StorageError> {
+        let session = session.clone();
+        self.call(move |connection| {
+            if outcome.session_id != session.id {
+                return Err(StorageError::new(
+                    "Top-level run outcome belongs to a different Session",
+                ));
+            }
+            let stored = prepare_session(&session)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            save_prepared_session(&transaction, &stored)?;
+            save_run_outcome_record(&transaction, &outcome, stored.messages.len())?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Exercise the real tokio-rusqlite commit/response boundary. The closure
+    /// blocks before the transaction and again after `COMMIT` but before its
+    /// result is returned to the async caller, proving that dropping the async
+    /// future cannot be used as transaction cancellation.
+    #[cfg(test)]
+    pub(crate) async fn save_session_with_run_outcome_test_gated(
+        &self,
+        session: &Session,
+        outcome: TopLevelRunOutcome,
+        gate: Arc<RunOutcomeCommitTestGate>,
+    ) -> Result<(), StorageError> {
+        let session = session.clone();
+        self.call(move |connection| {
+            gate.entered.store(true, Ordering::Release);
+            RunOutcomeCommitTestGate::wait_for(&gate.allow_commit);
+            if outcome.session_id != session.id {
+                return Err(StorageError::new(
+                    "Top-level run outcome belongs to a different Session",
+                ));
+            }
+            let stored = prepare_session(&session)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            save_prepared_session(&transaction, &stored)?;
+            save_run_outcome_record(&transaction, &outcome, stored.messages.len())?;
+            if gate.fail_before_commit.load(Ordering::Acquire) {
+                return Err(StorageError::new(
+                    "simulated terminal transaction failure before COMMIT",
+                ));
+            }
+            transaction.commit()?;
+            gate.committed.store(true, Ordering::Release);
+            RunOutcomeCommitTestGate::wait_for(&gate.allow_response);
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn load_run_outcomes(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TopLevelRunOutcome>, StorageError> {
+        let session_id = session_id.to_string();
+        self.read(move |connection| {
+            let Some(session_id) = canonical_session_id_record(connection, &session_id)? else {
+                return Ok(Vec::new());
+            };
+            let message_count = query_contiguous_session_message_count(connection, &session_id)?;
+            query_run_outcomes(connection, &session_id, message_count)
+        })
+        .await
+    }
+
     /// Replace the current conversation state and remove every plan artifact
     /// that belonged to the cleared transcript in the same transaction.
     pub(crate) async fn reset_session_context(
@@ -797,6 +1164,10 @@ impl Database {
             save_session_record(&transaction, &session)?;
             transaction.execute(
                 "DELETE FROM session_plans WHERE session_id=?1",
+                [&session.id],
+            )?;
+            transaction.execute(
+                "DELETE FROM session_run_outcomes WHERE session_id=?1",
                 [&session.id],
             )?;
             transaction.commit()?;
@@ -1023,6 +1394,188 @@ impl Database {
                 output = output.saturating_add(to_u64(row_output, "daily output tokens")?);
             }
             Ok((input, output))
+        })
+        .await
+    }
+
+    /// Apply one background Memory/Reflection usage delta without rewriting a
+    /// Session snapshot. The durable operation marker and every aggregate row
+    /// change share one transaction, so retrying the same operation id is a
+    /// no-op and a crash cannot commit only one side.
+    pub(crate) async fn apply_auxiliary_usage_delta(
+        &self,
+        id: &str,
+        operation_id: &str,
+        today: &str,
+        update: UsageUpdate,
+    ) -> Result<AuxiliaryUsageApplyOutcome, StorageError> {
+        if operation_id.is_empty() || operation_id.len() > 256 {
+            return Err(StorageError::new(
+                "Invalid auxiliary Usage operation identity",
+            ));
+        }
+        let id = id.to_string();
+        let today = today.to_string();
+        let operation_key = format!(
+            "aux_usage:{:x}",
+            Sha256::digest(format!("{id}\0{operation_id}").as_bytes())
+        );
+        self.call(move |connection| {
+            let Some(id) = canonical_session_id_record(connection, &id)? else {
+                return Ok(AuxiliaryUsageApplyOutcome::Missing);
+            };
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO storage_metadata(key, value) VALUES (?1, ?2)",
+                params![operation_key, crate::now_epoch().to_string()],
+            )?;
+            if inserted == 0 {
+                transaction.commit()?;
+                return Ok(AuxiliaryUsageApplyOutcome::Duplicate);
+            }
+
+            transaction.execute(
+                r#"INSERT OR IGNORE INTO session_usage(
+                    session_id, total_input, total_output, current_input, current_output,
+                    input_source, output_source, current_day
+                ) VALUES (?1, 0, 0, 0, 0, ?2, ?2, '')"#,
+                params![id, crate::default_token_usage_source()],
+            )?;
+            let (total_input, total_output, mut current_input, mut current_output, current_day) =
+                transaction.query_row(
+                    "SELECT total_input, total_output, current_input, current_output, current_day \
+                 FROM session_usage WHERE session_id=?1",
+                    [&id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )?;
+
+            if current_day != today {
+                if (current_input > 0 || current_output > 0) && !current_day.is_empty() {
+                    transaction.execute(
+                        r#"INSERT INTO session_usage_days(session_id, date, input, output)
+                           VALUES (?1, ?2, ?3, ?4)
+                           ON CONFLICT(session_id, date) DO UPDATE SET
+                               input=excluded.input,
+                               output=excluded.output"#,
+                        params![id, current_day, current_input, current_output],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM session_usage_labels \
+                         WHERE session_id=?1 AND scope='history' AND bucket=?2",
+                        params![id, current_day],
+                    )?;
+                    transaction.execute(
+                        r#"INSERT INTO session_usage_labels(
+                               session_id, scope, bucket, label, input, output
+                           )
+                           SELECT session_id, 'history', ?2, label, input, output
+                           FROM session_usage_labels
+                           WHERE session_id=?1 AND scope='current'"#,
+                        params![id, current_day],
+                    )?;
+                }
+                transaction.execute(
+                    "DELETE FROM session_usage_labels \
+                     WHERE session_id=?1 AND scope='current'",
+                    [&id],
+                )?;
+                current_input = 0;
+                current_output = 0;
+            }
+
+            let total_input =
+                to_u64(total_input, "total input tokens")?.saturating_add(update.input_tokens);
+            let total_output =
+                to_u64(total_output, "total output tokens")?.saturating_add(update.output_tokens);
+            let current_input =
+                to_u64(current_input, "daily input tokens")?.saturating_add(update.input_tokens);
+            let current_output =
+                to_u64(current_output, "daily output tokens")?.saturating_add(update.output_tokens);
+            transaction.execute(
+                r#"UPDATE session_usage SET
+                       total_input=?2,
+                       total_output=?3,
+                       current_input=?4,
+                       current_output=?5,
+                       input_source=?6,
+                       output_source=?7,
+                       current_day=?8
+                   WHERE session_id=?1"#,
+                params![
+                    id,
+                    to_i64(total_input, "total input tokens")?,
+                    to_i64(total_output, "total output tokens")?,
+                    to_i64(current_input, "daily input tokens")?,
+                    to_i64(current_output, "daily output tokens")?,
+                    update.input_source,
+                    update.output_source,
+                    today,
+                ],
+            )?;
+
+            for (label, values) in &update.labels {
+                let input = to_i64(values[0], "auxiliary usage label input")?;
+                let output = to_i64(values[1], "auxiliary usage label output")?;
+                transaction.execute(
+                    r#"INSERT INTO session_usage_labels(
+                           session_id, scope, bucket, label, input, output
+                       ) VALUES (?1, 'current', ?2, ?3, ?4, ?5)
+                       ON CONFLICT(session_id, scope, bucket, label) DO UPDATE SET
+                           input=input + excluded.input,
+                           output=output + excluded.output"#,
+                    params![id, today, label, input, output],
+                )?;
+                transaction.execute(
+                    r#"INSERT INTO session_usage_labels(
+                           session_id, scope, bucket, label, input, output
+                       ) VALUES (?1, 'total', '', ?2, ?3, ?4)
+                       ON CONFLICT(session_id, scope, bucket, label) DO UPDATE SET
+                           input=input + excluded.input,
+                           output=output + excluded.output"#,
+                    params![id, label, input, output],
+                )?;
+            }
+
+            let expired_days = {
+                let mut statement = transaction.prepare(
+                    "SELECT date FROM session_usage_days WHERE session_id=?1 \
+                     ORDER BY date DESC LIMIT -1 OFFSET ?2",
+                )?;
+                statement
+                    .query_map(params![id, crate::USAGE_HISTORY_CAP as i64], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for day in expired_days {
+                transaction.execute(
+                    "DELETE FROM session_usage_days WHERE session_id=?1 AND date=?2",
+                    params![id, day],
+                )?;
+                transaction.execute(
+                    "DELETE FROM session_usage_labels \
+                     WHERE session_id=?1 AND scope='history' AND bucket=?2",
+                    params![id, day],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM storage_metadata WHERE key IN (\
+                     SELECT key FROM storage_metadata WHERE key LIKE 'aux_usage:%' \
+                     ORDER BY rowid DESC LIMIT -1 OFFSET ?1\
+                 )",
+                [MAX_AUXILIARY_USAGE_OPERATION_MARKERS],
+            )?;
+            transaction.commit()?;
+            Ok(AuxiliaryUsageApplyOutcome::Applied)
         })
         .await
     }

@@ -1,4 +1,4 @@
-import { dom, state } from '../state.js';
+import { state } from '../state.js';
 import {
   MIN_REACT_ANALYZE_VISIBLE_MS,
   MIN_REACT_ACT_VISIBLE_MS,
@@ -7,16 +7,25 @@ import {
 } from '../constants.js';
 import { reactPhaseLabel, hideWelcome } from '../utils.js';
 import { scrollDown } from '../scroll.js';
+import {
+  mountExecutionPanel,
+  refreshExecutionStackForPanel,
+  removeExecutionPanel,
+} from './execution-stack.js';
 
 export function pinReactStatusToBottom() {
   if (!state.reactStatusRow?.isConnected) return;
-  if (dom.chat.lastElementChild === state.reactStatusRow) return;
-  dom.chat.appendChild(state.reactStatusRow);
+  const step = state.reactStatusRow.closest<HTMLElement>('.execution-step');
+  const body = step?.parentElement;
+  if (!step || !body || body.lastElementChild === step) return;
+  body.appendChild(step);
 }
 
 export function renderReactStatus() {
   if (!state.reactStatusRow) return;
-  const card = state.reactStatusRow.querySelector<HTMLElement>('.react-status-card');
+  const card = state.reactStatusRow.matches('.react-status-card')
+    ? state.reactStatusRow
+    : state.reactStatusRow.querySelector<HTMLElement>('.react-status-card');
   const phase = state.reactStatusRow.querySelector<HTMLElement>('.react-status-phase');
   const cycle = state.reactStatusRow.querySelector<HTMLElement>('.react-status-cycle');
   const detail = state.reactStatusRow.querySelector<HTMLElement>('.react-status-detail');
@@ -38,6 +47,11 @@ export function renderReactStatus() {
     detailTime.textContent = '';
     detail.hidden = true;
   }
+  state.reactStatusRow.dataset.executionAction = phase.textContent || '';
+  state.reactStatusRow.dataset.executionObject = detailTool.textContent || cycle.textContent || '';
+  state.reactStatusRow.dataset.executionResult = detailTime.textContent || '';
+  state.reactStatusRow.dataset.executionState = 'running';
+  refreshExecutionStackForPanel(state.reactStatusRow);
 }
 
 export function clearReactStatus() {
@@ -53,7 +67,7 @@ export function clearReactStatus() {
   state.reactStatusElapsedMs = 0;
   state.reactPhaseShownAt = 0;
   if (state.reactStatusRow) {
-    state.reactStatusRow.remove();
+    removeExecutionPanel(state.reactStatusRow);
     state.reactStatusRow = null;
   }
 }
@@ -80,27 +94,38 @@ export function requestClearReactStatus() {
 }
 
 function ensureReactStatusRow() {
+  if (state.reactStatusRow) {
+    const rowStack = state.reactStatusRow.closest<HTMLElement>('.execution-stack');
+    const belongsToActiveRun =
+      state.reactStatusRow.isConnected &&
+      rowStack === state.activeExecutionStack &&
+      rowStack?.dataset.executionStatus === 'running' &&
+      (state.activeExecutionRunId === 0 ||
+        rowStack.dataset.executionClientRunId === String(state.activeExecutionRunId));
+    if (!belongsToActiveRun) {
+      const staleRow = state.reactStatusRow;
+      state.reactStatusRow = null;
+      removeExecutionPanel(staleRow);
+    }
+  }
   if (!state.reactStatusRow) {
     state.reactStatusRow = document.createElement('div');
-    state.reactStatusRow.className = 'msg-row system react-status-row';
+    state.reactStatusRow.className = 'react-status-card execution-react-status';
     state.reactStatusRow.innerHTML = `
-      <div class="system-card system-inline react-status-card">
-        <span class="react-status-tag">ReAct</span>
-        <span class="react-status-phase"></span>
-        <span class="react-status-cycle"></span>
-        <span class="react-status-detail" hidden>
-          <span class="react-status-tool"></span>
-          <span class="react-status-separator">·</span>
-          <span class="react-status-time"></span>
-        </span>
-        <span class="react-status-dots" aria-hidden="true">
-          <span></span>
-          <span></span>
-          <span></span>
-        </span>
-      </div>
+      <span class="react-status-phase"></span>
+      <span class="react-status-cycle"></span>
+      <span class="react-status-detail" hidden>
+        <span class="react-status-tool"></span>
+        <span class="react-status-separator">·</span>
+        <span class="react-status-time"></span>
+      </span>
+      <span class="react-status-dots" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+      </span>
     `;
-    dom.chat.appendChild(state.reactStatusRow);
+    mountExecutionPanel(state.reactStatusRow, 'react');
     hideWelcome();
   }
 }
@@ -112,8 +137,17 @@ function scheduleNextReactPhase() {
 
   const elapsed = performance.now() - state.reactPhaseShownAt;
   const delay = Math.max(0, reactPhaseMinVisibleMs(state.reactStatusPhase) - elapsed);
-  state.reactPhaseTimer = setTimeout(() => {
+  const scheduledRow = state.reactStatusRow;
+  const timer = window.setTimeout(() => {
+    if (state.reactPhaseTimer !== timer || state.reactStatusRow !== scheduledRow) return;
     state.reactPhaseTimer = 0;
+    // A terminal run may still have minimum-visible phases queued. Draining
+    // those phases must not mount a fresh running stack after completion.
+    const scheduledStack = scheduledRow?.closest<HTMLElement>('.execution-stack');
+    if (scheduledStack?.dataset.executionStatus !== 'running') {
+      clearReactStatus();
+      return;
+    }
     const next = state.reactPhaseQueue.shift();
     if (next) {
       applyReactStatusNow(next.phase, next.cycle);
@@ -123,6 +157,7 @@ function scheduleNextReactPhase() {
       clearReactStatus();
     }
   }, delay);
+  state.reactPhaseTimer = timer;
 }
 
 function applyReactStatusNow(phase, cycle = null) {

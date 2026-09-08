@@ -60,6 +60,8 @@ lingclaw restart
 
 Settings validates, atomically writes, and applies a new runtime snapshot. Editing the file directly does not hot-reload the current process; restart LingClaw or save again through Settings.
 
+If another editor changes the configuration, saving reports a conflict (HTTP 409), retains your draft, and temporarily disables Save. Configuration pages such as General and Agents provide the same keyboard-accessible **Reload latest** button on desktop and mobile. Reloading explicitly replaces the draft with the latest configuration; you can then edit and save again. Leaving the Console still asks for confirmation when changes are unsaved.
+
 ## settings
 
 Common fields:

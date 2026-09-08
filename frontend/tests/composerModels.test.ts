@@ -20,6 +20,7 @@ import {
 import { openAttachPopup } from '../src/images.js';
 import { setLanguage } from '../src/i18n.js';
 import { dom, initDomRefs, state } from '../src/state.js';
+import { prepareComposerTransportFixture } from './composerTransportFixture.js';
 
 function response(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -45,6 +46,7 @@ function deferredResponse(): {
 function installOpenSocket(): WebSocket {
   const socket = { readyState: WebSocket.OPEN } as WebSocket;
   state.ws = socket;
+  prepareComposerTransportFixture();
   return socket;
 }
 

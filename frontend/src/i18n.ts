@@ -96,7 +96,23 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'workspace.viewControlsHint': 'Choose what appears in the timeline',
     'workspace.todosHint': 'Session task list',
     'workspace.toolsHint': 'Tool calls and results',
-    'workspace.reasoningHint': 'Reasoning trace',
+    'workspace.reasoningHint': 'Reasoning density',
+    'reasoning.densityLabel': 'Reasoning detail',
+    'reasoning.summary': 'Summary',
+    'reasoning.normal': 'Normal',
+    'reasoning.verbose': 'Verbose',
+    'reasoning.summaryHint': 'Summary · concise overview',
+    'reasoning.normalHint': 'Normal · bounded detail',
+    'reasoning.verboseHint': 'Verbose · full trace',
+    'reasoning.summaryAria': 'Concise reasoning summary',
+    'reasoning.normalAria': 'Bounded reasoning detail',
+    'reasoning.verboseAria': 'Full reasoning trace',
+    'reasoning.summaryBody': 'Reasoning trace retained · {characters} characters',
+    'reasoning.normalBody':
+      'Reasoning trace retained · {sections} sections · {lines} lines · {characters} characters',
+    'reasoning.traceSummary': 'Reasoning trace · {characters} characters',
+    'reasoning.derivedMarker': 'derived summary',
+    'autoDebug.regionLabel': 'Auto Debug diagnostics',
     'workspace.debugHint': 'Automatic routing trace',
     'workspace.quickActions': 'Quick actions',
     'workspace.quickActionsHint': 'Run common workspace commands',
@@ -263,6 +279,18 @@ const STRINGS: Record<Language, Record<string, string>> = {
       'The image upload was discarded because the active Session or its capabilities changed.',
     'composer.retryConfig': 'Retry',
     'composer.configureModels': 'Configure models',
+    'composer.reconnect': 'Reconnect',
+    'composer.transport.connecting': 'Connecting…',
+    'composer.transport.preparing': 'Preparing session…',
+    'composer.transport.offline': 'Connection unavailable',
+    'composer.connectionConnecting':
+      'Connecting to the daemon. Your draft will stay here until the connection is ready.',
+    'composer.connectionPreparing':
+      'Waiting for this session to be ready. Your draft has not been sent.',
+    'composer.connectionUnavailable':
+      'The daemon is not connected. Reconnect here to send your draft.',
+    'composer.connectionProtocolUnavailable':
+      'This daemon cannot use the required connection protocol. Update or restart the daemon, then reconnect. Your draft is still here.',
     'composer.configureAgent': 'Set Agent model',
     'composer.chooseSessionModel': 'Choose model',
     'composer.groupTargetsUnconfigured': 'Configure models for: {targets}.',
@@ -327,6 +355,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
       'Local uploaded images were cleared because storage settings changed. Please re-attach them.',
 
     'plan.title': 'Plan',
+    'plan.formalPlan': 'Formal Plan',
+    'plan.contractDetails': 'Contract details · {count} items',
     'plan.cardLabel': 'Plan: {title}',
     'plan.previousRevision': 'Previous revision',
     'plan.steps': 'Steps',
@@ -416,9 +446,104 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'tool.imageLoadFailed': 'Image unavailable',
     'tool.compatibilityWarning':
       'This OpenAI-compatible endpoint cannot accept images after tool results. Tool images are disabled for the rest of this run.',
+    'tool.action.read': 'Read',
+    'tool.action.change': 'Change',
+    'tool.action.search': 'Search',
+    'tool.action.verify': 'Verify',
+    'tool.action.run': 'Run',
+    'tool.action.remove': 'Remove',
+    'tool.action.invoke': 'Use {name}',
     'execution.working': 'Working',
     'execution.worked': 'Worked',
     'execution.failed': 'Execution failed',
+    'execution.blocked': 'Execution blocked',
+    'execution.waitingUser': 'Waiting for input',
+    'execution.partial': 'Partially completed',
+    'execution.stopped': 'Execution stopped',
+    'execution.incomplete': 'Execution incomplete',
+    'execution.discarded': 'Plan discarded',
+    'execution.statusAction.running': 'Working: {action}',
+    'execution.statusAction.completed': 'Completed: {action}',
+    'execution.statusAction.failed': 'Failed at: {action}',
+    'execution.statusAction.blocked': 'Blocked at: {action}',
+    'execution.statusAction.waiting_user': 'Waiting: {action}',
+    'execution.statusAction.partial': 'Partial result: {action}',
+    'execution.statusAction.stopped': 'Stopped at: {action}',
+    'execution.statusAction.incomplete': 'Incomplete at: {action}',
+    'execution.statusAction.discarded': 'Plan discarded: {action}',
+    'execution.runningSummary': 'Work is in progress.',
+    'execution.completedSummary': 'Run completed.',
+    'execution.failedSummary': 'A step failed. Review the failure before continuing.',
+    'execution.blockedSummary': 'Work is blocked and needs a decision or revision.',
+    'execution.waiting_userSummary': 'Your input is required to continue.',
+    'execution.partialSummary': 'Some work finished, but unresolved items remain.',
+    'execution.stoppedSummary': 'The run was stopped before completion.',
+    'execution.incompleteSummary': 'The run ended without completing all work.',
+    'execution.discardedSummary': 'The formal Plan was discarded.',
+    'execution.hardCapSummary': 'The run reached its safety limit before completion.',
+    'execution.completionContractFailedSummary':
+      'The final result did not satisfy the approved completion contract.',
+    'execution.unknownTerminalSummary':
+      'The run ended without a terminal result that proves completion.',
+    'execution.historyOutcomeUnavailable':
+      'This historical run has no persisted terminal result, so completion cannot be verified.',
+    'execution.protocolFailureSummary':
+      'Execution-event identity validation failed. This run may be incomplete; review its last reported work before retrying.',
+    'execution.terminalIdentityUnavailable':
+      "LingClaw could not safely bind this run's final state to its originating message. Retry or resume the run; its history will remain incomplete until a new terminal result is persisted.",
+    'execution.interruptedByNewRun': 'A newer run started before this run reported completion.',
+    'execution.progressCount': '{completed}/{total} complete',
+    'execution.verificationCount': '{count} verification',
+    'execution.artifactCount': '{count} artifact action',
+    'execution.unresolvedCount': '{count} unresolved',
+    'execution.recoveredRetryOne': 'Recovered after 1 retry',
+    'execution.recoveredRetries': 'Recovered after {count} retries',
+    'execution.failurePoint': 'Failure: {action}',
+    'execution.llmRetry': 'Retrying the model request · attempt {attempt}/{max}',
+    'execution.reviewDetails': 'Review details',
+    'execution.recoveryPrompt': 'This run needs attention before continuing.',
+    'execution.reviewError': 'Review error',
+    'execution.diagnosticDetails': 'Failure details',
+    'execution.diagnosticModels': 'Review Models',
+    'execution.diagnostic.provider_authentication.summary': 'Provider authentication failed.',
+    'execution.diagnostic.provider_authentication.detail':
+      'Open Models and check the Provider API key and access permissions, then retry the request.',
+    'execution.diagnostic.provider_rate_limited.summary': 'Provider rate limit reached.',
+    'execution.diagnostic.provider_rate_limited.detail':
+      'Wait before retrying. If this continues, review the Provider rate or quota limits.',
+    'execution.diagnostic.provider_unavailable.summary': 'Model provider unavailable.',
+    'execution.diagnostic.provider_unavailable.detail':
+      'The Provider could not complete this request. Try again later, or choose another configured model.',
+    'execution.diagnostic.provider_connection.summary': 'Could not reach the model provider.',
+    'execution.diagnostic.provider_connection.detail':
+      'Check network connectivity and the Provider address in Models, then try again.',
+    'execution.diagnostic.provider_request_rejected.summary': 'Model request rejected.',
+    'execution.diagnostic.provider_request_rejected.detail':
+      'Open Models and confirm that the selected model supports the configured API protocol and request features.',
+    'execution.diagnostic.provider_response_invalid.summary': 'Model response could not be read.',
+    'execution.diagnostic.provider_response_invalid.detail':
+      'Open Models and check the model and API protocol. If this continues, try another configured Provider.',
+    'execution.diagnostic.model_configuration.summary':
+      'Model configuration could not form a request.',
+    'execution.diagnostic.model_configuration.detail':
+      'Open Models and correct the Provider address or credentials. The request was rejected locally before it reached the Provider.',
+    'execution.diagnostic.context_budget_exceeded.summary': 'Model context budget exceeded.',
+    'execution.diagnostic.context_budget_exceeded.detail':
+      'Reduce the conversation context or reasoning effort, or open Models to choose a model with a larger context window.',
+    'execution.reviewInterrupted': 'Review stopped work',
+    'execution.reviewIncomplete': 'Review unresolved work',
+    'execution.reviewPlan': 'Review Plan',
+    'execution.answerPlan': 'Answer Plan',
+    'execution.planNeedsInput': 'The formal Plan is waiting for your answers.',
+    'execution.planBlocked': 'The approved Plan is blocked at an unresolved step.',
+    'execution.planFailed': 'The Plan run failed and can be revised or resumed.',
+    'execution.planStopped': 'The Plan run was stopped before completion and can be resumed.',
+    'execution.planDiscarded':
+      'The formal Plan was discarded. No response or recovery action is pending.',
+    'execution.reasoningAction': 'Review reasoning',
+    'execution.delegate': 'Delegate',
+    'execution.coordinate': 'Coordinate',
+    'execution.prepareOutline': 'Outline execution',
     'execution.stepCountOne': '{count} step',
     'execution.stepCount': '{count} steps',
     'execution.reasoningActive': 'Thinking',
@@ -429,7 +554,7 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'execution.waiting': 'Waiting',
     'execution.subagent': 'Sub-agent',
     'execution.orchestration': 'Orchestration',
-    'execution.taskPlan': 'Task Plan',
+    'execution.taskPlan': 'Execution outline',
     'execution.planActive': 'Active',
     'execution.planReady': 'Ready',
     'execution.planSuperseded': 'Superseded',
@@ -483,7 +608,13 @@ const STRINGS: Record<Language, Record<string, string>> = {
 
     'socket.reconnecting': 'Reconnecting in {seconds}s (#{attempt})',
     'socket.disconnectedReconnecting': 'Disconnected. Reconnecting...',
-    'socket.lostRefresh': 'Connection lost. Please refresh the page.',
+    'socket.lostRefresh': 'Connection lost. Choose Reconnect below to try again.',
+    'socket.executionProtocolUnavailable':
+      'Connection setup failed. Check the daemon, then choose Reconnect.',
+    'socket.legacyExecutionReconnectUnsupported':
+      'This older daemon cannot reconnect execution events safely. Refresh the page for a fresh legacy connection, or restart the daemon with the current LingClaw version.',
+    'socket.executionIdentityMissing':
+      'Missing execution identity. Restart the daemon, then choose Reconnect.',
 
     'slash.noMatches': 'No matching commands',
     'slash.suggestions': 'Command suggestions',
@@ -888,7 +1019,22 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'workspace.viewControlsHint': '选择时间线中显示的内容',
     'workspace.todosHint': '当前会话的任务列表',
     'workspace.toolsHint': '工具调用与结果',
-    'workspace.reasoningHint': '推理过程',
+    'workspace.reasoningHint': '推理信息密度',
+    'reasoning.densityLabel': '推理详细程度',
+    'reasoning.summary': '摘要',
+    'reasoning.normal': '标准',
+    'reasoning.verbose': '详细',
+    'reasoning.summaryHint': '摘要 · 精简概览',
+    'reasoning.normalHint': '标准 · 有界细节',
+    'reasoning.verboseHint': '详细 · 完整过程',
+    'reasoning.summaryAria': '精简推理摘要',
+    'reasoning.normalAria': '有界推理细节',
+    'reasoning.verboseAria': '完整推理过程',
+    'reasoning.summaryBody': '已保留推理轨迹 · {characters} 个字符',
+    'reasoning.normalBody': '已保留推理轨迹 · {sections} 个段落 · {lines} 行 · {characters} 个字符',
+    'reasoning.traceSummary': '推理轨迹 · {characters} 个字符',
+    'reasoning.derivedMarker': '派生摘要',
+    'autoDebug.regionLabel': 'Auto Debug 诊断',
     'workspace.debugHint': '自动路由轨迹',
     'workspace.quickActions': '快捷操作',
     'workspace.quickActionsHint': '执行常用工作台命令',
@@ -1049,6 +1195,15 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'composer.uploadContextChanged': '当前 Session 或其能力已变化，本次图片上传已丢弃。',
     'composer.retryConfig': '重试',
     'composer.configureModels': '配置模型',
+    'composer.reconnect': '重新连接',
+    'composer.transport.connecting': '正在连接…',
+    'composer.transport.preparing': '正在准备会话…',
+    'composer.transport.offline': '连接不可用',
+    'composer.connectionConnecting': '正在连接服务。连接就绪前，草稿会保留在这里。',
+    'composer.connectionPreparing': '正在等待当前会话就绪，草稿尚未发送。',
+    'composer.connectionUnavailable': '尚未连接服务。请在此重新连接后发送草稿。',
+    'composer.connectionProtocolUnavailable':
+      '当前服务无法使用所需的连接协议。请更新或重启服务后重新连接，草稿仍保留在这里。',
     'composer.configureAgent': '配置代理模型',
     'composer.chooseSessionModel': '选择模型',
     'composer.groupTargetsUnconfigured': '以下成员未配置模型：{targets}。',
@@ -1107,6 +1262,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'composer.uploadConfigChanged': '存储设置已更改，本地上传图片已清除。请重新附加。',
 
     'plan.title': '计划',
+    'plan.formalPlan': '正式计划',
+    'plan.contractDetails': '执行合同详情 · {count} 项',
     'plan.cardLabel': '计划：{title}',
     'plan.previousRevision': '历史版本',
     'plan.steps': '执行步骤',
@@ -1194,9 +1351,98 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'tool.imageLoadFailed': '图片不可用',
     'tool.compatibilityWarning':
       '当前 OpenAI 兼容端点不支持在工具结果后附加图片，本次运行后续将仅使用文本工具结果。',
+    'tool.action.read': '读取',
+    'tool.action.change': '修改',
+    'tool.action.search': '搜索',
+    'tool.action.verify': '验证',
+    'tool.action.run': '运行',
+    'tool.action.remove': '移除',
+    'tool.action.invoke': '调用 {name}',
     'execution.working': '处理中',
     'execution.worked': '已处理',
     'execution.failed': '处理失败',
+    'execution.blocked': '执行受阻',
+    'execution.waitingUser': '等待输入',
+    'execution.partial': '部分完成',
+    'execution.stopped': '执行已停止',
+    'execution.incomplete': '执行未完成',
+    'execution.statusAction.running': '正在处理：{action}',
+    'execution.statusAction.completed': '已完成：{action}',
+    'execution.statusAction.failed': '失败于：{action}',
+    'execution.statusAction.blocked': '受阻于：{action}',
+    'execution.statusAction.waiting_user': '等待：{action}',
+    'execution.statusAction.partial': '部分结果：{action}',
+    'execution.statusAction.stopped': '停止于：{action}',
+    'execution.statusAction.incomplete': '未完成于：{action}',
+    'execution.statusAction.discarded': '计划已丢弃：{action}',
+    'execution.runningSummary': '任务仍在执行。',
+    'execution.completedSummary': '本次运行已完成。',
+    'execution.failedSummary': '有步骤失败，请检查后再继续。',
+    'execution.blockedSummary': '任务受阻，需要决策或修订。',
+    'execution.waiting_userSummary': '需要你的输入后才能继续。',
+    'execution.partialSummary': '部分工作已完成，但仍有未解决项。',
+    'execution.stoppedSummary': '本次运行在完成前被停止。',
+    'execution.incompleteSummary': '本次运行结束时仍有工作未完成。',
+    'execution.discardedSummary': '正式计划已丢弃。',
+    'execution.hardCapSummary': '本次运行在完成前触及安全上限。',
+    'execution.completionContractFailedSummary': '最终结果未满足已批准的完成合同。',
+    'execution.unknownTerminalSummary': '本次运行结束时没有可证明完成的终态结果。',
+    'execution.historyOutcomeUnavailable': '该历史运行未持久化终态结果，无法确认已完成。',
+    'execution.protocolFailureSummary':
+      '执行事件身份校验失败。本次运行可能未完成；重试前请检查最后已报告的工作。',
+    'execution.terminalIdentityUnavailable':
+      'LingClaw 无法安全地把本次运行终态绑定到原始用户消息。请重试或恢复；在新的终态结果持久化前，历史记录会保持未完成。',
+    'execution.interruptedByNewRun': '该运行尚未报告完成时，新的运行已经开始。',
+    'execution.progressCount': '已完成 {completed}/{total}',
+    'execution.verificationCount': '{count} 项验证',
+    'execution.artifactCount': '{count} 项产物操作',
+    'execution.unresolvedCount': '{count} 项未解决',
+    'execution.recoveredRetryOne': '1 次重试后已恢复',
+    'execution.recoveredRetries': '{count} 次重试后已恢复',
+    'execution.failurePoint': '失败点：{action}',
+    'execution.llmRetry': '正在重试模型请求 · 第 {attempt}/{max} 次',
+    'execution.reviewDetails': '查看详情',
+    'execution.recoveryPrompt': '继续之前，请先检查本次运行。',
+    'execution.reviewError': '查看错误',
+    'execution.diagnosticDetails': '失败详情',
+    'execution.diagnosticModels': '检查模型配置',
+    'execution.diagnostic.provider_authentication.summary': '模型服务鉴权失败。',
+    'execution.diagnostic.provider_authentication.detail':
+      '打开模型设置，检查 Provider 的 API Key 和访问权限，然后重试。',
+    'execution.diagnostic.provider_rate_limited.summary': '模型服务达到请求限制。',
+    'execution.diagnostic.provider_rate_limited.detail':
+      '等待一段时间后重试。如果持续发生，请检查 Provider 的速率或配额限制。',
+    'execution.diagnostic.provider_unavailable.summary': '模型服务暂时不可用。',
+    'execution.diagnostic.provider_unavailable.detail':
+      'Provider 未能完成此次请求。请稍后重试，或选择另一个已配置的模型。',
+    'execution.diagnostic.provider_connection.summary': '无法连接模型服务。',
+    'execution.diagnostic.provider_connection.detail':
+      '检查网络连接及模型设置中的 Provider 地址，然后重试。',
+    'execution.diagnostic.provider_request_rejected.summary': '模型服务拒绝了请求。',
+    'execution.diagnostic.provider_request_rejected.detail':
+      '打开模型设置，确认所选模型支持当前 API 协议和请求功能。',
+    'execution.diagnostic.provider_response_invalid.summary': '无法读取模型服务的响应。',
+    'execution.diagnostic.provider_response_invalid.detail':
+      '打开模型设置，检查模型和 API 协议。如果持续发生，可尝试其他已配置的 Provider。',
+    'execution.diagnostic.model_configuration.summary': '模型配置无法构造请求。',
+    'execution.diagnostic.model_configuration.detail':
+      '打开模型设置，修正 Provider 地址或凭据。此次请求在本地被拒绝，尚未发送到 Provider。',
+    'execution.diagnostic.context_budget_exceeded.summary': '请求超过模型上下文预算。',
+    'execution.diagnostic.context_budget_exceeded.detail':
+      '减少会话上下文或推理强度，或打开模型设置选择上下文窗口更大的模型。',
+    'execution.reviewInterrupted': '查看已停止工作',
+    'execution.reviewIncomplete': '查看未解决工作',
+    'execution.reviewPlan': '查看计划',
+    'execution.answerPlan': '回答计划问题',
+    'execution.planNeedsInput': '正式计划正在等待你的回答。',
+    'execution.planBlocked': '已批准计划在未解决步骤处受阻。',
+    'execution.planFailed': '计划执行失败，可修订或恢复。',
+    'execution.planStopped': '计划执行在完成前停止，可继续恢复。',
+    'execution.planDiscarded': '正式计划已丢弃，无待回答问题或恢复操作。',
+    'execution.reasoningAction': '查看推理',
+    'execution.delegate': '委派',
+    'execution.coordinate': '协调',
+    'execution.prepareOutline': '整理执行提纲',
     'execution.stepCountOne': '{count} 个步骤',
     'execution.stepCount': '{count} 个步骤',
     'execution.reasoningActive': '思考中',
@@ -1207,7 +1453,7 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'execution.waiting': '等待中',
     'execution.subagent': '子代理',
     'execution.orchestration': '编排',
-    'execution.taskPlan': '任务计划',
+    'execution.taskPlan': '执行提纲',
     'execution.planActive': '进行中',
     'execution.planReady': '已就绪',
     'execution.planSuperseded': '已替代',
@@ -1261,7 +1507,11 @@ const STRINGS: Record<Language, Record<string, string>> = {
 
     'socket.reconnecting': '{seconds} 秒后重连（第 {attempt} 次）',
     'socket.disconnectedReconnecting': '连接已断开，正在重连...',
-    'socket.lostRefresh': '连接丢失，请刷新页面。',
+    'socket.lostRefresh': '连接已断开，请点击下方“重新连接”重试。',
+    'socket.executionProtocolUnavailable': '连接准备失败。请检查 daemon 后点击“重新连接”。',
+    'socket.legacyExecutionReconnectUnsupported':
+      '旧版 daemon 无法安全重连执行事件。请刷新页面建立新的兼容连接，或使用当前 LingClaw 重启 daemon。',
+    'socket.executionIdentityMissing': '缺少必需的执行身份。请重启 daemon 后点击“重新连接”。',
 
     'slash.noMatches': '没有匹配的命令',
     'slash.suggestions': '命令建议',
@@ -1579,13 +1829,11 @@ function normalizeLanguage(value: unknown): Language | null {
 }
 
 function detectInitialLanguage(): Language {
-  if (typeof localStorage !== 'undefined') {
-    try {
-      const stored = normalizeLanguage(localStorage.getItem(STORAGE_KEY));
-      if (stored) return stored;
-    } catch {
-      // Ignore blocked localStorage.
-    }
+  try {
+    const stored = normalizeLanguage(globalThis.localStorage?.getItem(STORAGE_KEY));
+    if (stored) return stored;
+  } catch {
+    // Ignore a missing or blocked localStorage property.
   }
   if (typeof navigator !== 'undefined') {
     const candidates = [navigator.language, ...(navigator.languages || [])];

@@ -113,7 +113,7 @@ async fn group_socket_operations_fail_closed_after_the_feature_is_disabled() {
     let state = Arc::new(test_app_state());
     let mut config = (*state.config()).clone();
     config.enable_groups = false;
-    state.apply_runtime_config(config);
+    state.apply_runtime_config(config).await;
 
     let error = handle_group_socket_message(
         &state,
@@ -189,7 +189,7 @@ async fn group_dispatch_is_serialized_with_a_hot_disable_transition() {
 
     let mut config = (*state.config()).clone();
     config.enable_groups = false;
-    state.apply_runtime_config(config);
+    state.apply_runtime_config(config).await;
     drop(feature_guard);
 
     let error = tokio::time::timeout(Duration::from_secs(2), dispatch)
@@ -262,7 +262,7 @@ async fn group_run_completion_is_serialized_with_a_hot_disable_transition() {
 
     let mut config = (*state.config()).clone();
     config.enable_groups = false;
-    state.apply_runtime_config(config);
+    state.apply_runtime_config(config).await;
     drop(feature_guard);
 
     let recorded = tokio::time::timeout(Duration::from_secs(2), completion)
@@ -1228,6 +1228,7 @@ fn test_app_state() -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     }
 }
@@ -1498,7 +1499,7 @@ async fn execute_session_control_describe_session_covers_sections_and_errors() {
 
     let mut disabled_config = (*state.config()).clone();
     disabled_config.enable_groups = false;
-    state.apply_runtime_config(disabled_config);
+    state.apply_runtime_config(disabled_config).await;
     let hidden_runtime = execute_session_control_tool(
         &state,
         MAIN_SESSION_ID,
@@ -1520,7 +1521,7 @@ async fn execute_session_control_describe_session_covers_sections_and_errors() {
 
     let mut enabled_config = (*state.config()).clone();
     enabled_config.enable_groups = true;
-    state.apply_runtime_config(enabled_config);
+    state.apply_runtime_config(enabled_config).await;
 
     let invalid = execute_session_control_tool(
         &state,
@@ -2904,6 +2905,97 @@ async fn delete_session_with_safety_checks_guards_current_and_delegated_work() {
 }
 
 #[tokio::test]
+async fn delete_session_waits_for_exact_auxiliary_lifetime_before_removing_workspace() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "delete-auxiliary-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session = test_session_with_workspace(&session_id, "Delete Auxiliary", workspace.clone());
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("session should save");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let permit = state
+        .auxiliary_tasks
+        .permit(
+            &session_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+        )
+        .expect("the live Session should accept auxiliary work");
+    let worker_started = Arc::new(tokio::sync::Notify::new());
+    let worker_cancelled = Arc::new(tokio::sync::Notify::new());
+    let release_worker = Arc::new(tokio::sync::Notify::new());
+    let worker_workspace = workspace.clone();
+    let worker = state
+        .auxiliary_tasks
+        .spawn(permit.clone(), {
+            let worker_started = Arc::clone(&worker_started);
+            let worker_cancelled = Arc::clone(&worker_cancelled);
+            let release_worker = Arc::clone(&release_worker);
+            move |cancel| async move {
+                worker_started.notify_one();
+                cancel.cancelled().await;
+                worker_cancelled.notify_one();
+                release_worker.notified().await;
+                std::fs::write(worker_workspace.join("late-memory.txt"), "finished")
+                    .expect("workspace must remain until the worker exits");
+            }
+        })
+        .expect("auxiliary worker should be registered");
+    worker_started.notified().await;
+
+    let delete_state = Arc::clone(&state);
+    let delete_session_id = session_id.clone();
+    let mut deletion = tokio::spawn(async move {
+        delete_session_with_safety_checks(&delete_state, &delete_session_id, Some(MAIN_SESSION_ID))
+            .await
+    });
+    worker_cancelled.notified().await;
+    let deletion_was_waiting = !deletion.is_finished();
+    let stale_spawn_rejected = state.auxiliary_tasks.spawn(permit, |_| async {}).is_err();
+
+    // Release the worker before asserting so an assertion failure cannot
+    // strand a supervised task or the deletion future.
+    release_worker.notify_one();
+    worker.wait().await.expect("worker should exit normally");
+    let deleted = (&mut deletion)
+        .await
+        .expect("deletion task should not panic")
+        .expect("deletion should succeed after the worker drains");
+
+    assert!(deletion_was_waiting, "deletion must wait for the worker");
+    assert!(stale_spawn_rejected, "closed permits must fail closed");
+    assert!(deleted.contains("Deleted"));
+    assert!(
+        !workspace.exists(),
+        "late worker output must be removed once"
+    );
+    assert!(
+        state
+            .auxiliary_tasks
+            .permit(
+                &session_id,
+                crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+            )
+            .is_err(),
+        "a deleted Session lifetime must remain closed"
+    );
+    cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
 async fn deleting_directory_session_removes_only_lingclaw_private_home() {
     let _guard = control_registry_test_guard();
     clear_direct_runs_for_test();
@@ -3079,6 +3171,518 @@ async fn delete_session_waits_for_in_flight_session_persistence() {
     assert!(!state.sessions.lock().await.contains_key(&session_id));
     assert!(session_store::load_session_from_disk(&session_id).is_none());
     cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
+async fn queued_socket_reconnect_binds_before_concurrent_session_delete_can_commit() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "delete-reconnect-first-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session =
+        test_session_with_workspace(&session_id, "Reconnect Before Delete", workspace.clone());
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("Session should save");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let persist_gate = session_store::session_persist_gate(&session_id);
+    let persist_guard = persist_gate.lock().await;
+    let lifecycle_lock = session_control_lock(&state, &session_id).await;
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(32);
+    let connection_cancel = CancellationToken::new();
+    let reconnect_state = Arc::clone(&state);
+    let reconnect_session_id = session_id.clone();
+    let reconnect_cancel = connection_cancel.clone();
+    let reconnect = tokio::spawn(async move {
+        crate::runtime_loop::resolve_or_create_socket_session(
+            &reconnect_state,
+            &tx,
+            Some(&reconnect_session_id),
+            73,
+            &reconnect_cancel,
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if lifecycle_lock.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reconnect should own the lifecycle lock before waiting for persistence");
+
+    let delete_state = Arc::clone(&state);
+    let delete_session_id = session_id.clone();
+    let deletion = tokio::spawn(async move {
+        delete_session_with_safety_checks(&delete_state, &delete_session_id, Some(MAIN_SESSION_ID))
+            .await
+    });
+    assert!(!deletion.is_finished());
+    drop(persist_guard);
+
+    let resolved = reconnect.await.expect("reconnect should join");
+    assert_eq!(resolved, session_id);
+    let delete_error = deletion
+        .await
+        .expect("delete should join")
+        .expect_err("the newly bound connection must abort deletion");
+    assert!(delete_error.contains("active session"));
+    assert_eq!(
+        state
+            .active_connections
+            .lock()
+            .await
+            .get(&session_id)
+            .copied(),
+        Some(73)
+    );
+    assert!(state.sessions.lock().await.contains_key(&session_id));
+    assert!(session_store::load_session_from_disk(&session_id).is_some());
+    assert!(workspace.exists());
+    assert!(
+        state
+            .auxiliary_tasks
+            .permit(
+                &session_id,
+                crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+            )
+            .is_ok()
+    );
+
+    state.active_connections.lock().await.remove(&session_id);
+    state.session_clients.lock().await.remove(&session_id);
+    state.connection_cancels.lock().await.remove(&session_id);
+    cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
+async fn deletion_rechecks_closed_lifetime_after_waiting_for_persist_gate() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "delete-lifetime-recheck-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session = test_session_with_workspace(&session_id, "Lifetime Recheck", workspace.clone());
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("Session should save");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let stale_permit = state
+        .auxiliary_tasks
+        .permit(
+            &session_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+        )
+        .expect("initial lifetime should be open");
+    let persist_gate = session_store::session_persist_gate(&session_id);
+    let persist_guard = persist_gate.lock().await;
+    let delete_state = Arc::clone(&state);
+    let delete_session_id = session_id.clone();
+    let deletion = tokio::spawn(async move {
+        delete_session_with_safety_checks(&delete_state, &delete_session_id, Some(MAIN_SESSION_ID))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if state
+                .auxiliary_tasks
+                .permit(
+                    &session_id,
+                    crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+                )
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete should close the old lifetime before waiting on persistence");
+
+    state.auxiliary_tasks.activate_session(&session_id);
+    drop(persist_guard);
+    let error = deletion
+        .await
+        .expect("delete should join")
+        .expect_err("a replacement lifetime must invalidate the old deletion authority");
+    assert!(error.contains("lifecycle changed"));
+    assert!(state.sessions.lock().await.contains_key(&session_id));
+    assert!(session_store::load_session_from_disk(&session_id).is_some());
+    assert!(workspace.exists());
+    assert!(
+        state
+            .auxiliary_tasks
+            .spawn(stale_permit, |_| async {})
+            .is_err()
+    );
+    assert!(
+        state
+            .auxiliary_tasks
+            .permit(
+                &session_id,
+                crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+            )
+            .is_ok()
+    );
+    cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
+async fn delete_first_then_explicit_socket_recreation_uses_a_new_lifetime() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "delete-before-recreate-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session = test_session_with_workspace(&session_id, "Delete First", workspace.clone());
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("Session should save");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+    let stale_permit = state
+        .auxiliary_tasks
+        .permit(
+            &session_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+        )
+        .expect("old allocation permit");
+
+    let persist_gate = session_store::session_persist_gate(&session_id);
+    let persist_guard = persist_gate.lock().await;
+    let delete_state = Arc::clone(&state);
+    let delete_session_id = session_id.clone();
+    let deletion = tokio::spawn(async move {
+        delete_session_with_safety_checks(&delete_state, &delete_session_id, Some(MAIN_SESSION_ID))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if state
+                .auxiliary_tasks
+                .permit(
+                    &session_id,
+                    crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+                )
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete should close the old allocation");
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(32);
+    let connection_cancel = CancellationToken::new();
+    let reconnect_state = Arc::clone(&state);
+    let reconnect_session_id = session_id.clone();
+    let reconnect_cancel = connection_cancel.clone();
+    let reconnect = tokio::spawn(async move {
+        crate::runtime_loop::resolve_or_create_socket_session(
+            &reconnect_state,
+            &tx,
+            Some(&reconnect_session_id),
+            91,
+            &reconnect_cancel,
+        )
+        .await
+    });
+    assert!(!reconnect.is_finished());
+
+    drop(persist_guard);
+    let delete_message = deletion
+        .await
+        .expect("delete should join")
+        .expect("delete that owns the lifecycle lock should commit");
+    assert!(delete_message.contains("Deleted"));
+    let recreated = reconnect.await.expect("explicit recreation should join");
+    assert_eq!(recreated, session_id);
+    assert!(workspace.exists());
+    assert!(state.sessions.lock().await.contains_key(&session_id));
+    assert!(session_store::load_session_from_disk(&session_id).is_some());
+    assert!(
+        state
+            .auxiliary_tasks
+            .spawn(stale_permit, |_| async {})
+            .is_err()
+    );
+    assert!(
+        state
+            .auxiliary_tasks
+            .permit(
+                &session_id,
+                crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+            )
+            .is_ok()
+    );
+
+    state.active_connections.lock().await.remove(&session_id);
+    state.session_clients.lock().await.remove(&session_id);
+    state.connection_cancels.lock().await.remove(&session_id);
+    cleanup_created_session_for_test(&session_id);
+}
+
+struct ReleaseNotifyOnDrop(Arc<tokio::sync::Notify>);
+
+impl Drop for ReleaseNotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn switch_command_waits_for_committed_delete_workspace_cleanup_before_recreation() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let suffix = NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed);
+    let current_id = format!("switch-delete-source-{suffix}");
+    let target_id = format!("switch-delete-target-{suffix}");
+    cleanup_created_session_for_test(&current_id);
+    cleanup_created_session_for_test(&target_id);
+
+    let current_workspace = crate::session_workspace_path(&current_id);
+    let target_workspace = crate::session_workspace_path(&target_id);
+    std::fs::create_dir_all(&current_workspace).expect("current workspace should be created");
+    std::fs::create_dir_all(&target_workspace).expect("target workspace should be created");
+    let old_marker = target_workspace.join("old-allocation.txt");
+    std::fs::write(&old_marker, "old allocation").expect("old marker should be written");
+
+    let current = test_session_with_workspace(
+        &current_id,
+        "Switch Delete Source",
+        current_workspace.clone(),
+    );
+    let target =
+        test_session_with_workspace(&target_id, "Switch Delete Target", target_workspace.clone());
+    session_store::save_session_to_disk(&current)
+        .await
+        .expect("current Session should save");
+    session_store::save_session_to_disk(&target)
+        .await
+        .expect("target Session should save");
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(current_id.clone(), current);
+        sessions.insert(target_id.clone(), target);
+    }
+    let stale_target_permit = state
+        .auxiliary_tasks
+        .permit(
+            &target_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+        )
+        .expect("old target allocation should accept work");
+
+    let cleanup_reached = Arc::new(tokio::sync::Notify::new());
+    let cleanup_release = Arc::new(tokio::sync::Notify::new());
+    let release_on_panic = ReleaseNotifyOnDrop(Arc::clone(&cleanup_release));
+    install_session_delete_workspace_cleanup_test_gate(
+        &target_id,
+        Arc::clone(&cleanup_reached),
+        Arc::clone(&cleanup_release),
+    );
+    let delete_state = Arc::clone(&state);
+    let delete_target = target_id.clone();
+    let delete_current = current_id.clone();
+    let deletion = tokio::spawn(async move {
+        delete_session_with_safety_checks(&delete_state, &delete_target, Some(&delete_current))
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        cleanup_reached.notified(),
+    )
+    .await
+    .expect("deletion should commit before waiting for workspace cleanup");
+
+    // At this deterministic boundary SQLite/test persistence and the in-memory
+    // allocation are gone, while the old private workspace still exists and the
+    // deletion owns the canonical target control lock.
+    let target_missing_from_memory = !state.sessions.lock().await.contains_key(&target_id);
+    let target_missing_from_storage = session_store::load_session_from_disk(&target_id).is_none();
+    let old_workspace_still_present = old_marker.exists();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    let command_result = crate::commands::handle_command(
+        &format!("/switch {target_id}"),
+        &current_id,
+        41,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("switch command should return an intent");
+    let command_did_not_create_target = !state.sessions.lock().await.contains_key(&target_id)
+        && session_store::load_session_from_disk(&target_id).is_none()
+        && old_marker.exists();
+    let command_did_not_emit_success = rx.try_recv().is_err();
+    let stale_target_permit_rejected = state
+        .auxiliary_tasks
+        .spawn(stale_target_permit, |_| async {})
+        .is_err();
+
+    let switch_state = Arc::clone(&state);
+    let switch_tx = tx.clone();
+    let switch_target = target_id.clone();
+    let switch_current = current_id.clone();
+    let connection_cancel = CancellationToken::new();
+    let switch_cancel = connection_cancel.clone();
+    let switch = tokio::spawn(async move {
+        let current_ref = Arc::new(tokio::sync::Mutex::new(switch_current.clone()));
+        let mut current_id = switch_current;
+        let result = crate::switch_socket_session(
+            &switch_state,
+            &switch_tx,
+            &current_ref,
+            &mut current_id,
+            &switch_cancel,
+            41,
+            switch_target,
+        )
+        .await;
+        (result, current_id, current_ref.lock().await.clone())
+    });
+
+    cleanup_release.notify_one();
+    let delete_message = deletion
+        .await
+        .expect("delete task should join")
+        .expect("delete should finish its old workspace cleanup");
+    let (switch_result, switched_id, switched_ref) = switch
+        .await
+        .expect("switch task should join after deletion releases the target lock");
+    let created_fresh = switch_result.expect("switch should recreate the deleted target");
+
+    assert!(target_missing_from_memory);
+    assert!(target_missing_from_storage);
+    assert!(old_workspace_still_present);
+    assert!(command_did_not_create_target);
+    assert!(command_did_not_emit_success);
+    assert!(stale_target_permit_rejected);
+    assert_eq!(
+        command_result.switch_to_session.as_deref(),
+        Some(target_id.as_str())
+    );
+    assert!(delete_message.contains("Deleted"));
+    assert!(created_fresh);
+    assert_eq!(switched_id, target_id);
+    assert_eq!(switched_ref, target_id);
+    assert!(state.sessions.lock().await.contains_key(&target_id));
+    assert!(session_store::load_session_from_disk(&target_id).is_some());
+    assert!(target_workspace.exists());
+    assert!(
+        !old_marker.exists(),
+        "the old allocation must be cleaned before the new one is created"
+    );
+    assert_eq!(
+        state
+            .active_connections
+            .lock()
+            .await
+            .get(&target_id)
+            .copied(),
+        Some(41)
+    );
+    assert!(
+        state
+            .auxiliary_tasks
+            .permit(
+                &target_id,
+                crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+            )
+            .is_ok()
+    );
+
+    state.active_connections.lock().await.remove(&target_id);
+    state.session_clients.lock().await.remove(&target_id);
+    state.connection_cancels.lock().await.remove(&target_id);
+    cleanup_created_session_for_test(&target_id);
+    cleanup_created_session_for_test(&current_id);
+    drop(release_on_panic);
+}
+
+#[tokio::test]
+async fn switch_save_failure_does_not_create_or_activate_the_target() {
+    let state = Arc::new(test_app_state());
+    let suffix = NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed);
+    let missing_current = format!("switch-missing-source-{suffix}");
+    let target_id = format!("switch-save-failure-target-{suffix}");
+    cleanup_created_session_for_test(&target_id);
+    let target_workspace = crate::session_workspace_path(&target_id);
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(16);
+    let current_ref = Arc::new(tokio::sync::Mutex::new(missing_current.clone()));
+    let mut current_id = missing_current.clone();
+
+    let error = crate::switch_socket_session(
+        &state,
+        &tx,
+        &current_ref,
+        &mut current_id,
+        &CancellationToken::new(),
+        52,
+        target_id.clone(),
+    )
+    .await
+    .expect_err("saving the current Session should fail before target creation");
+
+    assert!(error.contains("Failed to save session"));
+    assert!(error.contains("Session not found"));
+    assert_eq!(current_id, missing_current);
+    assert_eq!(*current_ref.lock().await, missing_current);
+    assert!(!state.sessions.lock().await.contains_key(&target_id));
+    assert!(session_store::load_session_from_disk(&target_id).is_none());
+    assert!(!target_workspace.exists());
+    cleanup_created_session_for_test(&target_id);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn session_control_lock_is_shared_by_windows_case_aliases() {
+    let state = test_app_state();
+    let upper = session_control_lock(&state, "LifecycleAlias").await;
+    let lower = session_control_lock(&state, "lifecyclealias").await;
+    assert!(Arc::ptr_eq(&upper, &lower));
 }
 
 #[tokio::test]

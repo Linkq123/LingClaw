@@ -1,8 +1,8 @@
-import { invalidateChatScrollCache, scrollDown } from '../scroll.js';
 import { dom, state } from '../state.js';
 import type { AutoTraceEvent } from '../types.js';
-import { escHtml, hideWelcome } from '../utils.js';
+import { escHtml } from '../utils.js';
 import { tr } from '../i18n.js';
+import { iconMarkup } from '../icons.js';
 
 function flag(value: boolean): string {
   return value ? 'yes' : 'no';
@@ -48,17 +48,16 @@ function compressionSummary(trace: AutoTraceEvent): string | null {
 }
 
 function ensureAutoDebugRow(): HTMLElement | null {
-  if (!dom.chat) return null;
+  if (!dom.autoDebugHost) return null;
   if (!state.autoDebugRow) {
-    const row = document.createElement('div');
-    row.className = 'msg-row system auto-debug-row';
-    state.autoDebugRow = row;
+    const panel = document.createElement('div');
+    panel.className = 'auto-debug-panel';
+    state.autoDebugRow = panel;
   }
   if (!state.autoDebugRow.isConnected) {
-    dom.chat.appendChild(state.autoDebugRow);
-    invalidateChatScrollCache();
-    hideWelcome();
+    dom.autoDebugHost.appendChild(state.autoDebugRow);
   }
+  dom.autoDebugHost.hidden = false;
   return state.autoDebugRow;
 }
 
@@ -72,11 +71,14 @@ function renderAutoDebugPanel(): void {
   if (!row) return;
   const trace = state.latestAutoTrace;
   row.innerHTML = `
-    <div class="system-card auto-debug-card" data-auto-trace-panel="true">
+    <div class="auto-debug-card" data-auto-trace-panel="true">
       <div class="auto-debug-header">
         <span class="auto-debug-tag">Auto Debug</span>
         <span class="auto-debug-meta">round ${trace.round} · cycle ${trace.cycle} · ${escHtml(trace.phase)}</span>
         <span class="auto-debug-meta">${escHtml(trace.provider)} · ${escHtml(trace.model)}</span>
+        <button type="button" class="auto-debug-close" data-action="close-auto-debug" aria-label="${escHtml(tr('common.close'))}" title="${escHtml(tr('common.close'))}">
+          ${iconMarkup('close')}
+        </button>
       </div>
       <div class="auto-debug-line">
         selected=<strong>${escHtml(trace.selected_think)}</strong>
@@ -92,7 +94,6 @@ function renderAutoDebugPanel(): void {
       <pre class="auto-debug-signals">${escHtml(signalSummary(trace))}</pre>
     </div>
   `;
-  scrollDown();
 }
 
 export function updateAutoDebugToggleButton(): void {
@@ -113,7 +114,7 @@ export function clearAutoTracePanel(): void {
   if (!state.autoDebugRow) return;
   state.autoDebugRow.remove();
   state.autoDebugRow = null;
-  invalidateChatScrollCache();
+  if (dom.autoDebugHost) dom.autoDebugHost.hidden = true;
 }
 
 export function clearActiveAutoTrace(): void {

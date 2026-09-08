@@ -42,6 +42,61 @@ async fn attach_plan_history(
     payload
 }
 
+#[cfg(not(test))]
+async fn attach_run_outcome_history(
+    tx: &WsTx,
+    state: &AppState,
+    session_id: &str,
+    mut payload: serde_json::Value,
+) -> serde_json::Value {
+    match crate::storage::Database::global() {
+        Ok(database) => match database.load_run_outcomes(session_id).await {
+            Ok(outcomes) if !outcomes.is_empty() => {
+                if let Some(messages) = payload["messages"].as_array_mut() {
+                    for outcome in outcomes {
+                        let target = messages.iter_mut().rfind(|message| {
+                            message["message_index"]
+                                .as_u64()
+                                .and_then(|value| usize::try_from(value).ok())
+                                .is_some_and(|index| {
+                                    index >= outcome.start_message_index
+                                        && index <= outcome.end_message_index
+                                })
+                        });
+                        if let Some(target) = target {
+                            if !target["run_outcomes"].is_array() {
+                                target["run_outcomes"] = json!([]);
+                            }
+                            if let Some(items) = target["run_outcomes"].as_array_mut() {
+                                items.push(json!(outcome));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("ERROR: failed to load run outcomes for {session_id}: {error}");
+                crate::send_storage_status(tx, state).await;
+            }
+        },
+        Err(error) => {
+            eprintln!("ERROR: LingClaw storage is unavailable while loading run outcomes: {error}");
+        }
+    }
+    payload
+}
+
+#[cfg(test)]
+async fn attach_run_outcome_history(
+    _tx: &WsTx,
+    _state: &AppState,
+    _session_id: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    payload
+}
+
 #[cfg(test)]
 async fn attach_plan_history(
     _tx: &WsTx,
@@ -110,6 +165,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
     let session_payload = json!({"type":"session","id":session_id,"name":name,"model":effective_model,"effort":effort,"explicitPrimaryModelConfigured":config.explicit_primary_model_configured,"modelOverridePresent":model_override_present,"modelOverrideConfigured":model_override_configured,"effectiveModelConfigured":effective_model_configured,"configRevision":config_revision,"capabilities":{"image":supports_image,"s3":s3_available,"s3_config_id":s3_config_id},"usage":usage});
     drop(model_status_guard);
     let history = attach_plan_history(tx, state, session_id, history).await;
+    let history = attach_run_outcome_history(tx, state, session_id, history).await;
 
     ws_send(tx, &session_payload).await;
     ws_send(tx, &view_state).await;
@@ -386,6 +442,8 @@ pub(crate) async fn send_command_refresh(
         ws_send(tx, &todos_state).await;
         if let Some(history_payload) = history {
             let history_payload = attach_plan_history(tx, state, session_id, history_payload).await;
+            let history_payload =
+                attach_run_outcome_history(tx, state, session_id, history_payload).await;
             ws_send(tx, &history_payload).await;
         }
     }

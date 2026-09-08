@@ -6,6 +6,18 @@ type UtilsModule = typeof import('../src/utils.js');
 
 const mockWebSocket = vi.fn();
 
+function clientConfigResponse(executionIdentity: number | null = 1, groups = true): Response {
+  return new Response(
+    JSON.stringify({
+      features: { groups },
+      ...(executionIdentity == null
+        ? {}
+        : { protocols: { execution_identity: executionIdentity } }),
+    }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  );
+}
+
 vi.mock('../src/constants.js', () => ({
   MAX_RECONNECT_ATTEMPTS: 3,
 }));
@@ -88,6 +100,9 @@ describe('socket session binding', () => {
     mountSessionDrawerDom();
     stateModule.state.activeSessionId = '';
     stateModule.state.activeGroupId = '';
+    stateModule.state.executionIdentityProtocol = 'strict';
+    stateModule.state.socketGeneration = 0;
+    stateModule.state.legacyExecutionSocketGeneration = 0;
     stateModule.state.pendingDeleteSessionId = '';
     stateModule.state.reconnectDelay = 1000;
     stateModule.state.reconnectAttempts = 0;
@@ -106,9 +121,14 @@ describe('socket session binding', () => {
     (globalThis as unknown as { WebSocket: unknown }).WebSocket =
       mockWebSocket as unknown as typeof WebSocket;
     mockWebSocket.mockReset();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() => Promise.resolve(clientConfigResponse())),
+    );
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     sessionsRendererModule.disposeSessionDrawer();
     vi.unstubAllGlobals();
   });
@@ -116,19 +136,389 @@ describe('socket session binding', () => {
   it('connects to default websocket path when no active session is selected', async () => {
     const { connect } = await import('../src/socket.js');
 
-    connect(() => {});
+    await connect(() => {});
 
     expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws');
   });
 
+  it('classifies current, legacy, and unsupported execution identity capabilities', async () => {
+    const { executionIdentityProtocolFromClientConfig } = await import('../src/socket.js');
+
+    expect(
+      executionIdentityProtocolFromClientConfig({ protocols: { execution_identity: 1 } }),
+    ).toBe('strict');
+    expect(executionIdentityProtocolFromClientConfig({ features: { groups: false } })).toBe(
+      'legacy',
+    );
+    expect(
+      executionIdentityProtocolFromClientConfig({ protocols: { execution_identity: 2 } }),
+    ).toBeNull();
+  });
+
+  it('refuses a socket when execution protocol negotiation failed without leaving fake busy state', async () => {
+    const chatModule = await import('../src/renderers/chat.js');
+    const { connect } = await import('../src/socket.js');
+    vi.mocked(chatModule.addSystem).mockClear();
+    vi.mocked(chatModule.setBusy).mockClear();
+    stateModule.state.executionIdentityProtocol = 'unavailable';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() => Promise.resolve(new Response('unavailable', { status: 503 }))),
+    );
+
+    await connect(() => {});
+
+    expect(mockWebSocket).not.toHaveBeenCalled();
+    expect(stateModule.state.ws).toBeNull();
+    expect(chatModule.setBusy).toHaveBeenCalledWith(false);
+    expect(chatModule.addSystem).toHaveBeenCalledWith(
+      expect.stringContaining('Connection setup failed'),
+      'error',
+    );
+    expect(stateModule.dom.connLabel?.textContent).toContain('Connection setup failed');
+  });
+
+  it('allows one legacy socket but blocks reconnect after its connection epoch closes', async () => {
+    const chatModule = await import('../src/renderers/chat.js');
+    const sockets: Array<{ onclose?: (() => void) | null; close: ReturnType<typeof vi.fn> }> = [];
+    mockWebSocket.mockImplementation(() => {
+      const socket = {
+        close: vi.fn(),
+        onopen: undefined,
+        onclose: undefined,
+        onerror: undefined,
+        onmessage: undefined,
+        send: vi.fn(),
+        readyState: 1,
+      };
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    });
+    const { connect } = await import('../src/socket.js');
+    vi.mocked(chatModule.addSystem).mockClear();
+    vi.mocked(chatModule.setBusy).mockClear();
+    stateModule.state.executionIdentityProtocol = 'legacy';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() => Promise.resolve(clientConfigResponse(null))),
+    );
+
+    await connect(() => {});
+    expect(mockWebSocket).toHaveBeenCalledTimes(1);
+    expect(stateModule.state.legacyExecutionSocketGeneration).toBe(
+      stateModule.state.socketGeneration,
+    );
+
+    sockets[0].onclose?.();
+
+    expect(mockWebSocket).toHaveBeenCalledTimes(1);
+    expect(stateModule.state.ws).toBeNull();
+    expect(chatModule.setBusy).toHaveBeenCalledWith(false);
+    expect(chatModule.addSystem).toHaveBeenCalledWith(
+      expect.stringContaining('older daemon cannot reconnect'),
+      'error',
+    );
+  });
+
+  it.each([
+    ['legacy', () => clientConfigResponse(null)],
+    ['unknown', () => clientConfigResponse(99)],
+    ['failed', () => new Response('unavailable', { status: 503 })],
+  ])(
+    'renegotiates strict to %s before a manual reconnect and refuses the socket preflight',
+    async (_label, secondResponse) => {
+      vi.useFakeTimers();
+      const responses = [clientConfigResponse(), secondResponse()];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn<typeof fetch>(() => Promise.resolve(responses.shift()!)),
+      );
+      const sockets: Array<{ close: ReturnType<typeof vi.fn> }> = [];
+      mockWebSocket.mockImplementation(() => {
+        const socket = {
+          close: vi.fn(),
+          onopen: undefined,
+          onclose: undefined,
+          onerror: undefined,
+          onmessage: undefined,
+          send: vi.fn(),
+          readyState: 1,
+        };
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      });
+      const { connect, reconnectToActiveSession } = await import('../src/socket.js');
+
+      await connect(() => {});
+      expect(mockWebSocket).toHaveBeenCalledTimes(1);
+      stateModule.state.busy = true;
+
+      await reconnectToActiveSession(() => {});
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(mockWebSocket).toHaveBeenCalledTimes(1);
+      expect(sockets[0].close).toHaveBeenCalledTimes(1);
+      expect(stateModule.state.ws).toBeNull();
+      const chatModule = await import('../src/renderers/chat.js');
+      expect(chatModule.setBusy).toHaveBeenCalledWith(false);
+      expect(stateModule.state.executionIdentityProtocol).not.toBe('strict');
+      vi.useRealTimers();
+    },
+  );
+
+  it('renegotiates legacy to strict and permits the next socket generation', async () => {
+    const responses = [clientConfigResponse(null), clientConfigResponse(1)];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() => Promise.resolve(responses.shift()!)),
+    );
+    mockWebSocket.mockImplementation(
+      () =>
+        ({
+          close: vi.fn(),
+          onopen: undefined,
+          onclose: undefined,
+          onerror: undefined,
+          onmessage: undefined,
+          send: vi.fn(),
+          readyState: 1,
+        }) as unknown as WebSocket,
+    );
+    const { connect, reconnectToActiveSession } = await import('../src/socket.js');
+
+    await connect(() => {});
+    expect(stateModule.state.executionIdentityProtocol).toBe('legacy');
+    await reconnectToActiveSession(() => {});
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(mockWebSocket).toHaveBeenCalledTimes(2);
+    expect(stateModule.state.executionIdentityProtocol).toBe('strict');
+    expect(stateModule.state.socketGeneration).toBe(2);
+  });
+
+  it('renegotiates an automatic reconnect and does not loop when strict becomes legacy', async () => {
+    vi.useFakeTimers();
+    const responses = [clientConfigResponse(), clientConfigResponse(null)];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() => Promise.resolve(responses.shift()!)),
+    );
+    const sockets: Array<{ onclose?: (() => void) | null; close: ReturnType<typeof vi.fn> }> = [];
+    mockWebSocket.mockImplementation(() => {
+      const socket = {
+        close: vi.fn(),
+        onopen: undefined,
+        onclose: undefined,
+        onerror: undefined,
+        onmessage: undefined,
+        send: vi.fn(),
+        readyState: 1,
+      };
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    });
+    const { connect } = await import('../src/socket.js');
+
+    await connect(() => {});
+    sockets[0].onclose?.();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(mockWebSocket).toHaveBeenCalledTimes(1);
+    expect(stateModule.state.executionIdentityProtocol).toBe('legacy');
+    expect(stateModule.state.ws).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('discards a delayed negotiation when a newer Session target wins', async () => {
+    let firstSignal: AbortSignal | null = null;
+    let request = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>((_input, init) => {
+        request += 1;
+        if (request === 1) {
+          firstSignal = init?.signal ?? null;
+          return new Promise<Response>(() => {});
+        }
+        return Promise.resolve(clientConfigResponse());
+      }),
+    );
+    mockWebSocket.mockImplementation(
+      () =>
+        ({
+          close: vi.fn(),
+          onopen: undefined,
+          onclose: undefined,
+          onerror: undefined,
+          onmessage: undefined,
+          send: vi.fn(),
+          readyState: 1,
+        }) as unknown as WebSocket,
+    );
+    const { connect, reconnectToActiveSession } = await import('../src/socket.js');
+    stateModule.state.activeSessionId = 'old-target';
+
+    const oldIntent = connect(() => {});
+    stateModule.state.activeSessionId = 'new-target';
+    await reconnectToActiveSession(() => {});
+    await oldIntent;
+
+    expect(firstSignal?.aborted).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(mockWebSocket).toHaveBeenCalledTimes(1);
+    expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws?session=new-target');
+    expect(stateModule.state.executionIdentityProtocol).toBe('strict');
+  });
+
+  it.each(['headers', 'json body'])(
+    'bounds a client-config request whose %s never completes',
+    async (stallPoint) => {
+      vi.useFakeTimers();
+      let requestSignal: AbortSignal | null = null;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn<typeof fetch>((_input, init) => {
+          requestSignal = init?.signal ?? null;
+          if (stallPoint === 'headers') return new Promise<Response>(() => {});
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () => new Promise<unknown>(() => {}),
+          } as Response);
+        }),
+      );
+      const { CLIENT_CONFIG_TIMEOUT_MS, connect } = await import('../src/socket.js');
+
+      const pending = connect(() => {});
+      await Promise.resolve();
+      expect(mockWebSocket).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(CLIENT_CONFIG_TIMEOUT_MS);
+      await pending;
+
+      expect(requestSignal?.aborted).toBe(true);
+      expect(mockWebSocket).not.toHaveBeenCalled();
+      expect(stateModule.state.executionIdentityProtocol).toBe('unavailable');
+      expect(stateModule.state.ws).toBeNull();
+      expect(stateModule.state.busy).toBe(false);
+    },
+  );
+
+  it('actively aborts a pending negotiation when reconnect cancellation supersedes its intent', async () => {
+    let requestSignal: AbortSignal | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>((_input, init) => {
+        requestSignal = init?.signal ?? null;
+        return new Promise<Response>(() => {});
+      }),
+    );
+    const { cancelReconnect, connect } = await import('../src/socket.js');
+
+    const pending = connect(() => {});
+    await Promise.resolve();
+    cancelReconnect();
+    await pending;
+
+    expect(requestSignal?.aborted).toBe(true);
+    expect(mockWebSocket).not.toHaveBeenCalled();
+    expect(stateModule.state.executionIdentityProtocol).toBe('strict');
+  });
+
+  it('actively aborts a pending negotiation when the current protocol generation fail-closes', async () => {
+    const sockets: Array<{ close: ReturnType<typeof vi.fn> }> = [];
+    mockWebSocket.mockImplementation(() => {
+      const socket = {
+        close: vi.fn(),
+        onopen: undefined,
+        onclose: undefined,
+        onerror: undefined,
+        onmessage: undefined,
+        send: vi.fn(),
+        readyState: 1,
+      };
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    });
+    let request = 0;
+    let pendingSignal: AbortSignal | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>((_input, init) => {
+        request += 1;
+        if (request === 1) return Promise.resolve(clientConfigResponse());
+        pendingSignal = init?.signal ?? null;
+        return new Promise<Response>(() => {});
+      }),
+    );
+    const { connect, failCloseCurrentExecutionProtocol } = await import('../src/socket.js');
+    await connect(() => {});
+
+    const pending = connect(() => {});
+    await Promise.resolve();
+    failCloseCurrentExecutionProtocol();
+    await pending;
+
+    expect(pendingSignal?.aborted).toBe(true);
+    expect(sockets[0].close).toHaveBeenCalledTimes(1);
+    expect(mockWebSocket).toHaveBeenCalledTimes(1);
+    expect(stateModule.state.ws).toBeNull();
+  });
+
+  it('renegotiates before switching from a Session socket to a Group socket', async () => {
+    mockWebSocket.mockImplementation(
+      () =>
+        ({
+          close: vi.fn(),
+          onopen: undefined,
+          onclose: undefined,
+          onerror: undefined,
+          onmessage: undefined,
+          send: vi.fn(),
+          readyState: 1,
+        }) as unknown as WebSocket,
+    );
+    const { connect, reconnectToActiveSession } = await import('../src/socket.js');
+    stateModule.state.activeSessionId = 'main';
+    await connect(() => {});
+
+    stateModule.state.activeGroupId = 'review-group';
+    await reconnectToActiveSession(() => {});
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(mockWebSocket).toHaveBeenCalledTimes(2);
+    expect(mockWebSocket).toHaveBeenLastCalledWith(
+      'ws://localhost:3000/ws?group=review-group&session=main',
+    );
+  });
+
+  it('does not let a hanging Group discovery delay the negotiated WebSocket generation', async () => {
+    stateModule.state.groupsEnabled = false;
+    const onMessage = vi.fn((message: { features?: { groups?: boolean } }) => {
+      stateModule.state.groupsEnabled = message.features?.groups === true;
+      return new Promise<void>(() => {});
+    });
+    const { connect } = await import('../src/socket.js');
+
+    await connect(onMessage);
+
+    expect(onMessage).toHaveBeenCalledWith({
+      type: 'feature_status',
+      features: { groups: true },
+    });
+    expect(mockWebSocket).toHaveBeenCalledTimes(1);
+  });
+
   it('starts a model revision handshake when the socket opens', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => {})));
     const composerModule = await import('../src/composerAvailability.js');
     const { connect } = await import('../src/socket.js');
     stateModule.state.composerConfigRevision = 50;
     stateModule.state.composerSessionModelRevision = 50;
 
-    connect(() => {});
+    await connect(() => {});
     const socket = mockWebSocket.mock.instances[0] as unknown as { onopen?: () => void };
     socket.onopen?.();
 
@@ -136,7 +526,7 @@ describe('socket session binding', () => {
       'composer-availability-detail',
     );
     expect(document.getElementById('composer-availability-detail')?.textContent).toBe(
-      'Checking model configuration...',
+      'Waiting for this session to be ready. Your draft has not been sent.',
     );
 
     // An HTTP response cannot consume the connection-scoped handshake.
@@ -147,6 +537,12 @@ describe('socket session binding', () => {
 
     composerModule.setComposerExplicitPrimaryModelConfigured(true, 5);
     composerModule.setComposerSessionModelConfigured(false, false, true, 5);
+    expect(stateModule.dom.sendBtn?.disabled).toBe(true);
+    // Model payloads cannot confirm the full Session identity for this socket.
+    stateModule.state.composerSessionIdentityPending = false;
+    (await import('../src/composerTransport.js')).confirmComposerTransportIdentity();
+    (await import('../src/composerTransport.js')).confirmComposerTransportHistory();
+    composerModule.syncComposerAvailability();
     expect(stateModule.dom.sendBtn?.disabled).toBe(false);
     expect(stateModule.dom.input?.hasAttribute('aria-describedby')).toBe(false);
     expect(stateModule.dom.sendBtn?.hasAttribute('aria-describedby')).toBe(false);
@@ -177,7 +573,11 @@ describe('socket session binding', () => {
     let recoverySignal: AbortSignal | null = null;
     vi.stubGlobal(
       'fetch',
-      vi.fn<typeof fetch>((_input, init) => {
+      vi.fn<typeof fetch>((input, init) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url === '/api/client-config') {
+          return Promise.resolve(clientConfigResponse());
+        }
         recoverySignal = init?.signal ?? null;
         return new Promise<Response>(() => {});
       }),
@@ -189,7 +589,7 @@ describe('socket session binding', () => {
 
     const { refreshActiveComposerSessionModelState } = await import('../src/composerModels.js');
     const { connect } = await import('../src/socket.js');
-    connect(() => {});
+    await connect(() => {});
     const recovery = refreshActiveComposerSessionModelState('main');
     expect(recoverySignal?.aborted).toBe(false);
 
@@ -199,7 +599,7 @@ describe('socket session binding', () => {
 
     expect(recoverySignal?.aborted).toBe(true);
     await expect(recovery).resolves.toBe('cancelled');
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it('retranslates the current connection state without resetting it to offline', async () => {
@@ -207,7 +607,7 @@ describe('socket session binding', () => {
     const { connect, refreshConnectionStatus } = await import('../src/socket.js');
 
     setLanguage('en');
-    connect(() => {});
+    await connect(() => {});
     expect(stateModule.dom.connLabel?.textContent).toBe('Connecting...');
 
     setLanguage('zh-CN');
@@ -221,7 +621,7 @@ describe('socket session binding', () => {
     const { connect } = await import('../src/socket.js');
     stateModule.state.activeSessionId = 'research-notes';
 
-    connect(() => {});
+    await connect(() => {});
 
     expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws?session=research-notes');
   });
@@ -231,7 +631,7 @@ describe('socket session binding', () => {
     stateModule.state.activeSessionId = 'main';
     stateModule.state.activeGroupId = 'review-group';
 
-    connect(() => {});
+    await connect(() => {});
 
     expect(mockWebSocket).toHaveBeenCalledWith(
       'ws://localhost:3000/ws?group=review-group&session=main',
@@ -243,7 +643,7 @@ describe('socket session binding', () => {
     stateModule.state.activeSessionId = 'worker-a';
     stateModule.state.activeGroupId = 'review-group';
 
-    connect(() => {});
+    await connect(() => {});
 
     expect(mockWebSocket).toHaveBeenCalledWith(
       'ws://localhost:3000/ws?group=review-group&session=main',
@@ -272,10 +672,7 @@ describe('socket session binding', () => {
     });
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ features: { groups: false } }),
-      }),
+      vi.fn<typeof fetch>(() => Promise.resolve(clientConfigResponse(1, false))),
     );
     stateModule.state.activeSessionId = 'main';
     stateModule.state.activeGroupId = 'review-group';
@@ -285,19 +682,71 @@ describe('socket session binding', () => {
       if (message?.type !== 'feature_status') return;
       stateModule.state.groupsEnabled = false;
       stateModule.state.activeGroupId = '';
-      socketModule.reconnectToActiveSession(onMessage);
+      void socketModule.reconnectToActiveSession(onMessage);
     });
 
-    socketModule.connect(onMessage);
-    sockets[0].onclose?.();
+    await socketModule.connect(onMessage);
 
-    await vi.waitFor(() => expect(mockWebSocket).toHaveBeenCalledTimes(2));
-    expect(fetch).toHaveBeenCalledWith('/api/client-config', { cache: 'no-store' });
+    await vi.waitFor(() => expect(mockWebSocket).toHaveBeenCalledTimes(1));
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/client-config',
+      expect.objectContaining({ cache: 'no-store', signal: expect.any(AbortSignal) }),
+    );
     expect(onMessage).toHaveBeenCalledWith({
       type: 'feature_status',
       features: { groups: false },
     });
-    expect(mockWebSocket).toHaveBeenLastCalledWith('ws://localhost:3000/ws?session=main');
+    expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws?session=main');
+  });
+
+  it('times out a closed Group capability probe and continues with one bounded reconnect', async () => {
+    vi.useFakeTimers();
+    const sockets: Array<{
+      close: ReturnType<typeof vi.fn>;
+      onclose?: (() => void) | null;
+    }> = [];
+    mockWebSocket.mockImplementation(() => {
+      const socket = {
+        close: vi.fn(),
+        onopen: undefined,
+        onclose: undefined,
+        onerror: undefined,
+        onmessage: undefined,
+        send: vi.fn(),
+        readyState: 1,
+      };
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    });
+    let request = 0;
+    let recoverySignal: AbortSignal | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>((_input, init) => {
+        request += 1;
+        if (request === 2) {
+          recoverySignal = init?.signal ?? null;
+          return new Promise<Response>(() => {});
+        }
+        return Promise.resolve(clientConfigResponse(1, true));
+      }),
+    );
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.activeGroupId = 'review-group';
+    const { CLIENT_CONFIG_TIMEOUT_MS, connect } = await import('../src/socket.js');
+
+    await connect(() => {});
+    sockets[0].onclose?.();
+    await vi.advanceTimersByTimeAsync(CLIENT_CONFIG_TIMEOUT_MS);
+    expect(recoverySignal?.aborted).toBe(true);
+    expect(mockWebSocket).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await Promise.resolve();
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(mockWebSocket).toHaveBeenCalledTimes(2);
+    expect(stateModule.state.reconnectAttempts).toBe(1);
   });
 
   it('keeps only a non-current non-main pending delete target', async () => {
@@ -1042,7 +1491,7 @@ describe('socket session binding', () => {
       return socket as unknown as WebSocket;
     });
 
-    connect(() => {});
+    await connect(() => {});
     stateModule.state.reconnectAttempts = 3;
     sockets[0].onclose?.();
 
@@ -1076,7 +1525,7 @@ describe('socket session binding', () => {
       composerModule.updateComposerSessionTransitionFallback('main', true, false, false, true, 30),
     ).toBe(true);
 
-    connect(() => {});
+    await connect(() => {});
     stateModule.state.reconnectAttempts = 3;
     sockets[0].onclose?.();
 
@@ -1090,10 +1539,18 @@ describe('socket session binding', () => {
     const { reconnectToActiveSession } = await import('../src/socket.js');
 
     stateModule.state.sessionSwitchInFlight = true;
+    stateModule.state.activeExecutionRunId = 17;
+    stateModule.state.activeExecutionServerRunId = 'old-connection';
+    stateModule.state.activeExecutionPlanId = 'plan-switch';
+    stateModule.state.terminalExecutionStack = document.createElement('section');
 
-    reconnectToActiveSession(() => {});
+    await reconnectToActiveSession(() => {});
 
     expect(stateModule.state.sessionSwitchInFlight).toBe(true);
+    expect(stateModule.state.activeExecutionRunId).toBe(0);
+    expect(stateModule.state.activeExecutionServerRunId).toBe('');
+    expect(stateModule.state.activeExecutionPlanId).toBe('');
+    expect(stateModule.state.terminalExecutionStack).toBeNull();
   });
 
   it('detaches the previous socket message handler during reconnect', async () => {
@@ -1117,9 +1574,9 @@ describe('socket session binding', () => {
     const onMessage = vi.fn();
     const { connect, reconnectToActiveSession } = await import('../src/socket.js');
 
-    connect(onMessage);
+    await connect(onMessage);
     const staleHandler = sockets[0].onmessage;
-    reconnectToActiveSession(onMessage);
+    await reconnectToActiveSession(onMessage);
 
     expect(sockets[0].onmessage).toBeNull();
     staleHandler?.({ data: JSON.stringify({ type: 'session', id: 'old' }) });

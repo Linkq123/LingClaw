@@ -11,6 +11,7 @@ import { scrollDown } from '../scroll.js';
 import { animatePanelIn, animateCollapsibleSection, linkCollapsibleControl } from './timeline.js';
 import {
   mountExecutionPanel,
+  linkExecutionDelegate,
   refreshExecutionStackForPanel,
   removeExecutionPanel,
 } from './execution-stack.js';
@@ -33,7 +34,7 @@ function ensureRegistry() {
 }
 
 function orchestrationLabel(taskCount: number, layerCount: number): string {
-  return `${tr('execution.orchestration')} · ${tr('execution.orchestrationSummary', {
+  return `${tr('execution.coordinate')} · ${tr('execution.orchestrationSummary', {
     tasks: taskCount,
     layers: layerCount,
   })}`;
@@ -162,6 +163,13 @@ function updateHeaderProgress(entry) {
     parts.push(tr('execution.pendingCount', { count: pending }));
   }
   statusEl.textContent = parts.join(' / ');
+  entry.panel.dataset.executionAction = tr('execution.coordinate');
+  entry.panel.dataset.executionObject = tr('execution.orchestrationSummary', {
+    tasks: total,
+    layers: Number(entry.panel.dataset.layerCount || entry.layerCount || 0),
+  });
+  entry.panel.dataset.executionResult = statusEl.textContent;
+  entry.panel.dataset.executionState = failed ? 'failed' : 'running';
   refreshExecutionStackForPanel(entry.panel);
 }
 
@@ -578,6 +586,13 @@ export function createOrchestratePanel(data) {
   panel.dataset.orchestrateId = data.orchestrate_id;
   panel.dataset.taskCount = String(data.task_count || 0);
   panel.dataset.layerCount = String(data.layer_count || 0);
+  panel.dataset.executionAction = tr('execution.coordinate');
+  panel.dataset.executionObject = tr('execution.orchestrationSummary', {
+    tasks: data.task_count || 0,
+    layers: data.layer_count || 0,
+  });
+  panel.dataset.executionResult = tr('execution.running');
+  panel.dataset.executionState = 'running';
   if (data.synthetic === true) panel.dataset.synthetic = 'true';
 
   const header = document.createElement('button');
@@ -639,6 +654,8 @@ export function createOrchestratePanel(data) {
 
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
   mountExecutionPanel(panel, 'orchestrate', currentRow);
+  linkExecutionDelegate(panel, data.parent_tool_call_id);
+  if (data.retry_key) panel.dataset.executionRetryKey = data.retry_key;
 
   pinReactStatusToBottom();
   animatePanelIn(panel);
@@ -801,10 +818,22 @@ export function finishOrchestratePanel(data) {
       const duration = formatToolDuration(data.duration_ms);
       if (duration) parts.push(duration);
     }
-    status.textContent = data.aborted
-      ? `${tr('execution.failed')} (${parts.join(' / ')})`
-      : `${tr('execution.completed')} (${parts.join(' / ')})`;
+    status.textContent =
+      data.aborted || Number(data.failed || 0) > 0 || Number(data.skipped || 0) > 0
+        ? `${tr('execution.failed')} (${parts.join(' / ')})`
+        : `${tr('execution.completed')} (${parts.join(' / ')})`;
   }
+
+  panel.dataset.executionAction = tr('execution.coordinate');
+  panel.dataset.executionObject = tr('execution.orchestrationSummary', {
+    tasks: Number(panel.dataset.taskCount || 0),
+    layers: Number(panel.dataset.layerCount || 0),
+  });
+  panel.dataset.executionResult = status?.textContent || '';
+  panel.dataset.executionState =
+    data.aborted || Number(data.failed || 0) > 0 || Number(data.skipped || 0) > 0
+      ? 'failed'
+      : 'completed';
 
   renderOrchestrationSummary(panel);
 
@@ -858,9 +887,16 @@ export function refreshOrchestratePanelsLanguage(): void {
       : '';
     if (duration) parts.push(duration);
     status.textContent =
-      panel.dataset.orchestrateAborted === 'true'
+      panel.dataset.orchestrateAborted === 'true' || failed > 0 || skipped > 0
         ? `${tr('execution.failed')} (${parts.join(' / ')})`
         : `${tr('execution.completed')} (${parts.join(' / ')})`;
+    panel.dataset.executionAction = tr('execution.coordinate');
+    panel.dataset.executionObject = tr('execution.orchestrationSummary', {
+      tasks: taskCount,
+      layers: layerCount,
+    });
+    panel.dataset.executionResult = status.textContent;
     renderOrchestrationSummary(panel);
+    refreshExecutionStackForPanel(panel);
   });
 }

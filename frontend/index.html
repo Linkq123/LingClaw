@@ -364,21 +364,55 @@
                     >
                     <span class="shell-switch" aria-hidden="true"><span></span></span>
                   </button>
-                  <button
-                    id="toggle-reasoning-btn"
-                    class="shell-toggle-item"
-                    data-action="toggle-reasoning"
-                    aria-pressed="true"
-                  >
+                  <div id="toggle-reasoning-btn" class="shell-density-item">
                     <span class="shell-menu-icon"
                       ><svg class="icon" aria-hidden="true"><use href="#icon-reasoning"></use></svg
                     ></span>
                     <span class="shell-menu-item-copy"
                       ><strong class="control-label" data-i18n="common.reasoning">Reasoning</strong
-                      ><span data-i18n="workspace.reasoningHint">Reasoning trace</span></span
+                      ><span class="reasoning-density-current">Summary</span></span
                     >
-                    <span class="shell-switch" aria-hidden="true"><span></span></span>
-                  </button>
+                    <span
+                      class="reasoning-density-options"
+                      role="radiogroup"
+                      data-i18n-aria-label="reasoning.densityLabel"
+                      aria-label="Reasoning detail"
+                    >
+                      <button
+                        type="button"
+                        role="radio"
+                        data-action="set-reasoning-density"
+                        data-density="summary"
+                        aria-checked="true"
+                        tabindex="0"
+                        data-i18n="reasoning.summary"
+                      >
+                        Summary
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        data-action="set-reasoning-density"
+                        data-density="normal"
+                        aria-checked="false"
+                        tabindex="-1"
+                        data-i18n="reasoning.normal"
+                      >
+                        Normal
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        data-action="set-reasoning-density"
+                        data-density="verbose"
+                        aria-checked="false"
+                        tabindex="-1"
+                        data-i18n="reasoning.verbose"
+                      >
+                        Verbose
+                      </button>
+                    </span>
+                  </div>
                   <button
                     id="toggle-auto-debug-btn"
                     class="shell-toggle-item"
@@ -474,6 +508,15 @@
               </div>
             </div>
           </div>
+
+          <aside
+            id="auto-debug-host"
+            class="auto-debug-host"
+            data-i18n-aria-label="autoDebug.regionLabel"
+            aria-label="Auto Debug diagnostics"
+            role="region"
+            hidden
+          ></aside>
 
           <button
             id="jump-to-latest"

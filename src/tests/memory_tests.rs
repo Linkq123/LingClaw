@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -57,6 +57,234 @@ fn queue_test_config() -> Config {
         enable_task_plan: true,
         enable_groups: true,
     }
+}
+
+struct MemoryProviderTestGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MemoryProviderTestGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn spawn_memory_provider_for_test(content: &str) -> (String, MemoryProviderTestGuard) {
+    let content = Arc::new(content.to_string());
+    let app = axum::Router::new()
+        .route(
+            "/chat/completions",
+            axum::routing::post(
+                |axum::extract::State(content): axum::extract::State<Arc<String>>| async move {
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": content.as_str()}}],
+                        "usage": {"prompt_tokens": 17, "completion_tokens": 9}
+                    }))
+                },
+            ),
+        )
+        .with_state(content);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Memory Provider listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("Memory Provider listener should have an address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (
+        format!("http://{address}"),
+        MemoryProviderTestGuard { handle },
+    )
+}
+
+fn memory_usage_test_session(id: &str, workspace: &std::path::Path) -> crate::Session {
+    crate::Session {
+        id: id.to_string(),
+        name: "Memory Usage Test".to_string(),
+        messages: Vec::new(),
+        created_at: now_epoch_secs(),
+        updated_at: now_epoch_secs(),
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: crate::default_token_usage_source(),
+        output_token_source: crate::default_token_usage_source(),
+        token_usage_day: crate::prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: crate::default_think_level(),
+        show_react: crate::default_show_react(),
+        show_tools: crate::default_show_tools(),
+        show_reasoning: crate::default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: HashSet::new(),
+        subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::empty(now_epoch_secs()),
+        pending_plan: None,
+        version: crate::SESSION_VERSION,
+        workspace: workspace.to_path_buf(),
+        working_directory: workspace.to_path_buf(),
+        workspace_kind: crate::SessionWorkspaceKind::Managed,
+    }
+}
+
+async fn assert_provider_usage_survives_memory_finish(
+    label: &str,
+    provider_content: &str,
+    force_private_save_failure: bool,
+    expected_error: Option<&str>,
+) {
+    let root = unique_temp_dir(label);
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("isolated workspace should be created");
+    let database_path = root.join("lingclaw.db");
+    let database = crate::storage::Database::open(database_path.clone())
+        .await
+        .expect("isolated database should open");
+    let session_id = format!("{label}-session");
+    let session = memory_usage_test_session(&session_id, &workspace);
+    database
+        .save_session(&session)
+        .await
+        .expect("base Session should persist");
+    let sessions = Arc::new(AsyncMutex::new(HashMap::from([(
+        session_id.clone(),
+        session,
+    )])));
+    let (api_base, _provider_guard) = spawn_memory_provider_for_test(provider_content).await;
+    let mut config = queue_test_config();
+    config.api_base = api_base;
+    config.max_llm_retries = 0;
+    let config = Arc::new(config);
+    let registry = crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true);
+    let permit = registry
+        .permit(
+            &session_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+        )
+        .expect("Memory permit should be available");
+    let operation_id = format!("{label}-provider-usage");
+    let request = MemoryUpdateRequest {
+        session_id: session_id.clone(),
+        usage_operation_id: operation_id.clone(),
+        auxiliary_permit: permit.clone(),
+        workspace: workspace.clone(),
+        model: config.model.clone(),
+        config,
+        conversation_excerpt: vec![crate::ChatMessage {
+            role: "user".to_string(),
+            content: Some("Remember this durable preference".to_string()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        }],
+        usage_database: Some(database.clone()),
+        post_provider_gate: None,
+        post_usage_gate: None,
+        force_private_save_failure,
+    };
+    let status = Arc::new(Mutex::new(MemoryQueueStatusSnapshot {
+        state: "idle".to_string(),
+        ..Default::default()
+    }));
+    let task = registry
+        .spawn(permit, {
+            let status = Arc::clone(&status);
+            let sessions = Arc::clone(&sessions);
+            move |task_context| async move {
+                execute_memory_update_request(
+                    request,
+                    status,
+                    sessions,
+                    CancellationToken::new(),
+                    task_context,
+                )
+                .await;
+            }
+        })
+        .expect("Memory task should be supervised");
+    task.wait().await.expect("Memory task should finish");
+
+    let status = status.lock().expect("Memory status lock").clone();
+    match expected_error {
+        Some(expected) => {
+            assert_eq!(status.failed, 1);
+            assert_eq!(status.succeeded, 0);
+            assert!(
+                status
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected)),
+                "unexpected Memory error: {:?}",
+                status.last_error
+            );
+            assert!(!workspace.join(MEMORY_FILE_NAME).exists());
+            let audit = read_recent_memory_audit(&workspace, 1);
+            assert_eq!(
+                audit.last().map(|record| record.status.as_str()),
+                Some("error")
+            );
+        }
+        None => {
+            assert_eq!(status.succeeded, 1);
+            assert_eq!(status.failed, 0);
+        }
+    }
+
+    let today = crate::prompts::current_local_snapshot().today();
+    let usage = database
+        .load_usage_snapshot(&session_id, &today)
+        .await
+        .expect("Usage should load")
+        .expect("Provider success should persist Usage");
+    assert_eq!((usage.total_input, usage.total_output), (17, 9));
+    assert_eq!(
+        crate::session_store::persist_auxiliary_usage_update_with_database(
+            database.clone(),
+            Arc::clone(&sessions),
+            session_id.clone(),
+            operation_id,
+            UsageUpdate {
+                input_tokens: 999,
+                output_tokens: 999,
+                input_source: "provider".to_string(),
+                output_source: "provider".to_string(),
+                labels: HashMap::new(),
+            },
+        )
+        .await
+        .expect("duplicate Usage marker lookup should succeed"),
+        crate::storage::AuxiliaryUsageApplyOutcome::Duplicate
+    );
+
+    database
+        .close_for_test()
+        .await
+        .expect("database should close");
+    let reopened = crate::storage::Database::open(database_path)
+        .await
+        .expect("database should reopen");
+    let reloaded = reopened
+        .load_usage_snapshot(&session_id, &today)
+        .await
+        .expect("reloaded Usage should load")
+        .expect("reloaded Usage should exist");
+    assert_eq!((reloaded.total_input, reloaded.total_output), (17, 9));
+    reopened
+        .close_for_test()
+        .await
+        .expect("reopened database should close");
+    std::fs::remove_dir_all(&root).expect("isolated Memory test root should be removable");
 }
 
 #[test]
@@ -386,9 +614,11 @@ fn test_memory_runtime_status_unavailable_without_queue() {
 
 #[tokio::test]
 async fn test_memory_queue_replace_config_updates_runtime_snapshot() {
+    let auxiliary_tasks = crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true);
     let queue = MemoryUpdateQueue::spawn(
         queue_test_config(),
         Arc::new(AsyncMutex::new(HashMap::new())),
+        auxiliary_tasks,
     );
 
     let mut new_config = queue_test_config();
@@ -406,21 +636,62 @@ async fn test_memory_queue_replace_config_updates_runtime_snapshot() {
 }
 
 #[tokio::test]
+async fn provider_usage_survives_invalid_memory_json_and_is_idempotent() {
+    assert_provider_usage_survives_memory_finish(
+        "memory-invalid-json-usage",
+        r#"{"update_facts":["unterminated""#,
+        false,
+        Some("parse LLM response"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn provider_usage_survives_private_memory_save_failure() {
+    assert_provider_usage_survives_memory_finish(
+        "memory-save-failure-usage",
+        r#"{"update_facts":[{"key":"durable","value":"yes"}],"delete_facts":[]}"#,
+        true,
+        Some("injected structured memory save failure"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn empty_memory_provider_response_still_persists_usage() {
+    assert_provider_usage_survives_memory_finish("memory-empty-response-usage", "   ", false, None)
+        .await;
+}
+
+#[tokio::test]
 async fn test_memory_request_keeps_trigger_config_after_queue_reload() {
     let mut trigger_config = queue_test_config();
     trigger_config.api_base = "https://trigger.example/v1".to_string();
     trigger_config.api_key = "trigger-key".to_string();
     let trigger_config = Arc::new(trigger_config);
+    let auxiliary_tasks = crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true);
     let request = MemoryUpdateRequest {
         session_id: "memory-config-snapshot".to_string(),
+        usage_operation_id: "memory-config-snapshot-usage".to_string(),
+        auxiliary_permit: auxiliary_tasks
+            .permit(
+                "memory-config-snapshot",
+                crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+            )
+            .expect("memory task permit"),
         workspace: PathBuf::from("memory-config-snapshot"),
         model: "openai/trigger-model".to_string(),
         config: Arc::clone(&trigger_config),
         conversation_excerpt: Vec::new(),
+        usage_database: None,
+        post_provider_gate: None,
+        post_usage_gate: None,
+        force_private_save_failure: false,
     };
     let queue = MemoryUpdateQueue::spawn(
         (*trigger_config).clone(),
         Arc::new(AsyncMutex::new(HashMap::new())),
+        auxiliary_tasks,
     );
 
     let mut reloaded_config = queue_test_config();
@@ -442,9 +713,11 @@ async fn test_memory_request_keeps_trigger_config_after_queue_reload() {
 
 #[tokio::test]
 async fn test_memory_queue_shutdown_cancels_runtime_loop() {
+    let auxiliary_tasks = crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true);
     let queue = MemoryUpdateQueue::spawn(
         queue_test_config(),
         Arc::new(AsyncMutex::new(HashMap::new())),
+        auxiliary_tasks,
     );
 
     queue.shutdown();

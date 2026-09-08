@@ -29,6 +29,7 @@ function taskPlanStatusText(status: string): string {
 function syncTaskPlanPresentation(panel: HTMLElement): void {
   const status = panel.dataset.taskPlanStatus || 'active';
   const localizedStatus = taskPlanStatusText(status);
+  let goal = panel.dataset.executionObject || '';
   panel.dataset.toolName = tr('execution.taskPlan');
   panel.dataset.toolStatus = localizedStatus;
   try {
@@ -39,6 +40,7 @@ function syncTaskPlanPresentation(panel: HTMLElement): void {
       intent: plan.intent,
     });
     panel.dataset.toolResult = renderPlanDetail(plan, status);
+    goal = plan.goal;
   } catch {
     // Preserve the last valid inspector content if a legacy panel has no raw plan data.
   }
@@ -46,6 +48,11 @@ function syncTaskPlanPresentation(panel: HTMLElement): void {
   const statusEl = panel.querySelector<HTMLElement>('.tool-status');
   if (nameEl) nameEl.textContent = tr('execution.taskPlan');
   if (statusEl) statusEl.textContent = localizedStatus;
+  panel.dataset.executionAction = tr('execution.prepareOutline');
+  panel.dataset.executionObject = goal;
+  panel.dataset.executionResult = localizedStatus;
+  panel.dataset.executionState =
+    status === 'complete' ? 'completed' : status === 'stale' ? 'skipped' : 'running';
   if (state.activeToolPanel === panel) syncToolDrawer(panel);
 }
 
@@ -109,6 +116,10 @@ function updatePanel(panel: HTMLElement, event: TaskPlanEvent): void {
   panel.dataset.toolResult = renderPlanDetail(event.plan);
   panel.dataset.toolHasResult = 'true';
   panel.dataset.toolStatus = taskPlanStatusText(event.plan.status || 'active');
+  panel.dataset.executionAction = tr('execution.prepareOutline');
+  panel.dataset.executionObject = event.plan.goal;
+  panel.dataset.executionResult = panel.dataset.toolStatus;
+  panel.dataset.executionState = event.plan.status === 'complete' ? 'completed' : 'running';
   panel.className = `tool-panel tool-panel-ready task-plan-panel task-plan-${event.plan.status || 'active'}`;
   panel.innerHTML = `
     <button type="button" class="tool-header task-plan-header" data-action="open-tool-drawer" aria-haspopup="dialog">

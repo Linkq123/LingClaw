@@ -376,6 +376,99 @@ describe('workspace shell', () => {
     styleElement.remove();
   });
 
+  it('keeps desktop, 200% effective viewport and 390px layouts reviewable', () => {
+    const zoomedStyle = document.createElement('style');
+    zoomedStyle.textContent = cssForMediaEnvironment(appCss, {
+      // A 1440px desktop viewport at 200% zoom exposes about 720 CSS pixels.
+      width: 720,
+      colorScheme: 'light',
+      reducedMotion: true,
+      hover: 'none',
+      pointer: 'coarse',
+    });
+    const stack = document.createElement('section');
+    stack.className = 'execution-stack';
+    stack.innerHTML = `
+      <div class="execution-stack-meta"></div>
+      <div class="execution-stack-recovery">
+        <button class="execution-stack-recovery-action"></button>
+      </div>
+      <div class="execution-stack-body">
+        <div class="execution-step">
+          <div class="subagent-reasoning-body">${'Long reasoning '.repeat(80)}</div>
+          <div class="subagent-prompt">${'Long prompt '.repeat(80)}</div>
+          <div class="subagent-preview">${'Long preview '.repeat(80)}</div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(stack);
+
+    (document.getElementById('mobile-navigation-toggle') as HTMLElement).className =
+      'mobile-navigation-toggle';
+    (stateModule.dom.sessionDrawer as HTMLElement).className = 'session-drawer';
+
+    const desktopStyle = document.createElement('style');
+    desktopStyle.textContent = cssForMediaEnvironment(appCss, {
+      width: 1440,
+      colorScheme: 'light',
+      reducedMotion: false,
+      hover: 'hover',
+      pointer: 'fine',
+    });
+    document.head.appendChild(desktopStyle);
+    expect(
+      getComputedStyle(document.getElementById('mobile-navigation-toggle') as HTMLElement).display,
+    ).toBe('none');
+    expect(getComputedStyle(stateModule.dom.sessionDrawer as HTMLElement).position).toBe(
+      'relative',
+    );
+    expect(
+      getComputedStyle(stack.querySelector('.execution-stack-meta') as HTMLElement).display,
+    ).not.toBe('none');
+    desktopStyle.remove();
+
+    document.head.appendChild(zoomedStyle);
+
+    expect(
+      getComputedStyle(document.getElementById('mobile-navigation-toggle') as HTMLElement).display,
+    ).toBe('grid');
+    expect(getComputedStyle(stateModule.dom.sessionDrawer as HTMLElement).position).toBe('fixed');
+    expect(
+      getComputedStyle(stack.querySelector('.execution-stack-meta') as HTMLElement).display,
+    ).toBe('none');
+    expect(
+      getComputedStyle(stack.querySelector('.execution-stack-recovery') as HTMLElement)
+        .flexDirection,
+    ).toBe('column');
+    expect(
+      getComputedStyle(stack.querySelector('.execution-stack-recovery-action') as HTMLElement)
+        .minHeight,
+    ).toBe('44px');
+    expect(
+      getComputedStyle(stack.querySelector('.execution-stack-body') as HTMLElement).overflowY,
+    ).toBe('auto');
+    for (const detail of stack.querySelectorAll<HTMLElement>(
+      '.subagent-reasoning-body, .subagent-prompt, .subagent-preview',
+    )) {
+      expect(getComputedStyle(detail).maxHeight).toBe('none');
+      expect(getComputedStyle(detail).overflowY).toBe('visible');
+    }
+    expect(zoomedStyle.textContent).toMatch(
+      /\.execution-stack[\s\S]*?(?:animation|transition): none !important/,
+    );
+    zoomedStyle.remove();
+
+    const narrowCss = cssForMediaEnvironment(appCss, {
+      width: 390,
+      colorScheme: 'dark',
+      reducedMotion: true,
+      hover: 'none',
+      pointer: 'coarse',
+    });
+    expect(narrowCss).toMatch(/\.workspace-header\s*\{[^}]*padding-inline: 9px/);
+    expect(narrowCss).toMatch(/\.reasoning-density-options\s*\{[^}]*grid-template-columns: 1fr/);
+  });
+
   it('evaluates non-width media features and comma-separated alternatives', () => {
     const css = cssForMediaEnvironment(
       `
@@ -418,7 +511,14 @@ describe('workspace shell', () => {
   });
 
   it('uses accessible welcome contrast and collapsed sidebar inspector width', () => {
-    expect(workspaceCss).toContain('--welcome-muted: #6c7184;');
+    expect(workspaceCss).toContain('--welcome-muted: #706964;');
+    expect(workspaceCss).toContain('--color-action: #8f4058;');
+    expect(workspaceCss).toContain('--color-selected: #7c4b57;');
+    expect(workspaceCss).toContain('--color-focus: #72404f;');
+    expect(workspaceCss).toContain('--color-running: #8b6026;');
+    expect(workspaceCss).toContain('--color-plan: #765b2d;');
+    expect(workspaceCss).toContain('--color-info: #356b82;');
+    expect(workspaceCss).not.toContain('#6554d9');
     expect(workspaceCss).toMatch(/\.welcome-hint \{[\s\S]*?color: var\(--welcome-muted\);/);
     expect(workspaceCss).toMatch(
       /\.app-shell:has\(\.session-drawer\.is-collapsed\):has\(\.tool-drawer\.open\)[\s\S]*?var\(--workspace-sidebar-collapsed\)/,
@@ -495,6 +595,44 @@ describe('workspace shell', () => {
     );
     expect(indexHtml).toMatch(
       /id="composer-model-btn"[\s\S]*?aria-expanded="false"[\s\S]*?aria-haspopup="dialog"[\s\S]*?aria-controls="composer-model-popup"/,
+    );
+  });
+
+  it('exposes three keyboard-accessible reasoning densities and an out-of-timeline debug host', () => {
+    expect(indexHtml.match(/data-action="set-reasoning-density"/g)).toHaveLength(3);
+    expect(indexHtml).toContain('data-density="summary"');
+    expect(indexHtml).toContain('data-density="normal"');
+    expect(indexHtml).toContain('data-density="verbose"');
+    expect(indexHtml).toMatch(/class="reasoning-density-options"[\s\S]*?role="radiogroup"/);
+    expect(indexHtml).toMatch(
+      /data-density="summary"[\s\S]*?aria-checked="true"[\s\S]*?tabindex="0"/,
+    );
+    expect(indexHtml.match(/aria-checked="false"[\s\S]*?tabindex="-1"/g)).toHaveLength(2);
+    expect(mainSource).toContain('reasoningDensityForNavigationKey');
+    expect(indexHtml).toContain('id="auto-debug-host"');
+    expect(indexHtml).toMatch(/<\/div>\s*<aside\s+id="auto-debug-host"/);
+    expect(indexHtml).toMatch(/id="auto-debug-host"[^>]*role="region"/);
+    expect(indexHtml).not.toMatch(/id="auto-debug-host"[^>]*aria-live=/);
+  });
+
+  it('docks Auto Debug in layout without overlaying the composer at responsive widths', () => {
+    const debugIndex = indexHtml.indexOf('id="auto-debug-host"');
+    const inputIndex = indexHtml.indexOf('id="input-area"');
+    expect(debugIndex).toBeGreaterThan(0);
+    expect(inputIndex).toBeGreaterThan(debugIndex);
+
+    const baseRule = workspaceCss.match(/\.auto-debug-host\s*\{([^}]*)\}/)?.[1] || '';
+    expect(baseRule).toContain('position: relative');
+    expect(baseRule).toContain('flex: 0 0 auto');
+    expect(baseRule).toMatch(/max-height:\s*min\(30dvh,\s*300px\)/);
+    expect(baseRule).not.toMatch(/position:\s*(?:absolute|fixed)/);
+    expect(baseRule).not.toMatch(/(?:bottom|inset):/);
+
+    expect(workspaceCss).toMatch(
+      /@media \(max-width: 768px\)[\s\S]*?\.auto-debug-host\s*\{[\s\S]*?max-height:\s*min\(26dvh,\s*240px\)/,
+    );
+    expect(workspaceCss).not.toMatch(
+      /@media \(max-width: 768px\)[\s\S]*?\.auto-debug-host\s*\{[^}]*position:\s*(?:absolute|fixed)/,
     );
   });
 

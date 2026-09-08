@@ -279,6 +279,7 @@ describe('group sessions', () => {
     stateModule.state.pendingImages = [];
     stateModule.state.planModeEnabled = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send, stopAgent } = await import('../src/input.js');
     stateModule.dom.input!.value = 'check backend';
     send();
@@ -338,6 +339,7 @@ describe('group sessions', () => {
     stateModule.state.groupTargetMode = 'all';
     stateModule.state.pendingImages = [];
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send, sendCmd } = await import('../src/input.js');
     stateModule.dom.input!.value = '/status';
     send();
@@ -372,6 +374,7 @@ describe('group sessions', () => {
     stateModule.state.groupModelConfiguredMembers = new Set(['worker-a']);
     stateModule.state.pendingImages = [];
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     stateModule.dom.input!.value = 'run configured target';
     send();

@@ -43,6 +43,18 @@ static GROUP_RUN_CONTROLS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<String, GroupRunControlEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
+#[cfg(test)]
+#[derive(Clone)]
+struct SessionDeleteWorkspaceCleanupTestGate {
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static SESSION_DELETE_WORKSPACE_CLEANUP_TEST_GATES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, SessionDeleteWorkspaceCleanupTestGate>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 const DIRECT_RUN_RETAIN_SECS: u64 = 10 * 60;
 
 fn storage_protected_control_error() -> String {
@@ -1674,11 +1686,47 @@ pub(crate) async fn session_control_lock(
     state: &AppState,
     session_id: &str,
 ) -> Arc<tokio::sync::Mutex<()>> {
+    let session_key = session_control_key(session_id);
     let mut locks = state.session_control_locks.lock().await;
     locks
-        .entry(session_id.to_string())
+        .entry(session_key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+fn session_control_key(session_id: &str) -> String {
+    if cfg!(windows) {
+        session_id.to_ascii_lowercase()
+    } else {
+        session_id.to_string()
+    }
+}
+
+#[cfg(test)]
+fn install_session_delete_workspace_cleanup_test_gate(
+    session_id: &str,
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) {
+    SESSION_DELETE_WORKSPACE_CLEANUP_TEST_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            session_control_key(session_id),
+            SessionDeleteWorkspaceCleanupTestGate { reached, release },
+        );
+}
+
+#[cfg(test)]
+async fn wait_for_session_delete_workspace_cleanup_test_gate(session_id: &str) {
+    let gate = SESSION_DELETE_WORKSPACE_CLEANUP_TEST_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&session_control_key(session_id));
+    if let Some(gate) = gate {
+        gate.reached.notify_one();
+        gate.release.notified().await;
+    }
 }
 
 async fn wait_until_session_idle(state: &AppState, session_id: &str, cancel: &CancellationToken) {
@@ -4110,6 +4158,40 @@ pub(crate) async fn delete_session_with_safety_checks(
         ));
     }
 
+    // Close registration before taking the Session persist gate, then cancel
+    // and await every exact-lifetime Memory/Reflection task. An auxiliary task
+    // may already be waiting for the persist gate after a successful Provider
+    // call, so reversing this order would deadlock deletion. The closure
+    // reopens automatically on every pre-delete failure.
+    let auxiliary_closure = state
+        .auxiliary_tasks
+        .begin_session_close(&target_session_id)
+        .await;
+    if state
+        .active_connections
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+    {
+        return Err(format!("Cannot delete active session: {target_session_id}"));
+    }
+    if state
+        .active_runs
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+        || session_has_active_delegated_work(&target_session_id)
+    {
+        return Err(format!(
+            "Cannot delete running session: {target_session_id}"
+        ));
+    }
+    if !auxiliary_closure.still_owns_closed_lifetime() {
+        return Err(format!(
+            "Cannot delete session {target_session_id}: its lifecycle changed during deletion."
+        ));
+    }
+
     // Session writers (including `/think`, the Composer model picker and
     // config-reload Effort normalization) all serialize through this gate.
     // Hold it until both SQLite and the in-memory map no longer contain the
@@ -4117,6 +4199,35 @@ pub(crate) async fn delete_session_with_safety_checks(
     // row and a late writer observes `session_not_found` instead.
     let persist_gate = session_store::session_persist_gate(&target_session_id);
     let session_persist_guard = persist_gate.lock().await;
+
+    // A reconnect/explicit recreation that was already queued on the persist
+    // gate can reactivate the exact Session allocation while deletion drains
+    // auxiliary work. Revalidate only after this delete owns the gate: an old
+    // closure must never authorize removal of the replacement lifetime.
+    if !auxiliary_closure.still_owns_closed_lifetime() {
+        return Err(format!(
+            "Cannot delete session {target_session_id}: its lifecycle changed during deletion."
+        ));
+    }
+    if state
+        .active_connections
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+    {
+        return Err(format!("Cannot delete active session: {target_session_id}"));
+    }
+    if state
+        .active_runs
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+        || session_has_active_delegated_work(&target_session_id)
+    {
+        return Err(format!(
+            "Cannot delete running session: {target_session_id}"
+        ));
+    }
 
     let workspace_root = session_store::session_workspace_root_for_delete(&target_session_id)?;
     let saved_sessions =
@@ -4224,7 +4335,10 @@ pub(crate) async fn delete_session_with_safety_checks(
         let mut sessions = state.sessions.lock().await;
         sessions.remove(&target_session_id).is_some()
     };
+    auxiliary_closure.commit();
     drop(session_persist_guard);
+    #[cfg(test)]
+    wait_for_session_delete_workspace_cleanup_test_gate(&target_session_id).await;
     #[cfg(not(test))]
     let mut group_notifications_incomplete = false;
     #[cfg(test)]

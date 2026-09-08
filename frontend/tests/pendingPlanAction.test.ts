@@ -25,6 +25,7 @@ import {
 import { syncComposerAvailability } from '../src/composerAvailability.js';
 import { setLanguage } from '../src/i18n.js';
 import { dom, state } from '../src/state.js';
+import { prepareComposerTransportFixture } from './composerTransportFixture.js';
 
 function mountDom() {
   document.body.innerHTML = `
@@ -82,6 +83,7 @@ describe('pending plan action', () => {
       readyState: WebSocket.OPEN,
       send: vi.fn(),
     } as unknown as WebSocket;
+    prepareComposerTransportFixture();
   });
 
   afterEach(() => {
@@ -646,6 +648,13 @@ describe('pending plan action', () => {
     expect(document.querySelector('.plan-artifact-card')?.textContent).toContain(
       'ROUND2-V2-REFRESH',
     );
+    const contract = document.querySelector<HTMLDetailsElement>('.plan-contract-details');
+    expect(contract?.open).toBe(false);
+    expect(contract?.querySelector(':scope > summary')?.textContent).toBe(
+      'Contract details · 5 items',
+    );
+    expect(document.querySelector('.plan-card-eyebrow')?.textContent).toBe('Formal Plan · v1');
+    expect(contract?.contains(document.querySelector('[data-action="execute-plan"]'))).toBe(false);
 
     await copyPlan();
 
@@ -791,6 +800,8 @@ describe('pending plan action', () => {
     });
     executeStalePlan();
 
+    expect(state.pendingPlanExecutionId).toBe(revisionTwo.plan_id);
+
     expect(state.ws?.send).toHaveBeenLastCalledWith(
       JSON.stringify({
         plan_action: {
@@ -871,6 +882,7 @@ describe('pending plan action', () => {
     });
 
     resumePlan();
+    expect(state.pendingPlanExecutionId).toBe('plan_stale_resume');
     handlePlanStale({
       plan_id: 'plan_stale_resume',
       revision: 3,
@@ -880,6 +892,8 @@ describe('pending plan action', () => {
     expect(document.querySelector('.plan-stale-notice code')?.textContent).toBe('src/main.rs');
     expect(document.querySelector('[data-action="plan-execute-stale"]')).not.toBeNull();
     executeStalePlan();
+
+    expect(state.pendingPlanExecutionId).toBe('plan_stale_resume');
 
     expect(state.ws?.send).toHaveBeenLastCalledWith(
       JSON.stringify({
@@ -1306,6 +1320,40 @@ describe('pending plan action', () => {
       expect(document.querySelector('[data-action="plan-copy"]')).not.toBeNull();
     },
   );
+
+  it('removes pending questions and recovery actions only after authoritative discard state', () => {
+    const plan = {
+      plan_id: 'plan_authoritative_discard',
+      revision: 1,
+      status: 'needs_input' as const,
+      message_index: 2,
+      created_at: 1710000000,
+      updated_at: 1710000001,
+      artifact: {
+        title: 'Choose before discard',
+        goal: 'Wait for a server-owned terminal state',
+        steps: [{ id: 'choose', title: 'Choose an implementation' }],
+        questions: [{ id: 'strategy', prompt: 'Which strategy should be used?' }],
+      },
+      progress: [{ id: 'choose', title: 'Choose an implementation', status: 'pending' as const }],
+    };
+    renderPlanState(plan);
+
+    expect(document.querySelector('.plan-questions')).not.toBeNull();
+    expect(document.querySelector('[data-action="plan-submit-feedback"]')).not.toBeNull();
+
+    renderPlanState({
+      ...plan,
+      status: 'discarded',
+      updated_at: 1710000002,
+    });
+
+    expect(document.querySelector('.plan-questions')).toBeNull();
+    expect(document.querySelector('[data-action="plan-submit-feedback"]')).toBeNull();
+    const card = document.querySelector<HTMLElement>('.plan-artifact-card');
+    expect(card?.classList.contains('is-discarded')).toBe(true);
+    expect(card?.textContent).toContain('Discarded');
+  });
 
   it('locks the Plan marker while an unresolved plan is active', () => {
     const plan = {

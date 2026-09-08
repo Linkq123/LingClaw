@@ -9,6 +9,7 @@ export const CONSOLE_TRANSITION_CLASSES = {
 } as const;
 
 interface ViewTransitionLike {
+  ready?: Promise<unknown>;
   finished?: Promise<unknown>;
   updateCallbackDone?: Promise<unknown>;
 }
@@ -268,13 +269,16 @@ class ConsoleTransitionControllerImpl implements ConsoleTransitionController {
       applied = true;
     });
 
-    await (transition.updateCallbackDone ?? Promise.resolve());
-    if (applied && this.isGenerationCurrent(generation)) {
-      this.focusForSurface(surface, request);
-    }
-
     try {
-      await (transition.finished ?? Promise.resolve());
+      // Attach observers to all native promises immediately. `ready` can reject
+      // during capture while updateCallbackDone and finished still resolve.
+      const update = Promise.all([
+        transition.updateCallbackDone ?? Promise.resolve(),
+        transition.ready ?? Promise.resolve(),
+      ]).then(() => {
+        if (applied && this.isGenerationCurrent(generation)) this.focusForSurface(surface, request);
+      });
+      await Promise.all([update, transition.finished ?? Promise.resolve()]);
     } finally {
       if (this.isGenerationCurrent(generation)) this.clearTransitionClasses();
     }

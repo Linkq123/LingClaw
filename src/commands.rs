@@ -18,7 +18,7 @@ use crate::{
         build_compression_call_prompt, estimate_summary_output_tokens, extract_existing_summary,
     },
     memory, now_epoch, prompts, providers,
-    runtime_loop::{ensure_session_ready, resolve_session_target_for_command},
+    runtime_loop::resolve_session_target_for_command,
     session_admin::gather_global_today_usage,
     session_store::{
         SessionSummary, build_session_status, build_usage_report,
@@ -837,19 +837,16 @@ async fn handle_switch_command(
         );
     }
 
-    match ensure_session_ready(state, Some(&target_session_id)).await {
-        Ok((session_id, created_fresh)) => {
-            let mut result = command_result_with_session_switch(
-                format!("Switching to session: {session_id}"),
-                "system",
-                true,
-                session_id,
-            );
-            result.session_list_changed = created_fresh;
-            result
-        }
-        Err(err) => command_result(err, "error", false),
-    }
+    // Creating or reloading the target must remain serialized with deletion and
+    // connection binding. `switch_socket_session` owns the canonical target
+    // control lock across that entire operation; doing readiness work here would
+    // reopen the target between a committed delete and its workspace cleanup.
+    command_result_with_session_switch(
+        format!("Switching to session: {target_session_id}"),
+        "system",
+        true,
+        target_session_id,
+    )
 }
 
 async fn handle_model_command(

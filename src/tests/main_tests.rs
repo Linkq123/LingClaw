@@ -380,6 +380,7 @@ fn test_app_state() -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     }
 }
@@ -401,6 +402,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     }
 }
@@ -454,7 +456,7 @@ async fn sync_memory_queue_hot_toggles_structured_memory_runtime() {
 
     let mut enabled = test_config();
     enabled.structured_memory = true;
-    state.sync_memory_queue(&enabled);
+    state.sync_memory_queue(&enabled).await;
 
     let queue = state
         .memory_queue()
@@ -465,9 +467,65 @@ async fn sync_memory_queue_hot_toggles_structured_memory_runtime() {
 
     let mut disabled = enabled;
     disabled.structured_memory = false;
-    state.sync_memory_queue(&disabled);
+    state.sync_memory_queue(&disabled).await;
 
     assert!(state.memory_queue().is_none());
+}
+
+#[tokio::test]
+async fn disabling_structured_memory_waits_for_registered_memory_work() {
+    let state = Arc::new(test_app_state());
+    let permit = state
+        .auxiliary_tasks
+        .permit(
+            "memory-disable-drain",
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+        )
+        .expect("Memory permit should be available");
+    let cancelled = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let private_write_authorized = Arc::new(AtomicBool::new(true));
+    let worker = state
+        .auxiliary_tasks
+        .spawn(permit.clone(), {
+            let cancelled = Arc::clone(&cancelled);
+            let release = Arc::clone(&release);
+            let private_write_authorized = Arc::clone(&private_write_authorized);
+            move |task_context| async move {
+                task_context.cancelled().await;
+                cancelled.notify_one();
+                release.notified().await;
+                private_write_authorized.store(
+                    task_context.begin_private_write().is_some(),
+                    Ordering::Release,
+                );
+            }
+        })
+        .expect("Memory worker should be registered");
+
+    let disable_state = Arc::clone(&state);
+    let mut disabled = test_config();
+    disabled.structured_memory = false;
+    let mut disable = tokio::spawn(async move {
+        disable_state.sync_memory_queue(&disabled).await;
+    });
+    cancelled.notified().await;
+    let disable_waited = !disable.is_finished();
+    let stale_permit_rejected = state.auxiliary_tasks.spawn(permit, |_| async {}).is_err();
+
+    release.notify_one();
+    worker.wait().await.expect("Memory worker should finish");
+    (&mut disable)
+        .await
+        .expect("Memory hot-disable should finish");
+
+    assert!(disable_waited, "feature disable must drain active work");
+    assert!(stale_permit_rejected, "old feature permits must stay stale");
+    assert!(
+        !private_write_authorized.load(Ordering::Acquire),
+        "a disabled feature cycle must reject a not-yet-started private write"
+    );
+    assert_eq!(state.auxiliary_tasks.task_count(), 0);
 }
 
 fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
@@ -688,6 +746,8 @@ fn replay_live_round_replays_compression_before_assistant_delta() {
             session_id.clone(),
             LiveRoundState {
                 connection_id: 1,
+                run_id: String::new(),
+                run_started_at_ms: 0,
                 round: 1,
                 react_visible: true,
                 phase: Some("analyze".into()),
@@ -859,6 +919,54 @@ fn replay_group_member_live_round_wraps_running_member_events() {
             .iter()
             .any(|event| event["event"]["type"] == "thinking_delta")
     );
+}
+
+#[test]
+fn terminal_run_status_preserves_server_authoritative_outcome_classes() {
+    for (event_type, event, expected) in [
+        (
+            "done",
+            json!({"phase":"finish", "reason":"complete"}),
+            "completed",
+        ),
+        (
+            "done",
+            json!({"phase":"failed", "reason":"provider_error"}),
+            "failed",
+        ),
+        (
+            "done",
+            json!({"phase":"blocked", "reason":"blocked"}),
+            "blocked",
+        ),
+        (
+            "done",
+            json!({"phase":"waiting_user", "reason":"needs_input"}),
+            "waiting_user",
+        ),
+        (
+            "done",
+            json!({"phase":"stopped", "reason":"user_stop"}),
+            "stopped",
+        ),
+        (
+            "done",
+            json!({"phase":"hard_cap", "reason":"hard_cap"}),
+            "incomplete",
+        ),
+        (
+            "done",
+            json!({"phase":"partial", "reason":"partial"}),
+            "partial",
+        ),
+        (
+            "error",
+            json!({"run_terminal":true, "code":"provider_error"}),
+            "failed",
+        ),
+    ] {
+        assert_eq!(terminal_run_status(event_type, &event), expected);
+    }
 }
 
 #[test]
@@ -6055,6 +6163,10 @@ async fn api_client_config_returns_upload_token_and_s3_identity() {
     assert_eq!(payload["upload_token"], state.upload_token);
     assert_eq!(payload["s3_config_id"], expected_s3_config_id);
     assert_eq!(payload["features"]["groups"], true);
+    assert_eq!(
+        payload["protocols"]["execution_identity"],
+        EXECUTION_IDENTITY_PROTOCOL_VERSION
+    );
 }
 
 #[tokio::test]
@@ -6071,6 +6183,10 @@ async fn api_client_config_reports_groups_disabled_without_exposing_secrets() {
         .expect("local request should be accepted");
 
     assert_eq!(payload["features"]["groups"], false);
+    assert_eq!(
+        payload["protocols"]["execution_identity"],
+        EXECUTION_IDENTITY_PROTOCOL_VERSION
+    );
     assert!(!payload.to_string().contains("must-not-leak"));
 }
 
@@ -11522,6 +11638,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
         .collect::<Vec<_>>();
 
     assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[0]["run_connection_id"], "1");
     assert_eq!(replayed[0]["round"], 3);
     assert_eq!(replayed[0]["phase"], "act");
     assert_eq!(replayed[0]["cycle"], 2);
@@ -11568,6 +11685,328 @@ fn replay_live_round_rehydrates_inflight_round_state() {
         rt.block_on(state.live_rounds.lock())
             .get(&session_id)
             .is_none()
+    );
+}
+
+#[test]
+fn live_replay_keeps_nonterminal_errors_and_removes_only_terminal_errors() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-nonterminal-error-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "analyze",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+
+    for event in [
+        json!({
+            "type": "error",
+            "run_terminal": false,
+            "content": "A busy command failed while the run continued.",
+        }),
+        json!({
+            "type": "error",
+            "content": "A legacy error without terminal metadata is nonterminal.",
+        }),
+    ] {
+        rt.block_on(dispatch_live_event(&state, &session_id, 1, event));
+        assert!(
+            rt.block_on(state.live_rounds.lock())
+                .contains_key(&session_id),
+            "nonterminal or unclassified errors must retain live replay state"
+        );
+    }
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(4);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+    let replayed = rt
+        .block_on(replay_rx.recv())
+        .expect("the active round should still replay after a nonterminal error");
+    let replayed: serde_json::Value =
+        serde_json::from_str(&replayed).expect("replayed event should be valid json");
+    assert_eq!(replayed["type"], "start");
+    assert_eq!(replayed["round"], 1);
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "error",
+            "run_terminal": true,
+            "content": "The provider failed the top-level run.",
+        }),
+    ));
+    assert!(
+        rt.block_on(state.live_rounds.lock())
+            .get(&session_id)
+            .is_none(),
+        "an explicitly terminal error must close live replay state"
+    );
+}
+
+#[tokio::test]
+async fn storage_protection_watch_cancels_run_and_retires_only_its_matching_live_round() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("storage-watch-{}", now_epoch());
+    let workspace = std::env::temp_dir()
+        .join(format!("lingclaw-storage-watch-{}", now_epoch()))
+        .join("workspace");
+    std::fs::create_dir_all(&workspace).expect("isolated workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let mut session = test_session(&session_id, "Storage Watch", None);
+    session.workspace = workspace.clone();
+    session.working_directory = workspace;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let connection_id = 41;
+    let connection_cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let reservation = runtime_loop::try_reserve_agent_run(
+        &state,
+        &session_id,
+        connection_id,
+        &connection_cancel,
+        &stop_requested,
+    )
+    .await
+    .expect("the direct run should reserve the Session");
+    let matching_run_cancel = state.active_runs.lock().await[&session_id].cancel.clone();
+
+    let newer_session_id = format!("storage-watch-newer-{}", now_epoch());
+    let newer_run_cancel = CancellationToken::new();
+    state.active_runs.lock().await.insert(
+        newer_session_id.clone(),
+        SessionRunBinding {
+            connection_id: 51,
+            cancel: newer_run_cancel.clone(),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+        },
+    );
+    let unrelated_session_id = format!("storage-watch-other-{}", now_epoch());
+    {
+        let mut rounds = state.live_rounds.lock().await;
+        rounds.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id,
+                round: 1,
+                ..Default::default()
+            },
+        );
+        rounds.insert(
+            newer_session_id.clone(),
+            LiveRoundState {
+                connection_id: 52,
+                round: 2,
+                ..Default::default()
+            },
+        );
+        rounds.insert(
+            unrelated_session_id.clone(),
+            LiveRoundState {
+                connection_id: 61,
+                round: 3,
+                ..Default::default()
+            },
+        );
+    }
+
+    let auxiliary_cancelled = Arc::new(tokio::sync::Notify::new());
+    let release_auxiliary = Arc::new(tokio::sync::Notify::new());
+    let private_write_authorized = Arc::new(AtomicBool::new(true));
+    let auxiliary_permit = state
+        .auxiliary_tasks
+        .permit(
+            &session_id,
+            crate::auxiliary_tasks::AuxiliaryTaskKind::Memory,
+        )
+        .expect("storage-watch Session should accept Memory work");
+    let auxiliary_worker = state
+        .auxiliary_tasks
+        .spawn(auxiliary_permit, {
+            let auxiliary_cancelled = Arc::clone(&auxiliary_cancelled);
+            let release_auxiliary = Arc::clone(&release_auxiliary);
+            let private_write_authorized = Arc::clone(&private_write_authorized);
+            move |task_context| async move {
+                task_context.cancelled().await;
+                auxiliary_cancelled.notify_one();
+                release_auxiliary.notified().await;
+                private_write_authorized.store(
+                    task_context.begin_private_write().is_some(),
+                    Ordering::Release,
+                );
+            }
+        })
+        .expect("storage-watch auxiliary task should be supervised");
+
+    let (status_tx, status_rx) = watch::channel(storage::StorageStatus::default());
+    let mut monitor = tokio::spawn(monitor_storage_status(Arc::clone(&state), status_rx));
+    let (live_tx, mut live_rx) = mpsc::channel::<serde_json::Value>(8);
+    let (_inbound_tx, mut inbound_rx) = mpsc::channel::<String>(4);
+    let model_snapshot = session_model_snapshot(&state, &session_id)
+        .await
+        .expect("the test Session should have an explicit model snapshot");
+
+    status_tx
+        .send(storage::StorageStatus {
+            mode: storage::StorageMode::Protected,
+            reason: Some("test storage failure".to_string()),
+        })
+        .expect("the protected transition should reach the watcher");
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        connection_id,
+        &connection_cancel,
+        &live_tx,
+        &mut inbound_rx,
+        &stop_requested,
+        runtime_loop::AgentRunMode::Execute,
+        Some(reservation),
+        Some(model_snapshot),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), auxiliary_cancelled.notified())
+        .await
+        .expect("storage protection should cancel auxiliary work");
+    assert!(
+        !monitor.is_finished(),
+        "storage protection must drain auxiliary work before broadcasting completion"
+    );
+    release_auxiliary.notify_one();
+    auxiliary_worker
+        .wait()
+        .await
+        .expect("auxiliary task should finish");
+    (&mut monitor)
+        .await
+        .expect("storage watcher should finish cleanly");
+
+    assert!(matching_run_cancel.is_cancelled());
+    assert!(newer_run_cancel.is_cancelled());
+    assert!(!stop_requested.load(Ordering::Relaxed));
+    assert!(!outcome.run_failed);
+    assert!(!outcome.run_stopped);
+    assert!(
+        !private_write_authorized.load(Ordering::Acquire),
+        "protected mode must reject a not-yet-started private write"
+    );
+    assert_eq!(state.auxiliary_tasks.task_count(), 0);
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+    assert!(
+        live_rx.try_recv().is_err(),
+        "storage cancellation must not fabricate a terminal event"
+    );
+
+    {
+        let rounds = state.live_rounds.lock().await;
+        assert!(!rounds.contains_key(&session_id));
+        assert_eq!(rounds[&newer_session_id].connection_id, 52);
+        assert_eq!(rounds[&unrelated_session_id].connection_id, 61);
+    }
+    let (replay_tx, mut replay_rx) = mpsc::channel(2);
+    replay_live_round(&replay_tx, &state, &session_id).await;
+    assert!(replay_rx.try_recv().is_err());
+
+    cancel_storage_protected_direct_runs(&state).await;
+    let rounds = state.live_rounds.lock().await;
+    assert_eq!(rounds[&newer_session_id].connection_id, 52);
+    assert_eq!(rounds[&unrelated_session_id].connection_id, 61);
+}
+
+#[test]
+fn terminal_done_after_rebind_is_not_routed_after_terminal_error_closed_replay() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("terminal-rebind-{}", now_epoch());
+    let old_connection_id = 71;
+    let new_connection_id = 72;
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        new_connection_id,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: old_connection_id,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: old_connection_id,
+                round: 1,
+                ..Default::default()
+            },
+        );
+    });
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        old_connection_id,
+        json!({
+            "type":"error",
+            "run_terminal":true,
+            "content":"provider failed"
+        }),
+    ));
+    let error: serde_json::Value = serde_json::from_str(
+        &rt.block_on(bound_rx.recv())
+            .expect("terminal error should route to the rebound client"),
+    )
+    .expect("terminal error should be valid JSON");
+    assert_eq!(error["run_connection_id"], old_connection_id.to_string());
+    assert!(
+        rt.block_on(state.live_rounds.lock())
+            .get(&session_id)
+            .is_none()
+    );
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        old_connection_id,
+        json!({"type":"done","phase":"failed","reason":"failed"}),
+    ));
+    assert!(
+        bound_rx.try_recv().is_err(),
+        "compatibility done must not cross the rebind after replay was closed"
     );
 }
 
@@ -13516,6 +13955,7 @@ fn best_effort_tool_output_preserves_replay_when_writer_queue_is_full() {
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -13614,6 +14054,7 @@ fn best_effort_tool_output_disconnects_slow_client_when_writer_queue_stays_full(
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -13707,6 +14148,7 @@ fn live_dispatch_serializes_normal_events_after_recovered_tool_output_flush() {
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -13812,6 +14254,7 @@ fn best_effort_subagent_tool_output_preserves_orchestration_context_for_replay()
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -13907,6 +14350,7 @@ fn synthetic_delegated_task_does_not_mark_active_without_stored_start_event() {
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -13976,6 +14420,7 @@ fn synthetic_orchestration_keeps_replayable_open_state_when_only_panel_fits() {
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -14072,6 +14517,7 @@ fn best_effort_tool_output_preserves_order_after_writer_queue_recovers() {
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -14183,6 +14629,7 @@ fn best_effort_tool_output_flushes_after_writer_queue_recovers_without_followup_
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -14280,6 +14727,7 @@ fn best_effort_subagent_tool_output_synthesizes_task_started_for_replay() {
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: Some("parent-call-with-independent-id".to_string()),
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -14306,6 +14754,10 @@ fn best_effort_subagent_tool_output_synthesizes_task_started_for_replay() {
         let queued = binding.pending_events.iter().cloned().collect::<Vec<_>>();
         assert_eq!(queued[1]["type"], "task_started");
         assert_eq!(queued[1]["task_id"], "task-1");
+        assert_eq!(
+            queued[1]["parent_tool_call_id"],
+            "parent-call-with-independent-id"
+        );
         assert_eq!(queued[2]["type"], "tool_output");
         assert_eq!(queued[2]["chunk"], "delegated output");
     });
@@ -14317,6 +14769,10 @@ fn best_effort_subagent_tool_output_synthesizes_task_started_for_replay() {
             .expect("live round should exist");
         assert_eq!(round.delegated_events.len(), 2);
         assert_eq!(round.delegated_events[0]["type"], "task_started");
+        assert_eq!(
+            round.delegated_events[0]["parent_tool_call_id"],
+            "parent-call-with-independent-id"
+        );
         assert_eq!(round.delegated_events[1]["type"], "tool_output");
     });
 }
@@ -14422,6 +14878,7 @@ fn best_effort_subagent_tool_output_replays_updated_synthetic_orchestration_to_c
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -14569,6 +15026,7 @@ fn best_effort_subagent_tool_output_grows_synthetic_orchestration_for_new_tasks(
     let (dummy_live_tx, _dummy_live_rx) =
         mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let replay_ctx = LiveOutputReplayCtx {
+        parent_tool_call_id: None,
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
@@ -14742,6 +15200,8 @@ fn dispatch_live_event_allows_live_round_source_after_run_teardown() {
             session_id.clone(),
             LiveRoundState {
                 connection_id: 1,
+                run_id: String::new(),
+                run_started_at_ms: 0,
                 round: 1,
                 react_visible: true,
                 phase: Some("finish".into()),

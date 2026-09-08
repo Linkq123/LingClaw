@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
 mod agent;
+mod auxiliary_tasks;
 mod cli;
 mod commands;
 mod config;
@@ -38,6 +39,7 @@ mod memory;
 mod plan;
 mod prompts;
 mod providers;
+mod run_diagnostics;
 mod runtime_loop;
 mod session_admin;
 mod session_control;
@@ -48,6 +50,7 @@ mod socket_tasks;
 mod storage;
 mod subagents;
 mod todos;
+mod tool_recovery;
 mod tools;
 mod tui;
 
@@ -113,6 +116,7 @@ use std::collections::{HashSet, VecDeque};
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const MAIN_SESSION_ID: &str = "main";
+pub(crate) const EXECUTION_IDENTITY_PROTOCOL_VERSION: u64 = 1;
 
 /// True when `id` denotes the main session, case-insensitively. Main protection
 /// must be uniform across OSes, so this never depends on `cfg!(windows)`.
@@ -260,6 +264,28 @@ struct ChatMessage {
     timestamp: Option<u64>,
 }
 
+/// Server-authoritative terminal fact for one top-level Agent run. These rows
+/// are stored separately from chat messages so a restart can reconstruct the
+/// execution outcome without inventing success from transcript shape.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TopLevelRunOutcome {
+    pub(crate) session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) run_connection_id: String,
+    pub(crate) status: String,
+    pub(crate) phase: String,
+    pub(crate) reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) diagnostic: Option<run_diagnostics::RunDiagnostic>,
+    pub(crate) duration_ms: u64,
+    pub(crate) start_message_index: usize,
+    pub(crate) end_message_index: usize,
+    pub(crate) plan_id: Option<String>,
+    pub(crate) plan_revision: Option<u32>,
+    pub(crate) started_at: u64,
+    pub(crate) finished_at: u64,
+}
+
 impl ChatMessage {
     fn has_nonempty_content(&self) -> bool {
         self.content
@@ -317,6 +343,13 @@ fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 const SESSION_VERSION: u32 = 7;
@@ -998,6 +1031,7 @@ struct AppState {
     shutdown_token: String,
     upload_token: String,
     hooks: HookRegistry,
+    auxiliary_tasks: auxiliary_tasks::AuxiliaryTaskRegistry,
     /// Background structured memory updater (active when config.structured_memory is true).
     memory_queue: std::sync::Mutex<Option<MemoryUpdateQueue>>,
 }
@@ -1104,11 +1138,20 @@ impl AppState {
         }
     }
 
-    fn apply_runtime_config(&self, new: Config) -> (Arc<Config>, u64) {
-        self.sync_memory_queue(&new);
-        runtime_loop::refresh_reflection_runtime(new.daily_reflection);
-        if !new.daily_reflection {
-            runtime_loop::cancel_active_reflections();
+    async fn apply_runtime_config(&self, new: Config) -> (Arc<Config>, u64) {
+        self.sync_memory_queue(&new).await;
+        if new.daily_reflection {
+            if self
+                .auxiliary_tasks
+                .enable_kind(auxiliary_tasks::AuxiliaryTaskKind::Reflection)
+            {
+                runtime_loop::refresh_reflection_runtime(true);
+            }
+        } else {
+            runtime_loop::refresh_reflection_runtime(false);
+            self.auxiliary_tasks
+                .disable_kind_and_wait(auxiliary_tasks::AuxiliaryTaskKind::Reflection)
+                .await;
         }
         self.replace_config(new)
     }
@@ -1123,29 +1166,70 @@ impl AppState {
         }
     }
 
-    fn sync_memory_queue(&self, config: &Config) {
+    async fn sync_memory_queue(&self, config: &Config) {
         let sessions = self.sessions.clone();
-        let apply = |guard: &mut Option<MemoryUpdateQueue>| match (
-            guard.as_ref(),
-            config.structured_memory,
-        ) {
-            (Some(queue), true) => queue.replace_config(config.clone()),
-            (None, true) => {
-                *guard = Some(MemoryUpdateQueue::spawn(config.clone(), sessions.clone()));
+        if config.structured_memory {
+            if !self
+                .auxiliary_tasks
+                .enable_kind(auxiliary_tasks::AuxiliaryTaskKind::Memory)
+            {
+                return;
             }
-            (_, false) => {
-                if let Some(queue) = guard.as_ref() {
-                    queue.shutdown();
+            let install = |guard: &mut Option<MemoryUpdateQueue>| match guard.as_ref() {
+                Some(queue) => queue.replace_config(config.clone()),
+                None => {
+                    *guard = Some(MemoryUpdateQueue::spawn(
+                        config.clone(),
+                        sessions,
+                        self.auxiliary_tasks.clone(),
+                    ));
                 }
-                *guard = None;
+            };
+            match self.memory_queue.lock() {
+                Ok(mut guard) => install(&mut guard),
+                Err(poisoned) => {
+                    eprintln!("Warning: memory queue lock poisoned during sync; recovering");
+                    install(&mut poisoned.into_inner());
+                }
             }
-        };
-        match self.memory_queue.lock() {
-            Ok(mut guard) => apply(&mut guard),
+            return;
+        }
+
+        let take = |guard: &mut Option<MemoryUpdateQueue>| guard.take();
+        let queue = match self.memory_queue.lock() {
+            Ok(mut guard) => take(&mut guard),
             Err(poisoned) => {
                 eprintln!("Warning: memory queue lock poisoned during sync; recovering");
-                apply(&mut poisoned.into_inner());
+                take(&mut poisoned.into_inner())
             }
+        };
+        if let Some(queue) = queue.as_ref() {
+            queue.shutdown();
+        }
+        self.auxiliary_tasks
+            .disable_kind_and_wait(auxiliary_tasks::AuxiliaryTaskKind::Memory)
+            .await;
+        if let Some(queue) = queue {
+            queue.shutdown_and_wait().await;
+        }
+    }
+
+    async fn shutdown_auxiliary_tasks(&self) {
+        runtime_loop::refresh_reflection_runtime(false);
+        let take = |guard: &mut Option<MemoryUpdateQueue>| guard.take();
+        let queue = match self.memory_queue.lock() {
+            Ok(mut guard) => take(&mut guard),
+            Err(poisoned) => {
+                eprintln!("Warning: memory queue lock poisoned during shutdown; recovering");
+                take(&mut poisoned.into_inner())
+            }
+        };
+        if let Some(queue) = queue.as_ref() {
+            queue.shutdown();
+        }
+        self.auxiliary_tasks.shutdown_and_wait().await;
+        if let Some(queue) = queue {
+            queue.shutdown_and_wait().await;
         }
     }
 }
@@ -1223,6 +1307,8 @@ struct LiveCompressionState {
 #[derive(Clone, Default)]
 struct LiveRoundState {
     connection_id: u64,
+    run_id: String,
+    run_started_at_ms: u64,
     round: usize,
     react_visible: bool,
     phase: Option<String>,
@@ -1335,12 +1421,19 @@ fn synthetic_task_started_event_for_output(event: &serde_json::Value) -> Option<
             "prompt": "",
         }));
     }
-    Some(json!({
+    let mut started = json!({
         "type": "task_started",
         "task_id": task_id,
         "agent": agent,
         "prompt": "",
-    }))
+    });
+    if let Some(parent_id) = event["parent_tool_call_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+    {
+        started["parent_tool_call_id"] = json!(parent_id);
+    }
+    Some(started)
 }
 
 fn synthetic_orchestrate_started_event_for_output(
@@ -1707,6 +1800,7 @@ const MAX_PENDING_LIVE_CLIENT_EVENTS: usize = 1_024;
 pub(crate) struct LiveOutputReplayCtx {
     pub(crate) state: Arc<AppState>,
     pub(crate) session_id: String,
+    pub(crate) parent_tool_call_id: Option<String>,
 }
 
 pub(crate) async fn ws_send(tx: &WsTx, data: &serde_json::Value) -> bool {
@@ -1724,8 +1818,7 @@ async fn send_storage_status(tx: &WsTx, state: &AppState) {
     .await;
 }
 
-#[cfg(not(test))]
-async fn broadcast_storage_status(state: &AppState) {
+async fn broadcast_storage_status_value(state: &AppState, status: &storage::StorageStatus) {
     let mut clients = state
         .session_clients
         .lock()
@@ -1743,7 +1836,7 @@ async fn broadcast_storage_status(state: &AppState) {
     );
     let payload = json!({
         "type": "storage_status",
-        "storage": storage_status_payload(state),
+        "storage": storage_status_value(status),
     });
     for client in clients {
         let _ = ws_send(&client, &payload).await;
@@ -1751,26 +1844,51 @@ async fn broadcast_storage_status(state: &AppState) {
 }
 
 #[cfg(not(test))]
+async fn broadcast_storage_status(state: &AppState) {
+    let status = state.storage_status();
+    broadcast_storage_status_value(state, &status).await;
+}
+
+async fn cancel_storage_protected_direct_runs(state: &AppState) {
+    let runs = {
+        let active_runs = state.active_runs.lock().await;
+        active_runs
+            .iter()
+            .map(|(session_id, run)| (session_id.clone(), run.connection_id, run.cancel.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    {
+        let mut live_rounds = state.live_rounds.lock().await;
+        for (session_id, connection_id, _) in &runs {
+            if live_rounds
+                .get(session_id)
+                .is_some_and(|round| round.connection_id == *connection_id)
+            {
+                live_rounds.remove(session_id);
+            }
+        }
+    }
+
+    for (_, _, cancel) in runs {
+        cancel.cancel();
+    }
+}
+
 async fn monitor_storage_status(
     state: Arc<AppState>,
     mut status_rx: tokio::sync::watch::Receiver<storage::StorageStatus>,
 ) {
     while status_rx.changed().await.is_ok() {
-        if status_rx.borrow().mode != storage::StorageMode::Protected {
+        let status = status_rx.borrow().clone();
+        if status.mode != storage::StorageMode::Protected {
             continue;
         }
-        let runs = state
-            .active_runs
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for run in runs {
-            run.cancel.cancel();
-        }
+        cancel_storage_protected_direct_runs(&state).await;
+        #[cfg(not(test))]
         session_control::cancel_all_active_runs_for_storage();
-        broadcast_storage_status(&state).await;
+        state.shutdown_auxiliary_tasks().await;
+        broadcast_storage_status_value(&state, &status).await;
         break;
     }
 }
@@ -1871,10 +1989,15 @@ pub(crate) async fn close_all_group_clients_with_event(
 
 pub(crate) async fn forward_tool_output_event_best_effort(
     live_tx: &LiveTx,
-    event: serde_json::Value,
+    mut event: serde_json::Value,
     replay_ctx: Option<&LiveOutputReplayCtx>,
 ) {
     if let Some(replay_ctx) = replay_ctx {
+        if is_subagent_live_event(&event)
+            && let Some(parent_tool_call_id) = &replay_ctx.parent_tool_call_id
+        {
+            event["parent_tool_call_id"] = json!(parent_tool_call_id);
+        }
         record_tool_output_event_for_replay_and_client(
             replay_ctx.state.as_ref(),
             &replay_ctx.session_id,
@@ -2412,13 +2535,62 @@ fn clear_live_compression_state(round: &mut LiveRoundState) {
     round.has_pending_pre_start_context_updates = false;
 }
 
+fn terminal_run_status(event_type: &str, event: &serde_json::Value) -> &'static str {
+    if event_type == "error" {
+        return "failed";
+    }
+    let phase = event["phase"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let reason = event["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if phase == "stopped"
+        || matches!(
+            reason.as_str(),
+            "user_stop" | "stopped" | "cancelled" | "canceled" | "shutdown"
+        )
+    {
+        "stopped"
+    } else if phase == "blocked" || reason == "blocked" {
+        "blocked"
+    } else if phase == "waiting_user" || matches!(reason.as_str(), "waiting_user" | "needs_input") {
+        "waiting_user"
+    } else if phase == "failed"
+        || matches!(reason.as_str(), "failed" | "completion_contract_failed")
+    {
+        "failed"
+    } else if matches!(phase.as_str(), "hard_cap" | "incomplete")
+        || matches!(
+            reason.as_str(),
+            "hard_cap" | "incomplete_plan" | "empty" | "empty_response" | "incomplete"
+        )
+    {
+        "incomplete"
+    } else if phase == "finish" && reason == "complete" {
+        "completed"
+    } else {
+        "partial"
+    }
+}
+
 async fn dispatch_live_event(
     state: &AppState,
     session_id: &str,
     connection_id: u64,
-    event: serde_json::Value,
+    mut event: serde_json::Value,
 ) {
-    let event_type = event["type"].as_str().unwrap_or_default();
+    let event_type = event["type"].as_str().unwrap_or_default().to_string();
+    let carries_run_identity = !is_subagent_live_event(&event)
+        && (matches!(event_type.as_str(), "start" | "done")
+            || (event_type == "error" && event["run_terminal"].as_bool() == Some(true)));
+    if carries_run_identity {
+        event["run_connection_id"] = json!(connection_id.to_string());
+    }
     let mut delegated_replay_event: Option<serde_json::Value> = None;
     let active_run_connection_id = {
         let runs = state.active_runs.lock().await;
@@ -2445,11 +2617,28 @@ async fn dispatch_live_event(
     if !(is_current || is_active_run_source || is_live_round_source) {
         return;
     }
+    let is_terminal_closure = event_type == "done"
+        || (event_type == "error" && event["run_terminal"].as_bool() == Some(true));
+    if is_terminal_closure
+        && is_active_run_source
+        && !is_current
+        && live_round_connection_id != Some(connection_id)
+    {
+        // A terminal error already retired this run's replay state. Do not
+        // route its compatibility `done` across a rebind where it could be
+        // mistaken for the newer connection's run.
+        return;
+    }
 
+    let incoming_run_id = event["run_id"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     {
         let mut live_rounds = state.live_rounds.lock().await;
 
-        match event_type {
+        match event_type.as_str() {
             "start" => {
                 if !is_subagent_live_event(&event) {
                     let latest_compression = live_rounds
@@ -2457,10 +2646,21 @@ async fn dispatch_live_event(
                         .filter(|round| round.has_pending_pre_start_context_updates)
                         .map(|round| round.latest_compression.clone())
                         .unwrap_or_default();
+                    let retained_run_metadata = live_rounds
+                        .get(session_id)
+                        .filter(|round| {
+                            round.connection_id == connection_id
+                                && round.run_id == incoming_run_id
+                                && !round.run_id.is_empty()
+                        })
+                        .map(|round| round.run_started_at_ms);
+                    let run_started_at_ms = retained_run_metadata.unwrap_or_else(now_epoch_millis);
                     live_rounds.insert(
                         session_id.to_string(),
                         LiveRoundState {
                             connection_id,
+                            run_id: incoming_run_id.clone(),
+                            run_started_at_ms,
                             round: event["round"].as_u64().unwrap_or(1) as usize,
                             react_visible: event["react_visible"].as_bool().unwrap_or(false),
                             phase: event["phase"].as_str().map(str::to_string),
@@ -2535,12 +2735,12 @@ async fn dispatch_live_event(
                     && round.connection_id == connection_id
                     && !is_subagent_live_event(&event)
                 {
-                    apply_live_compression_event(round, event_type, &event);
+                    apply_live_compression_event(round, &event_type, &event);
                     round.has_pending_pre_start_context_updates = true;
                 } else if !is_subagent_live_event(&event) {
                     let mut round = live_rounds.remove(session_id).unwrap_or_default();
                     round.connection_id = connection_id;
-                    apply_live_compression_event(&mut round, event_type, &event);
+                    apply_live_compression_event(&mut round, &event_type, &event);
                     round.has_pending_pre_start_context_updates = true;
                     live_rounds.insert(session_id.to_string(), round);
                 }
@@ -2860,9 +3060,28 @@ async fn dispatch_live_event(
                     delegated_replay_event = Some(event.clone());
                 }
             }
-            "done" | "error" => {
-                if live_rounds.get(session_id).map(|r| r.connection_id) == Some(connection_id) {
-                    live_rounds.remove(session_id);
+            "done" => {
+                let matches_run = live_rounds.get(session_id).is_some_and(|round| {
+                    round.connection_id == connection_id && round.run_id == incoming_run_id
+                });
+                if matches_run && let Some(round) = live_rounds.remove(session_id) {
+                    let finished_at_ms = now_epoch_millis();
+                    let duration_ms = event["duration_ms"]
+                        .as_u64()
+                        .unwrap_or_else(|| finished_at_ms.saturating_sub(round.run_started_at_ms));
+                    event["duration_ms"] = json!(duration_ms);
+                }
+            }
+            "error" if event["run_terminal"].as_bool() == Some(true) => {
+                let matches_run = live_rounds.get(session_id).is_some_and(|round| {
+                    round.connection_id == connection_id && round.run_id == incoming_run_id
+                });
+                if matches_run && let Some(round) = live_rounds.remove(session_id) {
+                    let finished_at_ms = now_epoch_millis();
+                    let duration_ms = event["duration_ms"]
+                        .as_u64()
+                        .unwrap_or_else(|| finished_at_ms.saturating_sub(round.run_started_at_ms));
+                    event["duration_ms"] = json!(duration_ms);
                 }
             }
             _ => {}
@@ -2979,6 +3198,8 @@ fn compression_pruned_replay_event(live_round: &LiveRoundState) -> Option<serde_
 fn live_round_replay_events(live_round: &LiveRoundState) -> Vec<serde_json::Value> {
     let mut start_event = json!({
         "type":"start",
+        "run_id": live_round.run_id,
+        "run_connection_id": live_round.connection_id.to_string(),
         "round": live_round.round,
         "phase": live_round.phase.as_deref().unwrap_or("analyze"),
         "cycle": live_round.cycle,
@@ -3379,8 +3600,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     )
                     .await
                     {
-                        Ok(()) => {
-                            if result.session_list_changed {
+                        Ok(created_fresh) => {
+                            if result.session_list_changed || created_fresh {
                                 broadcast_session_list_payload(&state).await;
                             }
                             ws_send(
@@ -3785,17 +4006,24 @@ async fn switch_socket_session(
     connection_cancel: &CancellationToken,
     connection_id: u64,
     next_session_id: String,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if next_session_id == *current_session_id {
-        return Ok(());
+        return Ok(false);
     }
 
+    // Persist the current Session before acquiring or creating the target. If this
+    // write fails, switching has no observable target-side effect to roll back.
     let previous_session_id = current_session_id.clone();
     session_store::save_current_session_to_disk(state, &previous_session_id)
         .await
         .map_err(|err| {
             format!("Failed to save session '{previous_session_id}' before switch: {err}")
         })?;
+
+    let target_lock = session_control::session_control_lock(state, &next_session_id).await;
+    let target_guard = target_lock.lock().await;
+    let (next_session_id, created_fresh) =
+        ensure_session_ready(state, Some(&next_session_id)).await?;
 
     unbind_session_connection_if_matches(state, &previous_session_id, connection_id).await;
     {
@@ -3812,23 +4040,27 @@ async fn switch_socket_session(
     }
 
     bind_session_connection(state, &next_session_id, connection_id, tx, false).await;
+    drop(target_guard);
     send_existing_session_payloads(tx, state, &next_session_id).await;
     replay_live_round(tx, state, &next_session_id).await;
     finish_session_replay(state, &next_session_id, connection_id).await;
-    Ok(())
+    Ok(created_fresh)
 }
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
 
-fn storage_status_payload(state: &AppState) -> serde_json::Value {
-    let status = state.storage_status();
-    match status.mode {
+fn storage_status_value(status: &storage::StorageStatus) -> serde_json::Value {
+    match &status.mode {
         storage::StorageMode::Healthy => json!({ "mode": "healthy" }),
         storage::StorageMode::Protected => json!({
             "mode": "protected",
             "code": "storage_protected",
         }),
     }
+}
+
+fn storage_status_payload(state: &AppState) -> serde_json::Value {
+    storage_status_value(&state.storage_status())
 }
 
 fn should_continue_after_default_session_error(status: &storage::StorageStatus) -> bool {
@@ -5556,6 +5788,9 @@ async fn api_client_config(
         "features": {
             "groups": config.enable_groups,
         },
+        "protocols": {
+            "execution_identity": EXECUTION_IDENTITY_PROTOCOL_VERSION,
+        },
     })))
 }
 
@@ -6112,7 +6347,7 @@ async fn api_put_config(
     // model/MCP changes take effect without a restart.
     let groups_were_enabled = state.config().enable_groups;
     let new_config = Config::load();
-    let (applied_config, config_revision) = state.apply_runtime_config(new_config);
+    let (applied_config, config_revision) = state.apply_runtime_config(new_config).await;
     if let Err(error) = normalize_session_model_efforts(&state, &applied_config).await {
         // Config is independent filesystem state and has already been durably
         // replaced above. A protected or newly failed SQLite store must not
@@ -6848,8 +7083,17 @@ async fn main() {
 
     let sessions = Arc::new(Mutex::new(HashMap::new()));
 
+    let auxiliary_tasks = auxiliary_tasks::AuxiliaryTaskRegistry::new(
+        config.structured_memory,
+        config.daily_reflection,
+    );
+
     let memory_queue = if config.structured_memory {
-        Some(MemoryUpdateQueue::spawn(config.clone(), sessions.clone()))
+        Some(MemoryUpdateQueue::spawn(
+            config.clone(),
+            sessions.clone(),
+            auxiliary_tasks.clone(),
+        ))
     } else {
         None
     };
@@ -6877,6 +7121,7 @@ async fn main() {
         shutdown_token,
         upload_token,
         hooks,
+        auxiliary_tasks,
         memory_queue: std::sync::Mutex::new(memory_queue),
     });
     #[cfg(not(test))]
@@ -6997,6 +7242,12 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal)
         .await
         .ok();
+
+    // Stop new Memory/Reflection work and drain every registered provider,
+    // Usage, and private-file lifecycle before the final Session flush and WAL
+    // checkpoint. Provider-stage cancellation remains cooperative; a Provider
+    // response that already succeeded finishes its idempotent Usage commit.
+    state.shutdown_auxiliary_tasks().await;
 
     // Flush all in-memory sessions to disk before exiting
     let session_ids: Vec<String> = {

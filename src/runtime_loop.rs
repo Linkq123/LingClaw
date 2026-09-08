@@ -5,6 +5,7 @@ use crate::prompts::{
     load_project_rules_async,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use tokio::time::MissedTickBehavior;
 
@@ -32,17 +33,28 @@ static REFLECTION_RUNTIME_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Generation counter for reflection runtime policy updates.
 static REFLECTION_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-/// Active background reflection cancellations keyed by an internal task id.
-static ACTIVE_REFLECTION_CANCELS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<u64, CancellationToken>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-/// Monotonic ids for background reflection tasks.
-static NEXT_REFLECTION_TASK_ID: AtomicU64 = AtomicU64::new(1);
-
 /// Monotonic counter used to make fallback task ids unique even if the system
 /// clock has coarse granularity or multiple tasks start within the same tick.
 static NEXT_FALLBACK_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local sequence combined with wall-clock nanoseconds for a stable,
+/// server-authored top-level run identity. Connection ids intentionally do not
+/// serve this purpose because one WebSocket may execute multiple runs.
+static NEXT_TOP_LEVEL_RUN_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+static TERMINAL_PERSISTENCE_RECORDS: std::sync::LazyLock<
+    tokio::sync::Mutex<HashMap<String, (Session, crate::TopLevelRunOutcome)>>,
+> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+fn new_top_level_run_id() -> String {
+    let sequence = NEXT_TOP_LEVEL_RUN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(sequence as u128);
+    format!("run-{nanos:x}-{sequence:x}")
+}
 
 #[cfg(test)]
 pub(crate) fn reflection_test_guard() -> &'static tokio::sync::Mutex<()> {
@@ -145,49 +157,6 @@ fn reflection_run_snapshot_is_enabled(config: &Config) -> bool {
     config.daily_reflection && reflection_runtime_enabled()
 }
 
-fn register_active_reflection(cancel: CancellationToken) -> u64 {
-    let task_id = NEXT_REFLECTION_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    match ACTIVE_REFLECTION_CANCELS.lock() {
-        Ok(mut guard) => {
-            guard.insert(task_id, cancel);
-        }
-        Err(poisoned) => {
-            eprintln!("Warning: reflection cancel registry poisoned during register; recovering");
-            let mut guard = poisoned.into_inner();
-            guard.insert(task_id, cancel);
-        }
-    }
-    task_id
-}
-
-fn finish_active_reflection(task_id: u64) {
-    match ACTIVE_REFLECTION_CANCELS.lock() {
-        Ok(mut guard) => {
-            guard.remove(&task_id);
-        }
-        Err(poisoned) => {
-            eprintln!("Warning: reflection cancel registry poisoned during cleanup; recovering");
-            let mut guard = poisoned.into_inner();
-            guard.remove(&task_id);
-        }
-    }
-}
-
-pub(crate) fn cancel_active_reflections() {
-    let cancels = match ACTIVE_REFLECTION_CANCELS.lock() {
-        Ok(mut guard) => guard.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>(),
-        Err(poisoned) => {
-            eprintln!("Warning: reflection cancel registry poisoned during cancel; recovering");
-            let mut guard = poisoned.into_inner();
-            guard.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>()
-        }
-    };
-
-    for cancel in cancels {
-        cancel.cancel();
-    }
-}
-
 pub(crate) struct AgentRunOutcome {
     pub(crate) rerun_agent: bool,
     pub(crate) shutting_down: bool,
@@ -197,6 +166,7 @@ pub(crate) struct AgentRunOutcome {
 
 pub(crate) struct AgentRunReservation {
     connection_id: u64,
+    run_id: String,
     run_cancel: CancellationToken,
     deferred_interventions: Arc<Mutex<DeferredInterventionState>>,
     reset_plan_evidence: bool,
@@ -227,6 +197,7 @@ pub(crate) async fn try_reserve_agent_run(
     );
     Some(AgentRunReservation {
         connection_id,
+        run_id: new_top_level_run_id(),
         run_cancel,
         deferred_interventions,
         reset_plan_evidence: false,
@@ -299,14 +270,49 @@ struct AgentRunCtx<'a> {
     cancel: &'a CancellationToken,
     live_tx: &'a LiveTx,
     run_cancel: &'a CancellationToken,
+    #[cfg(not(test))]
+    run_id: &'a str,
+    #[cfg(not(test))]
+    connection_id: u64,
+    #[cfg(not(test))]
+    terminal_persistence: RunTerminalPersistenceContext,
+}
+
+impl AgentRunCtx<'_> {
+    fn run_id(&self) -> &str {
+        #[cfg(not(test))]
+        {
+            self.run_id
+        }
+        #[cfg(test)]
+        {
+            "test-top-level-run"
+        }
+    }
+}
+
+#[cfg(not(test))]
+#[derive(Clone)]
+struct RunTerminalPersistenceContext {
+    started_at_ms: u64,
 }
 
 #[derive(Default)]
 struct PlanCompletionRunEvidence {
     tool_epochs: std::collections::BTreeMap<String, u64>,
     mutation_epoch: u64,
+    /// One run has exactly one terminal database winner. Stop/cancellation may
+    /// win only while this remains `PreCommit`; once the database operation is
+    /// chosen its future is never dropped.
+    terminal_linearization: TerminalLinearizationState,
+    /// A terminal boundary failure is live-only because no safe SQLite
+    /// message boundary exists. Emit it once so clients can close the exact
+    /// running stack without inventing a persisted outcome.
+    terminal_identity_failure_sent: bool,
     #[cfg(test)]
     verifier_gate: Option<Arc<CompletionVerifierTestGate>>,
+    #[cfg(test)]
+    finish_gate: Option<Arc<FinishPhaseTestGate>>,
 }
 
 #[cfg(test)]
@@ -343,6 +349,46 @@ impl CompletionVerifierTestGate {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinishPhaseTestStage {
+    OnFinishHook,
+    Usage,
+    BetweenHookEvents,
+    BetweenPlanEvents,
+    PostSessionMutation,
+    PreTerminalCommit,
+    PostCommitBeforeAck,
+}
+
+#[cfg(test)]
+struct FinishPhaseTestGate {
+    stage: FinishPhaseTestStage,
+    started: AtomicBool,
+    release: AtomicBool,
+}
+
+#[cfg(test)]
+impl FinishPhaseTestGate {
+    fn new(stage: FinishPhaseTestStage) -> Self {
+        Self {
+            stage,
+            started: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        }
+    }
+
+    async fn wait(&self, stage: FinishPhaseTestStage) {
+        if self.stage != stage {
+            return;
+        }
+        self.started.store(true, Ordering::Relaxed);
+        while !self.release.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 struct AgentPhaseState {
     round: usize,
     pending_tool_calls: Vec<ToolCall>,
@@ -368,12 +414,20 @@ struct AgentPhaseState {
     stagnation_streak: usize,
     error_streak: usize,
     recent_tool_history: Vec<agent::ToolResultEntry>,
+    unresolved_tool_targets: HashSet<String>,
     pending_interventions: Vec<String>,
     react_ctx: agent::AgentLoopCtx,
     shutting_down: bool,
     run_stopped: bool,
     run_failed: bool,
     run_detached: bool,
+    /// Stable identity of the user message that opened this exact top-level
+    /// run. Transcript rewrites may move it, but may never silently replace it
+    /// with a mutable array index or a different equal-looking message.
+    terminal_message_anchor: Option<RunMessageAnchor>,
+    /// Planning/execution identity captured when the run reservation starts.
+    /// PlanOnly replacement may supersede it with the final submitted revision.
+    terminal_plan_identity: Option<(String, u32)>,
     last_save_instant: Option<std::time::Instant>,
     /// Token counters snapshotted at loop start for per-round delta calculation.
     usage_snap_input: u64,
@@ -511,6 +565,10 @@ struct PostExecutionReflectionInput {
     policy_generation: u64,
     cycles: usize,
     tool_calls: usize,
+    provider_timeout: std::time::Duration,
+    task_context: crate::auxiliary_tasks::AuxiliaryTaskContext,
+    #[cfg(test)]
+    provider_succeeded_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 /// Post-execution reflection: analyze what went well/poorly in a multi-step task.
@@ -532,7 +590,13 @@ async fn run_post_execution_reflection(
         policy_generation,
         cycles,
         tool_calls,
+        provider_timeout,
+        task_context,
+        #[cfg(test)]
+        provider_succeeded_gate,
     } = input;
+    let cancel = task_context.cancellation_token();
+    let usage_operation_id = session_store::new_auxiliary_usage_operation_id("reflection");
 
     if !reflection_runtime_matches(policy_generation) {
         return Ok(false);
@@ -581,17 +645,31 @@ async fn run_post_execution_reflection(
     ];
 
     let resolved = config.resolve_model(&model);
-    let reflection = providers::call_llm_simple_with_usage(
-        &http,
-        &resolved,
-        &prompt_messages,
-        &workspace,
-        config.s3.as_ref(),
-        "off",
-        config.max_llm_retries,
-    )
-    .await
-    .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
+    let reflection = tokio::select! {
+        biased;
+        result = tokio::time::timeout(
+            provider_timeout,
+            providers::call_llm_simple_with_usage(
+                &http,
+                &resolved,
+                &prompt_messages,
+                &workspace,
+                config.s3.as_ref(),
+                "off",
+                config.max_llm_retries,
+            ),
+        ) => match result {
+            Ok(result) => result.map_err(|error| format!("Reflection LLM call failed: {error}"))?,
+            Err(_) => return Err("Reflection timed out".to_string()),
+        },
+        _ = cancel.cancelled() => return Ok(false),
+    };
+
+    #[cfg(test)]
+    if let Some((reached, release)) = provider_succeeded_gate {
+        reached.notify_one();
+        release.notified().await;
+    }
 
     let provider_name = config.resolve_provider_name(&model);
     let input_tokens = reflection.input_tokens.unwrap_or_else(|| {
@@ -613,19 +691,27 @@ async fn run_post_execution_reflection(
         ) as u64
     });
 
-    {
-        let mut sessions = sessions.lock().await;
-        if let Some(session) = sessions.get_mut(&session_id) {
-            crate::update_session_token_usage_with_provider(
-                session,
+    let usage_outcome = session_store::persist_auxiliary_usage_update(
+        Arc::clone(&sessions),
+        session_id.clone(),
+        usage_operation_id,
+        crate::context::UsageUpdate {
+            input_tokens,
+            output_tokens,
+            input_source: token_usage_source(reflection.input_tokens).to_string(),
+            output_source: token_usage_source(reflection.output_tokens).to_string(),
+            labels: crate::context::build_usage_labels(
                 input_tokens,
                 output_tokens,
-                token_usage_source(reflection.input_tokens),
-                token_usage_source(reflection.output_tokens),
                 Some(&provider_name),
                 Some(crate::context::USAGE_ROLE_REFLECTION),
-            );
-        }
+            ),
+        },
+    )
+    .await
+    .map_err(|error| format!("Persist reflection Usage: {error}"))?;
+    if usage_outcome == crate::storage::AuxiliaryUsageApplyOutcome::Missing {
+        return Ok(false);
     }
 
     let reflection = reflection.content.trim().to_string();
@@ -636,6 +722,9 @@ async fn run_post_execution_reflection(
     if !reflection_runtime_matches(policy_generation) {
         return Ok(false);
     }
+    let Some(_write_permit) = task_context.begin_private_write() else {
+        return Ok(false);
+    };
 
     // Write reflection to daily memory file.
     let local = prompts::current_local_snapshot();
@@ -2006,6 +2095,7 @@ fn delegated_config_for_run(config: &Config, run_model: &str) -> Config {
 #[allow(clippy::too_many_arguments)]
 async fn execute_task_tool(
     args_str: &str,
+    parent_tool_call_id: &str,
     config: &Config,
     http: &Client,
     agent_home: &Path,
@@ -2115,6 +2205,7 @@ async fn execute_task_tool(
         json!({
             "type": "task_started",
             "task_id": task_id,
+            "parent_tool_call_id": parent_tool_call_id,
             "agent": agent_name,
             "prompt": crate::truncate(prompt, 500),
         }),
@@ -2136,6 +2227,7 @@ async fn execute_task_tool(
         cancel,
         hooks,
         Some(crate::LiveOutputReplayCtx {
+            parent_tool_call_id: Some(parent_tool_call_id.to_string()),
             state: Arc::clone(state),
             session_id: session_id.to_string(),
         }),
@@ -2225,6 +2317,7 @@ async fn execute_task_tool(
 /// written back to the parent session for accurate stats tracking.
 #[allow(clippy::too_many_arguments)]
 async fn execute_orchestrate_tool(
+    tool_call_id: &str,
     args_str: &str,
     config: &Config,
     http: &Client,
@@ -2305,9 +2398,11 @@ async fn execute_orchestrate_tool(
         cancel,
         hooks,
         Some(crate::LiveOutputReplayCtx {
+            parent_tool_call_id: None,
             state: Arc::clone(state),
             session_id: session_id.to_string(),
         }),
+        Some(tool_call_id),
     )
     .await;
 
@@ -2395,6 +2490,633 @@ async fn build_done_usage(
     } else {
         json!({})
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalEventSendOutcome {
+    Committed,
+    CancelledBeforeCommit,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TerminalLinearizationState {
+    #[default]
+    PreCommit,
+    CommitChosen,
+    Committed,
+}
+
+async fn emit_terminal_identity_unavailable(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &mut AgentPhaseState,
+    diagnostic: &str,
+) {
+    phase_state.run_failed = true;
+    if phase_state
+        .completion_evidence
+        .terminal_identity_failure_sent
+    {
+        return;
+    }
+    phase_state
+        .completion_evidence
+        .terminal_identity_failure_sent = true;
+    eprintln!("ERROR: terminal identity unavailable: {diagnostic}");
+    let mut event = json!({
+        "type":"error",
+        "run_terminal":true,
+        "run_id":ctx.run_id(),
+        "phase":"incomplete",
+        "reason":"terminal_identity_unavailable",
+        "code":"terminal_identity_unavailable",
+        "content":"LingClaw could not safely bind this run's final state to its originating message. Retry or resume the run; history will remain incomplete until a new terminal result is persisted.",
+        "dismissible":true,
+        "recoverable":true,
+    });
+    if let Some((plan_id, revision)) = phase_state.terminal_plan_identity.as_ref() {
+        event["plan_id"] = json!(plan_id);
+        event["revision"] = json!(revision);
+    }
+    let _ = live_send(ctx.live_tx, event).await;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunMessageAnchor {
+    fingerprint: String,
+}
+
+fn terminal_anchor_message_fingerprint(message: &ChatMessage) -> Result<String, String> {
+    let mut stable = message.clone();
+    if let Some(images) = stable.images.as_mut() {
+        for image in images {
+            // Signed URLs are request-scoped and are stripped by Session
+            // normalization. The stable object identity remains unchanged.
+            if image.s3_object_key.is_some() {
+                image.url.clear();
+            }
+        }
+    }
+    let payload = serde_json::to_vec(&stable).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(payload)))
+}
+
+impl RunMessageAnchor {
+    fn from_messages(messages: &[ChatMessage]) -> Result<Self, String> {
+        let message = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .ok_or_else(|| "Terminal run has no user message anchor".to_string())?;
+        Ok(Self {
+            fingerprint: terminal_anchor_message_fingerprint(message)?,
+        })
+    }
+
+    fn resolve(&self, messages: &[ChatMessage]) -> Result<usize, String> {
+        let mut resolved = None;
+        for (index, message) in messages.iter().enumerate() {
+            if message.role != "user"
+                || terminal_anchor_message_fingerprint(message)? != self.fingerprint
+            {
+                continue;
+            }
+            if resolved.replace(index).is_some() {
+                return Err(
+                    "Terminal user message anchor is ambiguous after transcript rewrite"
+                        .to_string(),
+                );
+            }
+        }
+        resolved.ok_or_else(|| {
+            "Terminal user message anchor was not retained by transcript rewrite".to_string()
+        })
+    }
+}
+
+fn active_terminal_plan_identity(session: &Session) -> Option<(String, u32)> {
+    session.pending_plan.as_ref().and_then(|plan| {
+        matches!(
+            plan.status,
+            crate::plan::PlanStatus::Planning | crate::plan::PlanStatus::Executing
+        )
+        .then(|| (plan.id.clone(), plan.revision))
+    })
+}
+
+fn ensure_terminal_run_identity(
+    phase_state: &mut AgentPhaseState,
+    session: &Session,
+) -> Result<(), String> {
+    if phase_state.terminal_message_anchor.is_none() {
+        phase_state.terminal_message_anchor =
+            Some(RunMessageAnchor::from_messages(&session.messages)?);
+    }
+    if phase_state.terminal_plan_identity.is_none() {
+        phase_state.terminal_plan_identity = active_terminal_plan_identity(session);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+enum TerminalPlanPatch {
+    Keep,
+    Replace(Box<TerminalPlanReplacement>),
+}
+
+#[derive(Clone)]
+struct TerminalPlanReplacement {
+    expected: Option<crate::PendingPlan>,
+    replacement: Option<crate::PendingPlan>,
+}
+
+#[derive(Clone)]
+struct TerminalSessionPatch {
+    message_anchor: RunMessageAnchor,
+    expected_message_tail: Vec<ChatMessage>,
+    replacement_message_tail: Vec<ChatMessage>,
+    expected_subagent_snapshots: HashMap<String, crate::SubagentHistorySnapshot>,
+    replacement_subagent_snapshots: HashMap<String, crate::SubagentHistorySnapshot>,
+    expected_failed_tool_results: HashSet<String>,
+    replacement_failed_tool_results: HashSet<String>,
+    plan: TerminalPlanPatch,
+    updated_at: u64,
+}
+
+fn terminal_patch_values_match<T: serde::Serialize + ?Sized>(left: &T, right: &T) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+impl TerminalSessionPatch {
+    fn new(
+        expected: &Session,
+        replacement: &Session,
+        message_anchor: &RunMessageAnchor,
+    ) -> Result<Self, String> {
+        let expected_start = message_anchor.resolve(&expected.messages)?;
+        let replacement_start = message_anchor.resolve(&replacement.messages)?;
+        Ok(Self {
+            message_anchor: message_anchor.clone(),
+            expected_message_tail: expected.messages[expected_start..].to_vec(),
+            replacement_message_tail: replacement.messages[replacement_start..].to_vec(),
+            expected_subagent_snapshots: expected.subagent_snapshots.clone(),
+            replacement_subagent_snapshots: replacement.subagent_snapshots.clone(),
+            expected_failed_tool_results: expected.failed_tool_results.clone(),
+            replacement_failed_tool_results: replacement.failed_tool_results.clone(),
+            plan: if terminal_patch_values_match(&expected.pending_plan, &replacement.pending_plan)
+            {
+                TerminalPlanPatch::Keep
+            } else {
+                TerminalPlanPatch::Replace(Box::new(TerminalPlanReplacement {
+                    expected: expected.pending_plan.clone(),
+                    replacement: replacement.pending_plan.clone(),
+                }))
+            },
+            updated_at: replacement.updated_at,
+        })
+    }
+
+    fn apply_to_latest(&self, latest: &Session) -> Result<Session, String> {
+        let latest_start = self.message_anchor.resolve(&latest.messages)?;
+        if !terminal_patch_values_match(
+            &latest.messages[latest_start..],
+            self.expected_message_tail.as_slice(),
+        ) {
+            return Err(
+                "Session transcript changed outside the terminal run-owned message boundary"
+                    .to_string(),
+            );
+        }
+        if !terminal_patch_values_match(
+            &latest.subagent_snapshots,
+            &self.expected_subagent_snapshots,
+        ) || latest.failed_tool_results != self.expected_failed_tool_results
+        {
+            return Err(
+                "Session tool history changed outside the terminal run generation".to_string(),
+            );
+        }
+        if let TerminalPlanPatch::Replace(plan) = &self.plan
+            && !terminal_patch_values_match(&latest.pending_plan, &plan.expected)
+        {
+            return Err("Pending Plan changed outside the terminal run generation".to_string());
+        }
+
+        let mut merged = latest.clone();
+        merged.messages.truncate(latest_start);
+        merged
+            .messages
+            .extend(self.replacement_message_tail.iter().cloned());
+        merged.subagent_snapshots = self.replacement_subagent_snapshots.clone();
+        merged.failed_tool_results = self.replacement_failed_tool_results.clone();
+        if let TerminalPlanPatch::Replace(plan) = &self.plan {
+            merged.pending_plan = plan.replacement.clone();
+        }
+        merged.updated_at = merged.updated_at.max(self.updated_at);
+        Ok(merged)
+    }
+
+    fn final_plan_identity(&self, fallback: Option<(String, u32)>) -> Option<(String, u32)> {
+        match &self.plan {
+            TerminalPlanPatch::Keep => fallback,
+            TerminalPlanPatch::Replace(plan) => plan
+                .replacement
+                .as_ref()
+                .map(|plan| (plan.id.clone(), plan.revision)),
+        }
+    }
+}
+
+async fn persist_and_send_terminal_event(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &mut AgentPhaseState,
+    mut event: serde_json::Value,
+    cancel_before_commit: bool,
+    mut prepared_patch: Option<TerminalSessionPatch>,
+    mut post_commit_events: Vec<serde_json::Value>,
+) -> TerminalEventSendOutcome {
+    let finished_at_ms = crate::now_epoch_millis();
+    #[cfg(not(test))]
+    let started_at_ms = ctx.terminal_persistence.started_at_ms;
+    #[cfg(test)]
+    let started_at_ms = finished_at_ms;
+    let duration_ms = event["duration_ms"]
+        .as_u64()
+        .unwrap_or_else(|| finished_at_ms.saturating_sub(started_at_ms));
+    event["duration_ms"] = json!(duration_ms);
+    let event_type = event["type"].as_str().unwrap_or_default();
+    let terminal_status = crate::terminal_run_status(event_type, &event);
+
+    let persist_gate = session_store::session_persist_gate(ctx.current_session_id);
+    let persist_guard = if cancel_before_commit {
+        match await_finish_step(ctx, persist_gate.lock()).await {
+            Ok(guard) => guard,
+            Err(()) => return TerminalEventSendOutcome::CancelledBeforeCommit,
+        }
+    } else {
+        persist_gate.lock().await
+    };
+    let supplied_patch = prepared_patch.is_some();
+    // The persistence gate is the linearization boundary for every durable
+    // Session writer. Read the latest in-memory Session only after holding it,
+    // then merge just the fields owned by this exact run. A candidate cloned
+    // before the gate must never replace independently committed Todos, model
+    // preferences, usage, workspace bindings, or other Session metadata.
+    let snapshot_result =
+        {
+            let sessions = if cancel_before_commit {
+                match await_finish_step(ctx, ctx.state.sessions.lock()).await {
+                    Ok(sessions) => sessions,
+                    Err(()) => return TerminalEventSendOutcome::CancelledBeforeCommit,
+                }
+            } else {
+                ctx.state.sessions.lock().await
+            };
+            match sessions.get(ctx.current_session_id) {
+                None => Err(format!(
+                    "cannot persist terminal outcome for missing Session {}",
+                    ctx.current_session_id
+                )),
+                Some(latest) => match ensure_terminal_run_identity(phase_state, latest) {
+                    Err(error) => Err(error),
+                    Ok(()) => {
+                        if phase_state.terminal_plan_identity.as_ref().is_some_and(
+                            |(id, revision)| {
+                                !latest.pending_plan.as_ref().is_some_and(|plan| {
+                                    plan.id == *id && plan.revision == *revision
+                                })
+                            },
+                        ) {
+                            Err(
+                                "Pending Plan identity changed outside the terminal run generation"
+                                    .to_string(),
+                            )
+                        } else if prepared_patch.as_ref().is_some_and(|patch| {
+                            phase_state.terminal_message_anchor.as_ref()
+                                != Some(&patch.message_anchor)
+                        }) {
+                            Err(
+                                "terminal Session patch belongs to a different message anchor"
+                                    .to_string(),
+                            )
+                        } else {
+                            match prepared_patch.as_ref() {
+                                Some(patch) => patch.apply_to_latest(latest),
+                                None => Ok(latest.clone()),
+                            }
+                        }
+                    }
+                },
+            }
+        };
+    let mut snapshot = match snapshot_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            drop(persist_guard);
+            emit_terminal_identity_unavailable(ctx, phase_state, &error).await;
+            return TerminalEventSendOutcome::Failed;
+        }
+    };
+    let terminal_base_snapshot = snapshot.clone();
+    #[cfg(test)]
+    {
+        // Unit fixtures predate schema-version normalization. Production
+        // Sessions are current-version before a run starts.
+        snapshot.version = crate::SESSION_VERSION;
+    }
+    let terminal_plan_event = if !supplied_patch
+        && matches!(
+            terminal_status,
+            "failed" | "stopped" | "incomplete" | "partial" | "blocked"
+        ) {
+        let desired = if terminal_status == "stopped" {
+            crate::plan::PlanStatus::Stopped
+        } else {
+            crate::plan::PlanStatus::Failed
+        };
+        let matching_plan = snapshot.pending_plan.as_ref().is_some_and(|plan| {
+            phase_state
+                .terminal_plan_identity
+                .as_ref()
+                .is_some_and(|(plan_id, revision)| {
+                    plan.id == *plan_id && plan.revision == *revision
+                })
+        });
+        if matching_plan {
+            if snapshot.pending_plan.as_ref().is_some_and(|plan| {
+                matches!(
+                    plan.status,
+                    crate::plan::PlanStatus::Planning | crate::plan::PlanStatus::Executing
+                )
+            }) {
+                let now = now_epoch();
+                snapshot.pending_plan.as_mut().map(|plan| {
+                    plan.status = desired;
+                    plan.updated_at = now;
+                    plan.finished_at = Some(now);
+                    snapshot.updated_at = now;
+                    plan.clone()
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Abnormal exits use the same expected/replacement generation check as
+    // Finish, including publication after the database acknowledges COMMIT.
+    if prepared_patch.is_none() {
+        let patch_result = phase_state
+            .terminal_message_anchor
+            .as_ref()
+            .ok_or_else(|| "Terminal run has no message anchor".to_string())
+            .and_then(|anchor| {
+                TerminalSessionPatch::new(&terminal_base_snapshot, &snapshot, anchor)
+            });
+        match patch_result {
+            Ok(patch) => prepared_patch = Some(patch),
+            Err(error) => {
+                drop(persist_guard);
+                emit_terminal_identity_unavailable(ctx, phase_state, &error).await;
+                return TerminalEventSendOutcome::Failed;
+            }
+        }
+    }
+    let normalized = match session_store::session_for_storage(&snapshot) {
+        Ok(session) => session,
+        Err(error) => {
+            drop(persist_guard);
+            emit_terminal_identity_unavailable(
+                ctx,
+                phase_state,
+                &format!("cannot normalize terminal Session snapshot: {error}"),
+            )
+            .await;
+            return TerminalEventSendOutcome::Failed;
+        }
+    };
+    let Some(end_message_index) = normalized.messages.len().checked_sub(1) else {
+        drop(persist_guard);
+        emit_terminal_identity_unavailable(
+            ctx,
+            phase_state,
+            "cannot persist a terminal outcome without a message boundary",
+        )
+        .await;
+        return TerminalEventSendOutcome::Failed;
+    };
+    let Some(message_anchor) = phase_state.terminal_message_anchor.as_ref() else {
+        drop(persist_guard);
+        emit_terminal_identity_unavailable(
+            ctx,
+            phase_state,
+            "cannot persist terminal outcome without a message anchor",
+        )
+        .await;
+        return TerminalEventSendOutcome::Failed;
+    };
+    let start_message_index = match message_anchor.resolve(&normalized.messages) {
+        Ok(index) => index,
+        Err(error) => {
+            drop(persist_guard);
+            emit_terminal_identity_unavailable(
+                ctx,
+                phase_state,
+                &format!("cannot resolve terminal outcome boundary: {error}"),
+            )
+            .await;
+            return TerminalEventSendOutcome::Failed;
+        }
+    };
+    if end_message_index < start_message_index {
+        drop(persist_guard);
+        emit_terminal_identity_unavailable(
+            ctx,
+            phase_state,
+            &format!(
+                "terminal outcome boundary moved before its run start ({end_message_index} < {start_message_index})"
+            ),
+        )
+        .await;
+        return TerminalEventSendOutcome::Failed;
+    }
+
+    let phase = event["phase"]
+        .as_str()
+        .unwrap_or(if event_type == "error" {
+            "failed"
+        } else {
+            "partial"
+        })
+        .to_string();
+    let reason = event["reason"]
+        .as_str()
+        .or_else(|| event["code"].as_str())
+        .map(str::to_string);
+    #[cfg(not(test))]
+    let run_connection_id = ctx.connection_id.to_string();
+    #[cfg(test)]
+    let run_connection_id = "test-connection".to_string();
+    let final_plan_identity = if let Some(plan) = terminal_plan_event.as_ref() {
+        Some((plan.id.clone(), plan.revision))
+    } else if let Some(patch) = prepared_patch.as_ref() {
+        patch.final_plan_identity(phase_state.terminal_plan_identity.clone())
+    } else {
+        phase_state.terminal_plan_identity.clone()
+    };
+    let (plan_id, plan_revision) = final_plan_identity
+        .map(|(plan_id, revision)| (Some(plan_id), Some(revision)))
+        .unwrap_or((None, None));
+    let outcome = crate::TopLevelRunOutcome {
+        diagnostic: crate::run_diagnostics::RunDiagnostic::from_reason(reason.as_deref()),
+        session_id: ctx.current_session_id.to_string(),
+        run_id: ctx.run_id().to_string(),
+        run_connection_id,
+        status: terminal_status.to_string(),
+        phase,
+        reason,
+        duration_ms,
+        start_message_index,
+        end_message_index,
+        plan_id,
+        plan_revision,
+        started_at: started_at_ms / 1_000,
+        finished_at: finished_at_ms / 1_000,
+    };
+
+    #[cfg(test)]
+    if cancel_before_commit
+        && let Some(gate) = phase_state.completion_evidence.finish_gate.clone()
+        && await_finish_step(ctx, gate.wait(FinishPhaseTestStage::PreTerminalCommit))
+            .await
+            .is_err()
+    {
+        return TerminalEventSendOutcome::CancelledBeforeCommit;
+    }
+    // This is the final exact-generation arbitration. Everything before this
+    // point is safe to abandon; after choosing the terminal database operation
+    // its future must be awaited because tokio-rusqlite cannot retract a closure
+    // already delivered to the SQLite thread.
+    if cancel_before_commit
+        && await_finish_step(ctx, std::future::ready(()))
+            .await
+            .is_err()
+    {
+        return TerminalEventSendOutcome::CancelledBeforeCommit;
+    }
+    if phase_state.completion_evidence.terminal_linearization
+        != TerminalLinearizationState::PreCommit
+    {
+        eprintln!("ERROR: attempted to choose more than one terminal outcome for a run");
+        return TerminalEventSendOutcome::Failed;
+    }
+    phase_state.completion_evidence.terminal_linearization =
+        TerminalLinearizationState::CommitChosen;
+
+    let persisted =
+        session_store::save_session_with_run_outcome_locked(&normalized, outcome.clone()).await;
+    if let Err(error) = persisted {
+        eprintln!("ERROR: failed to persist top-level run outcome: {error}");
+        #[cfg(not(test))]
+        crate::broadcast_storage_status(ctx.state).await;
+        return TerminalEventSendOutcome::Failed;
+    }
+
+    #[cfg(test)]
+    if let Some(gate) = phase_state.completion_evidence.finish_gate.clone() {
+        // Deliberately not cancellation-aware: the SQLite transaction has
+        // already committed, so a Stop observed here is after linearization.
+        gate.wait(FinishPhaseTestStage::PostCommitBeforeAck).await;
+    }
+
+    // Publish the committed snapshot to in-memory readers only after SQLite
+    // acknowledges the one transaction containing Session, Plan, and outcome.
+    let publish_terminal_plan = terminal_plan_event.is_some()
+        || prepared_patch
+            .as_ref()
+            .is_some_and(|patch| matches!(patch.plan, TerminalPlanPatch::Replace(_)));
+    {
+        let mut sessions = ctx.state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(ctx.current_session_id) {
+            let publication_indices = if let Some(patch) = prepared_patch.as_ref() {
+                match (
+                    patch.message_anchor.resolve(&session.messages),
+                    patch.message_anchor.resolve(&normalized.messages),
+                    patch.apply_to_latest(session),
+                ) {
+                    (Ok(live_start), Ok(normalized_start), Ok(_)) => {
+                        Some((live_start, normalized_start))
+                    }
+                    _ => None,
+                }
+            } else {
+                Some((0, 0))
+            };
+            if let Some((live_start, normalized_start)) = publication_indices {
+                // Keep runtime-only and independently managed Session fields
+                // from the live object while publishing exactly the
+                // terminal-owned fields that the transaction committed.
+                if prepared_patch.is_some() {
+                    session.messages.truncate(live_start);
+                    session
+                        .messages
+                        .extend(normalized.messages[normalized_start..].iter().cloned());
+                } else {
+                    session.messages = normalized.messages.clone();
+                }
+                if publish_terminal_plan {
+                    session.pending_plan = normalized.pending_plan.clone();
+                }
+                session.subagent_snapshots = normalized.subagent_snapshots.clone();
+                session.failed_tool_results = normalized.failed_tool_results.clone();
+                session.updated_at = session.updated_at.max(normalized.updated_at);
+            } else {
+                // Every supported writer holds the same persistence gate, so
+                // this indicates an out-of-contract run-tail mutation. Never
+                // overwrite that newer in-memory generation after COMMIT.
+                eprintln!(
+                    "ERROR: terminal Session generation changed before in-memory publication"
+                );
+            }
+        } else {
+            sessions.insert(ctx.current_session_id.to_string(), normalized.clone());
+        }
+    }
+    phase_state.completion_evidence.terminal_linearization = TerminalLinearizationState::Committed;
+    #[cfg(test)]
+    {
+        TERMINAL_PERSISTENCE_RECORDS
+            .lock()
+            .await
+            .insert(ctx.current_session_id.to_string(), (normalized, outcome));
+    }
+    drop(persist_guard);
+
+    if let Some(plan) = terminal_plan_event {
+        post_commit_events.push(json!({"type":"plan_state", "plan": plan.to_live_value()}));
+    }
+    for post_commit_event in post_commit_events {
+        if !live_send(ctx.live_tx, post_commit_event).await {
+            // The database fact remains authoritative and History can recover
+            // it even when the current socket disappeared after commit.
+            return TerminalEventSendOutcome::Committed;
+        }
+    }
+    let _ = live_send(ctx.live_tx, event).await;
+    TerminalEventSendOutcome::Committed
+}
+
+#[cfg(test)]
+async fn take_terminal_persistence_record(
+    session_id: &str,
+) -> Option<(Session, crate::TopLevelRunOutcome)> {
+    TERMINAL_PERSISTENCE_RECORDS.lock().await.remove(session_id)
 }
 
 async fn run_tool_with_feedback<F>(
@@ -2878,6 +3600,7 @@ async fn execute_tool_call(
             None,
             execute_task_tool(
                 &effective_args,
+                &tc.id,
                 &delegated_config,
                 &ctx.state.http,
                 &phase_state.session_home,
@@ -2902,6 +3625,7 @@ async fn execute_tool_call(
             &tc.function.name,
             None,
             execute_orchestrate_tool(
+                &tc.id,
                 &effective_args,
                 &delegated_config,
                 &ctx.state.http,
@@ -2970,6 +3694,7 @@ async fn execute_tool_call(
                 &phase_state.cycle_workspace,
                 false,
                 Some(crate::LiveOutputReplayCtx {
+                    parent_tool_call_id: None,
                     state: Arc::clone(ctx.state),
                     session_id: ctx.current_session_id.to_string(),
                 }),
@@ -3333,6 +4058,18 @@ async fn record_materialized_tool_result(
         .iter()
         .map(crate::image_uploads::public_image_payload)
         .collect::<Vec<_>>();
+
+    if !is_internal_plan_tool(&tc.function.name) {
+        let recovery_key = crate::tool_recovery::canonical_tool_retry_key(
+            &tc.function.name,
+            effective_args.unwrap_or(&tc.function.arguments),
+        );
+        if result.is_error {
+            phase_state.unresolved_tool_targets.insert(recovery_key);
+        } else {
+            phase_state.unresolved_tool_targets.remove(&recovery_key);
+        }
+    }
 
     record_plan_completion_tool_outcome(
         phase_state,
@@ -3854,10 +4591,20 @@ async fn run_analyze_phase(
         if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
             done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
-        if !live_send(ctx.live_tx, system_event).await {
-            return AgentPhaseControl::Break;
+        done_event["run_id"] = json!(ctx.run_id());
+        if persist_and_send_terminal_event(
+            ctx,
+            phase_state,
+            done_event,
+            true,
+            None,
+            vec![system_event],
+        )
+        .await
+            == TerminalEventSendOutcome::CancelledBeforeCommit
+        {
+            apply_run_cancel_outcome(ctx, phase_state).await;
         }
-        let _ = live_send(ctx.live_tx, done_event).await;
         return AgentPhaseControl::Break;
     }
 
@@ -4017,6 +4764,7 @@ async fn run_analyze_phase(
 
     let mut start_event = json!({
         "type":"start",
+        "run_id": ctx.run_id(),
         "round": phase_state.round + 1,
         "phase": phase_state.react_ctx.phase().label(),
         "cycle": phase_state.react_ctx.cycles,
@@ -4093,18 +4841,33 @@ async fn run_analyze_phase(
 
     if request_estimate > request_budget {
         phase_state.run_failed = true;
-        let _ = live_send(
-            ctx.live_tx,
+        let diagnostic = crate::run_diagnostics::RunDiagnostic {
+            code: crate::run_diagnostics::RunDiagnosticCode::ContextBudgetExceeded,
+        };
+        if persist_and_send_terminal_event(
+            ctx,
+            phase_state,
             json!({
                 "type":"error",
+                "run_terminal":true,
+                "run_id":ctx.run_id(),
+                "code": diagnostic.reason(),
+                "diagnostic": diagnostic,
                 "content": format!(
                     "Estimated request size {} exceeds runtime input budget {} after accounting for tools and reasoning. Reduce context, disable MCP servers, lower /think, or switch to a model with a larger context window.",
                     format_token_count(request_estimate as u64),
                     format_token_count(request_budget as u64),
                 ),
             }),
+            true,
+            None,
+            Vec::new(),
         )
-        .await;
+        .await
+            == TerminalEventSendOutcome::CancelledBeforeCommit
+        {
+            apply_run_cancel_outcome(ctx, phase_state).await;
+        }
         return AgentPhaseControl::Break;
     }
 
@@ -4174,7 +4937,12 @@ async fn run_analyze_phase(
                 agent_llm_attempt += 1;
                 let _ = live_send(
                     ctx.live_tx,
-                    json!({"type":"system","content":format!("LLM request failed ({e}), retrying...")}),
+                    json!({
+                        "type":"progress",
+                        "kind":"llm_retry",
+                        "attempt": agent_llm_attempt + 1,
+                        "max_attempts": 2,
+                    }),
                 )
                 .await;
                 // Backoff before agent-level retry, respecting cancellation.
@@ -4210,7 +4978,20 @@ async fn run_analyze_phase(
         }
         Err(error) => {
             phase_state.run_failed = true;
-            let _ = live_send(ctx.live_tx, json!({"type":"error","content":error})).await;
+            let diagnostic = crate::run_diagnostics::RunDiagnostic::from_provider_error(&error);
+            if persist_and_send_terminal_event(
+                ctx,
+                phase_state,
+                json!({"type":"error","run_terminal":true,"run_id":ctx.run_id(),"code":diagnostic.reason(),"diagnostic":diagnostic,"content":diagnostic.safe_message()}),
+                true,
+                None,
+                Vec::new(),
+            )
+            .await
+                == TerminalEventSendOutcome::CancelledBeforeCommit
+            {
+                apply_run_cancel_outcome(ctx, phase_state).await;
+            }
             AgentPhaseControl::Break
         }
     }
@@ -4470,6 +5251,7 @@ async fn run_act_phase(
                             cycle_workspace,
                             true,
                             Some(crate::LiveOutputReplayCtx {
+                                parent_tool_call_id: None,
                                 state: Arc::clone(ctx.state),
                                 session_id: ctx.current_session_id.to_string(),
                             }),
@@ -4692,18 +5474,14 @@ async fn run_observe_phase(
     AgentPhaseControl::Continue
 }
 
-async fn register_pending_plan(
-    ctx: &AgentRunCtx<'_>,
+fn register_pending_plan(
+    session: &mut Session,
     phase_state: &mut AgentPhaseState,
 ) -> Vec<serde_json::Value> {
     if phase_state.react_ctx.finish_reason != Some(agent::FinishReason::Complete) {
         return Vec::new();
     }
 
-    let mut sessions = ctx.state.sessions.lock().await;
-    let Some(session) = sessions.get_mut(ctx.current_session_id) else {
-        return Vec::new();
-    };
     let latest_user_message_index = session
         .messages
         .iter()
@@ -4868,19 +5646,21 @@ async fn register_pending_plan(
     events
 }
 
-async fn mark_execution_plan_terminal(
-    state: &Arc<AppState>,
-    session_id: &str,
+fn mark_execution_plan_terminal_in_session(
+    session: &mut Session,
     approved_plan: Option<&crate::PendingPlan>,
     status: crate::plan::PlanStatus,
 ) -> Option<crate::PendingPlan> {
     let approved_plan = approved_plan?;
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions.get_mut(session_id)?;
     let plan = session.pending_plan.as_mut()?;
+    let stopping_exact_finish = status == crate::plan::PlanStatus::Stopped
+        && matches!(
+            plan.status,
+            crate::plan::PlanStatus::Completed | crate::plan::PlanStatus::Failed
+        );
     if plan.id != approved_plan.id
         || plan.revision != approved_plan.revision
-        || plan.status != crate::plan::PlanStatus::Executing
+        || (plan.status != crate::plan::PlanStatus::Executing && !stopping_exact_finish)
     {
         return None;
     }
@@ -4892,15 +5672,17 @@ async fn mark_execution_plan_terminal(
     Some(plan.clone())
 }
 
-async fn mark_planning_plan_terminal(
-    state: &Arc<AppState>,
-    session_id: &str,
+fn mark_planning_plan_terminal_in_session(
+    session: &mut Session,
     status: crate::plan::PlanStatus,
 ) -> Option<crate::PendingPlan> {
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions.get_mut(session_id)?;
     let plan = session.pending_plan.as_mut()?;
-    if plan.status != crate::plan::PlanStatus::Planning {
+    let stopping_exact_finish = status == crate::plan::PlanStatus::Stopped
+        && matches!(
+            plan.status,
+            crate::plan::PlanStatus::Completed | crate::plan::PlanStatus::Failed
+        );
+    if plan.status != crate::plan::PlanStatus::Planning && !stopping_exact_finish {
         return None;
     }
     let now = now_epoch();
@@ -4909,6 +5691,27 @@ async fn mark_planning_plan_terminal(
     plan.finished_at = Some(now);
     session.updated_at = now;
     Some(plan.clone())
+}
+
+async fn mark_execution_plan_terminal(
+    state: &Arc<AppState>,
+    session_id: &str,
+    approved_plan: Option<&crate::PendingPlan>,
+    status: crate::plan::PlanStatus,
+) -> Option<crate::PendingPlan> {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(session_id)?;
+    mark_execution_plan_terminal_in_session(session, approved_plan, status)
+}
+
+async fn mark_planning_plan_terminal(
+    state: &Arc<AppState>,
+    session_id: &str,
+    status: crate::plan::PlanStatus,
+) -> Option<crate::PendingPlan> {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(session_id)?;
+    mark_planning_plan_terminal_in_session(session, status)
 }
 
 async fn fail_plan_before_agent_phase(
@@ -4948,6 +5751,122 @@ enum PlanCompletionVerifierOutcome {
     Completed(crate::plan::PlanCompletionReport),
     Cancelled,
     TimedOut,
+}
+
+async fn await_finish_step<F, T>(ctx: &AgentRunCtx<'_>, future: F) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = ctx.run_cancel.cancelled() => Err(()),
+        _ = wait_for_active_run_stop_request(ctx.state, ctx.current_session_id) => {
+            ctx.run_cancel.cancel();
+            Err(())
+        }
+        result = future => Ok(result),
+    }
+}
+
+fn enqueue_success_background_work(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &AgentPhaseState,
+    snapshot: Option<&Session>,
+    config: &Arc<Config>,
+) {
+    let memory_queue = ctx.state.memory_queue();
+    if !phase_state.run_mode.is_plan_only()
+        && config.structured_memory
+        && let (Some(queue), Some(session)) = (memory_queue.as_ref(), snapshot)
+    {
+        let model = config.memory_model_or(&ctx.model).to_string();
+        let excerpt = crate::memory::prefilter_for_memory(&session.messages);
+        queue.enqueue(
+            session.id.clone(),
+            session.workspace.clone(),
+            model,
+            config.clone(),
+            excerpt,
+        );
+    }
+
+    if phase_state.run_mode.is_plan_only()
+        || !reflection_run_snapshot_is_enabled(config)
+        || snapshot.is_none()
+    {
+        return;
+    }
+    let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
+        phase_state.react_ctx.cycles,
+        phase_state.react_ctx.tool_calls,
+    ) else {
+        return;
+    };
+    let reflection_generation = reflection_runtime_generation();
+    if !reflection_runtime_matches(reflection_generation) {
+        rollback_reflection_claim(previous_epoch, claimed_epoch);
+        return;
+    }
+
+    let Some(session) = snapshot else {
+        rollback_reflection_claim(previous_epoch, claimed_epoch);
+        return;
+    };
+    let config = ctx.config.clone();
+    let http = ctx.state.http.clone();
+    let sessions = ctx.state.sessions.clone();
+    let session_id = session.id.clone();
+    let workspace = session.workspace.clone();
+    let fallback_model = ctx.model.clone();
+    let model = config.reflection_model_or(&fallback_model).to_string();
+    let messages = crate::memory::prefilter_for_memory(&session.messages);
+    let cycles = phase_state.react_ctx.cycles;
+    let tool_calls = phase_state.react_ctx.tool_calls;
+    let reflection_timeout = config.tool_timeout.max(std::time::Duration::from_secs(30));
+    let auxiliary_tasks = ctx.state.auxiliary_tasks.clone();
+    let permit = match auxiliary_tasks.permit(
+        &session_id,
+        crate::auxiliary_tasks::AuxiliaryTaskKind::Reflection,
+    ) {
+        Ok(permit) => permit,
+        Err(_) => {
+            rollback_reflection_claim(previous_epoch, claimed_epoch);
+            return;
+        }
+    };
+    let task = auxiliary_tasks.spawn(permit, move |task_context| async move {
+        let outcome = run_post_execution_reflection(PostExecutionReflectionInput {
+            config,
+            http,
+            sessions,
+            session_id,
+            workspace,
+            model,
+            messages,
+            policy_generation: reflection_generation,
+            cycles,
+            tool_calls,
+            provider_timeout: reflection_timeout,
+            task_context,
+            #[cfg(test)]
+            provider_succeeded_gate: None,
+        })
+        .await;
+
+        match outcome {
+            Err(error) => {
+                eprintln!("Reflection failed (non-critical): {error}");
+                rollback_reflection_claim(previous_epoch, claimed_epoch);
+            }
+            Ok(true) => {}
+            Ok(false) => {
+                rollback_reflection_claim(previous_epoch, claimed_epoch);
+            }
+        }
+    });
+    if task.is_err() {
+        rollback_reflection_claim(previous_epoch, claimed_epoch);
+    }
 }
 
 async fn verify_plan_completion_contract(
@@ -5050,30 +5969,19 @@ async fn run_finish_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
-    let config = ctx.config.clone();
-    let plan_registration_rollback = if phase_state.run_mode.is_plan_only() {
-        let sessions = ctx.state.sessions.lock().await;
-        sessions.get(ctx.current_session_id).cloned()
-    } else {
-        None
-    };
-    let mut plan_events = if phase_state.run_mode.is_plan_only() {
-        register_pending_plan(ctx, phase_state).await
-    } else {
-        Vec::new()
-    };
-    if phase_state.run_mode.is_plan_only()
-        && plan_events.is_empty()
-        && let Some(plan) = mark_planning_plan_terminal(
-            ctx.state,
-            ctx.current_session_id,
-            crate::plan::PlanStatus::Failed,
-        )
-        .await
-    {
-        phase_state.run_failed = true;
-        plan_events.push(json!({"type":"plan_state", "plan": plan.to_live_value()}));
+    macro_rules! await_or_cancel {
+        ($future:expr) => {
+            match await_finish_step(ctx, $future).await {
+                Ok(result) => result,
+                Err(()) => {
+                    apply_run_cancel_outcome(ctx, phase_state).await;
+                    return AgentPhaseControl::Break;
+                }
+            }
+        };
     }
+
+    let config = ctx.config.clone();
     let execution_plan_snapshot = if phase_state.run_mode.is_plan_only() {
         None
     } else {
@@ -5121,115 +6029,21 @@ async fn run_finish_phase(
     let completion_failed = completion_report
         .as_ref()
         .is_some_and(|report| !report.passed());
-    let completion_contract_rollback =
-        if let Some(report) = completion_report.as_ref().filter(|report| !report.passed()) {
-            let mut sessions = ctx.state.sessions.lock().await;
-            sessions
-                .get_mut(ctx.current_session_id)
-                .and_then(|session| {
-                    let previous_session_updated_at = session.updated_at;
-                    let plan = session.pending_plan.as_mut()?;
-                    let approved = phase_state.approved_plan.as_ref()?;
-                    if plan.id != approved.id
-                        || plan.revision != approved.revision
-                        || plan.status != crate::plan::PlanStatus::Executing
-                    {
-                        return None;
-                    }
-                    let rollback = (plan.clone(), previous_session_updated_at);
-                    if let Err(error) = crate::plan::apply_completion_failures(plan, report) {
-                        eprintln!(
-                            "ERROR: failed to bind completion failures to plan progress: {error}"
-                        );
-                    }
-                    let now = now_epoch();
-                    plan.updated_at = now;
-                    session.updated_at = now;
-                    Some(rollback)
-                })
-        } else {
-            None
-        };
-    let execution_incomplete = reported_steps_incomplete || completion_failed;
+    let unresolved_tools = !phase_state.unresolved_tool_targets.is_empty();
+    let execution_incomplete = reported_steps_incomplete || completion_failed || unresolved_tools;
     let execution_terminal_status = if execution_incomplete {
         phase_state.run_failed = true;
         crate::plan::PlanStatus::Failed
     } else {
         crate::plan::PlanStatus::Completed
     };
-    let completion_rollback = if phase_state.run_mode.is_plan_only() {
-        None
-    } else if completion_contract_rollback.is_some() {
-        completion_contract_rollback
-    } else {
-        let sessions = ctx.state.sessions.lock().await;
-        sessions.get(ctx.current_session_id).and_then(|session| {
-            let plan = session.pending_plan.as_ref()?;
-            let approved = phase_state.approved_plan.as_ref()?;
-            (plan.id == approved.id
-                && plan.revision == approved.revision
-                && plan.status == crate::plan::PlanStatus::Executing)
-                .then(|| (plan.clone(), session.updated_at))
-        })
-    };
-    let terminal_plan = if phase_state.run_mode.is_plan_only() {
-        None
-    } else {
-        mark_execution_plan_terminal(
-            ctx.state,
-            ctx.current_session_id,
-            phase_state.approved_plan.as_ref(),
-            execution_terminal_status,
-        )
-        .await
-    };
-
-    if let Err(error) =
-        session_store::save_current_session_to_disk(ctx.state, ctx.current_session_id).await
-    {
-        if let Some(previous_session) = plan_registration_rollback {
-            let mut sessions = ctx.state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(ctx.current_session_id) {
-                *session = previous_session;
-            }
-        } else if let (Some(terminal), Some((previous_plan, previous_session_updated_at))) =
-            (terminal_plan.as_ref(), completion_rollback)
-        {
-            let mut sessions = ctx.state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(ctx.current_session_id)
-                && session.pending_plan.as_ref().is_some_and(|plan| {
-                    plan.id == terminal.id
-                        && plan.revision == terminal.revision
-                        && plan.status == execution_terminal_status
-                        && plan.finished_at == terminal.finished_at
-                })
-            {
-                session.pending_plan = Some(previous_plan);
-                session.updated_at = previous_session_updated_at;
-            }
+    #[cfg(test)]
+    await_or_cancel!(async {
+        if let Some(gate) = phase_state.completion_evidence.finish_gate.as_ref() {
+            gate.wait(FinishPhaseTestStage::OnFinishHook).await;
         }
-        eprintln!("ERROR: failed to save session at finish phase: {error}");
-        phase_state.run_failed = true;
-        if ctx.state.storage_is_writable() {
-            let _ = live_send(
-                ctx.live_tx,
-                json!({
-                    "type":"error",
-                    "content":"The final Agent state could not be saved.",
-                    "dismissible":true,
-                }),
-            )
-            .await;
-        }
-        return AgentPhaseControl::Break;
-    }
-
-    let snapshot = {
-        let sessions = ctx.state.sessions.lock().await;
-        sessions.get(ctx.current_session_id).cloned()
-    };
-
-    let on_finish_events = run_hooks(
+    });
+    let on_finish_events = await_or_cancel!(run_hooks(
         &ctx.state.hooks,
         agent::HookPoint::OnFinish,
         &ctx.state.sessions,
@@ -5240,168 +6054,20 @@ async fn run_finish_phase(
         None,
         None,
         None,
-    )
-    .await;
-
-    for event in on_finish_events {
-        let _ = live_send(ctx.live_tx, event).await;
-    }
-
-    for event in plan_events {
-        let _ = live_send(ctx.live_tx, event).await;
-    }
-    if let Some(plan) = terminal_plan {
-        phase_state.approved_plan = Some(plan.clone());
-        let _ = live_send(
-            ctx.live_tx,
-            json!({"type":"plan_state", "plan": plan.to_live_value()}),
-        )
-        .await;
-    }
-    if completion_failed {
-        if let Some(report) = completion_report.as_ref() {
-            let checks = report
-                .failures
-                .iter()
-                .map(|failure| {
-                    json!({
-                        "check_id": failure.check_id,
-                        "step_id": failure.step_id,
-                        "reason": failure.reason,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let _ = live_send(
-                ctx.live_tx,
-                json!({
-                    "type":"error",
-                    "code":"plan_completion_contract_failed",
-                    "plan_id":report.plan_id,
-                    "revision":report.revision,
-                    "checks":checks,
-                    "content":"The final workspace or execution evidence did not satisfy the immutable approved revision. The plan was marked failed and can be revised or resumed.",
-                    "dismissible":true,
-                }),
-            )
-            .await;
+    ));
+    #[cfg(test)]
+    await_or_cancel!(async {
+        if let Some(gate) = phase_state.completion_evidence.finish_gate.as_ref() {
+            gate.wait(FinishPhaseTestStage::BetweenHookEvents).await;
         }
-    } else if reported_steps_incomplete {
-        let _ = live_send(
-            ctx.live_tx,
-            json!({
-                "type":"error",
-                "code":"plan_execution_incomplete",
-                "content":"The Agent ended before every approved plan step was reported completed or skipped. The plan was marked failed and can be resumed.",
-                "dismissible":true,
-            }),
-        )
-        .await;
-    }
-
-    // Enqueue structured memory update (async, non-blocking).
-    // Pre-filter messages to avoid cloning the full session history.
-    let memory_queue = ctx.state.memory_queue();
-    if !phase_state.run_mode.is_plan_only()
-        && !phase_state.run_failed
-        && config.structured_memory
-        && let (Some(queue), Some(session)) = (memory_queue.as_ref(), &snapshot)
-    {
-        let model = config.memory_model_or(&ctx.model).to_string();
-        let excerpt = crate::memory::prefilter_for_memory(&session.messages);
-        queue.enqueue(
-            session.id.clone(),
-            session.workspace.clone(),
-            model,
-            config.clone(),
-            excerpt,
-        );
-    }
-
-    // Post-execution reflection for non-trivial multi-step tasks.
-    // Gated by config.daily_reflection + minimum complexity + cooldown.
-    // Spawned as a background task to avoid delaying the "done" event.
-    // NOTE: snapshot check must precede try_claim_reflection() because the
-    // CAS has a side-effect; if it fires but the session is gone, nobody
-    // would roll back the cooldown slot.
-    if !phase_state.run_mode.is_plan_only()
-        && !phase_state.run_failed
-        && reflection_run_snapshot_is_enabled(&config)
-        && let Some(ref session) = snapshot
-        && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
-            phase_state.react_ctx.cycles,
-            phase_state.react_ctx.tool_calls,
-        )
-    {
-        let reflection_generation = reflection_runtime_generation();
-        if !reflection_runtime_matches(reflection_generation) {
-            rollback_reflection_claim(previous_epoch, claimed_epoch);
-        } else {
-            let config = ctx.config.clone();
-            let http = ctx.state.http.clone();
-            let sessions = ctx.state.sessions.clone();
-            let session_id = session.id.clone();
-            let workspace = session.workspace.clone();
-            let fallback_model = ctx.model.clone();
-            let model = config.reflection_model_or(&fallback_model).to_string();
-            let messages = crate::memory::prefilter_for_memory(&session.messages);
-            let cycles = phase_state.react_ctx.cycles;
-            let tool_calls = phase_state.react_ctx.tool_calls;
-            // Match structured memory: floor at 30s so a low toolTimeout doesn't
-            // cause reflections to time out systematically.
-            let reflection_timeout = config.tool_timeout.max(std::time::Duration::from_secs(30));
-            let reflection_cancel = CancellationToken::new();
-            let reflection_task_id = register_active_reflection(reflection_cancel.clone());
-            tokio::spawn(async move {
-                let outcome = tokio::select! {
-                    _ = reflection_cancel.cancelled() => None,
-                    outcome = tokio::time::timeout(
-                        reflection_timeout,
-                        run_post_execution_reflection(PostExecutionReflectionInput {
-                            config,
-                            http,
-                            sessions,
-                            session_id,
-                            workspace,
-                            model,
-                            messages,
-                            policy_generation: reflection_generation,
-                            cycles,
-                            tool_calls,
-                        }),
-                    ) => Some(outcome),
-                };
-                finish_active_reflection(reflection_task_id);
-
-                match outcome {
-                    None => {
-                        rollback_reflection_claim(previous_epoch, claimed_epoch);
-                    }
-                    Some(Ok(Err(e))) => {
-                        eprintln!("Reflection failed (non-critical): {e}");
-                        // Roll back so the next non-trivial run can try again.
-                        rollback_reflection_claim(previous_epoch, claimed_epoch);
-                    }
-                    Some(Err(_elapsed)) => {
-                        eprintln!("Reflection timed out (non-critical)");
-                        rollback_reflection_claim(previous_epoch, claimed_epoch);
-                    }
-                    Some(Ok(Ok(true))) => {
-                        // CAS already claimed the slot — nothing more to do.
-                    }
-                    Some(Ok(Ok(false))) => {
-                        // Conversation was too trivial — no reflection written.
-                        // Roll back so the next non-trivial run can reflect.
-                        rollback_reflection_claim(previous_epoch, claimed_epoch);
-                    }
-                }
-            });
-        }
-    }
+    });
 
     let finish_label = if completion_failed {
         "completion_contract_failed"
-    } else if execution_incomplete {
+    } else if reported_steps_incomplete {
         "incomplete_plan"
+    } else if unresolved_tools {
+        "unresolved_tool_failures"
     } else {
         phase_state
             .react_ctx
@@ -5409,31 +6075,254 @@ async fn run_finish_phase(
             .map(|reason| reason.label())
             .unwrap_or("complete")
     };
-    let finish_phase = if execution_incomplete {
+    let finish_phase = if reported_steps_incomplete || completion_failed {
         "failed"
+    } else if unresolved_tools {
+        "partial"
     } else {
         "finish"
     };
 
-    let usage = build_done_usage(
+    #[cfg(test)]
+    await_or_cancel!(async {
+        if let Some(gate) = phase_state.completion_evidence.finish_gate.as_ref() {
+            gate.wait(FinishPhaseTestStage::Usage).await;
+        }
+    });
+    let usage = await_or_cancel!(build_done_usage(
         ctx.state,
         ctx.current_session_id,
         phase_state.usage_snap_input,
         phase_state.usage_snap_output,
-    )
-    .await;
+    ));
+
+    await_or_cancel!(std::future::ready(()));
+    let prepared_base_snapshot = {
+        let sessions = await_or_cancel!(ctx.state.sessions.lock());
+        let Some(session) = sessions.get(ctx.current_session_id) else {
+            emit_terminal_identity_unavailable(
+                ctx,
+                phase_state,
+                "Finish cannot resolve the active Session",
+            )
+            .await;
+            return AgentPhaseControl::Break;
+        };
+        session.clone()
+    };
+    let mut prepared_snapshot = prepared_base_snapshot.clone();
+    if let Err(error) = ensure_terminal_run_identity(phase_state, &prepared_base_snapshot) {
+        emit_terminal_identity_unavailable(
+            ctx,
+            phase_state,
+            &format!("cannot prepare terminal run identity: {error}"),
+        )
+        .await;
+        return AgentPhaseControl::Break;
+    }
+    let mut plan_events = if phase_state.run_mode.is_plan_only() {
+        register_pending_plan(&mut prepared_snapshot, phase_state)
+    } else {
+        Vec::new()
+    };
+    if phase_state.run_mode.is_plan_only()
+        && plan_events.is_empty()
+        && let Some(plan) = mark_planning_plan_terminal_in_session(
+            &mut prepared_snapshot,
+            crate::plan::PlanStatus::Failed,
+        )
+    {
+        phase_state.run_failed = true;
+        plan_events.push(json!({"type":"plan_state", "plan": plan.to_live_value()}));
+    }
+    if let Some(report) = completion_report.as_ref().filter(|report| !report.passed())
+        && let Some(plan) = prepared_snapshot.pending_plan.as_mut()
+        && phase_state.approved_plan.as_ref().is_some_and(|approved| {
+            plan.id == approved.id
+                && plan.revision == approved.revision
+                && plan.status == crate::plan::PlanStatus::Executing
+        })
+    {
+        if let Err(error) = crate::plan::apply_completion_failures(plan, report) {
+            eprintln!("ERROR: failed to bind completion failures to plan progress: {error}");
+        }
+        let now = now_epoch();
+        plan.updated_at = now;
+        prepared_snapshot.updated_at = now;
+    }
+    let terminal_plan = if phase_state.run_mode.is_plan_only() {
+        None
+    } else {
+        mark_execution_plan_terminal_in_session(
+            &mut prepared_snapshot,
+            phase_state.approved_plan.as_ref(),
+            execution_terminal_status,
+        )
+    };
+    #[cfg(test)]
+    await_or_cancel!(async {
+        if let Some(gate) = phase_state.completion_evidence.finish_gate.as_ref() {
+            gate.wait(FinishPhaseTestStage::BetweenPlanEvents).await;
+        }
+    });
+    #[cfg(test)]
+    await_or_cancel!(async {
+        if let Some(gate) = phase_state.completion_evidence.finish_gate.as_ref() {
+            gate.wait(FinishPhaseTestStage::PostSessionMutation).await;
+        }
+    });
+
+    let mut post_commit_events = on_finish_events;
+    post_commit_events.append(&mut plan_events);
+    if let Some(plan) = terminal_plan.as_ref() {
+        post_commit_events.push(json!({"type":"plan_state", "plan": plan.to_live_value()}));
+    }
+
+    let Some(message_anchor) = phase_state.terminal_message_anchor.as_ref() else {
+        emit_terminal_identity_unavailable(
+            ctx,
+            phase_state,
+            "Finish has no run-start message anchor",
+        )
+        .await;
+        return AgentPhaseControl::Break;
+    };
+    let terminal_patch = match TerminalSessionPatch::new(
+        &prepared_base_snapshot,
+        &prepared_snapshot,
+        message_anchor,
+    ) {
+        Ok(patch) => patch,
+        Err(error) => {
+            emit_terminal_identity_unavailable(
+                ctx,
+                phase_state,
+                &format!("cannot prepare terminal Session patch: {error}"),
+            )
+            .await;
+            return AgentPhaseControl::Break;
+        }
+    };
 
     let mut done_event = json!({
         "type":"done",
+        "run_id":ctx.run_id(),
         "phase":finish_phase,
         "reason": finish_label,
         "cycles": phase_state.react_ctx.cycles,
         "tool_calls": phase_state.react_ctx.tool_calls,
     });
+    if phase_state.run_mode.is_plan_only()
+        && prepared_snapshot
+            .pending_plan
+            .as_ref()
+            .is_some_and(|plan| plan.status == crate::plan::PlanStatus::NeedsInput)
+    {
+        done_event["phase"] = json!("waiting_user");
+        done_event["reason"] = json!("needs_input");
+    }
     if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
         done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    let _ = live_send(ctx.live_tx, done_event).await;
+    let terminal_event = if completion_failed {
+        let Some(report) = completion_report.as_ref() else {
+            return AgentPhaseControl::Break;
+        };
+        let checks = report
+            .failures
+            .iter()
+            .map(|failure| {
+                json!({
+                    "check_id": failure.check_id,
+                    "step_id": failure.step_id,
+                    "reason": failure.reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "type":"error",
+            "run_terminal":true,
+            "run_id":ctx.run_id(),
+            "code":"plan_completion_contract_failed",
+            "plan_id":report.plan_id,
+            "revision":report.revision,
+            "checks":checks,
+            "content":"The final workspace or execution evidence did not satisfy the immutable approved revision. The plan was marked failed and can be revised or resumed.",
+            "dismissible":true,
+        })
+    } else if reported_steps_incomplete {
+        json!({
+            "type":"error",
+            "run_terminal":true,
+            "run_id":ctx.run_id(),
+            "code":"plan_execution_incomplete",
+            "content":"The Agent ended before every approved plan step was reported completed or skipped. The plan was marked failed and can be resumed.",
+            "dismissible":true,
+        })
+    } else if phase_state.run_mode.is_plan_only() && phase_state.run_failed {
+        json!({
+            "type":"error",
+            "run_terminal":true,
+            "run_id":ctx.run_id(),
+            "code":"plan_submission_failed",
+            "content":"The planning run ended without a valid approvable revision.",
+            "dismissible":true,
+        })
+    } else {
+        done_event.clone()
+    };
+    let terminal_outcome = persist_and_send_terminal_event(
+        ctx,
+        phase_state,
+        terminal_event,
+        true,
+        Some(terminal_patch),
+        post_commit_events,
+    )
+    .await;
+    match terminal_outcome {
+        TerminalEventSendOutcome::CancelledBeforeCommit => {
+            apply_run_cancel_outcome(ctx, phase_state).await;
+            return AgentPhaseControl::Break;
+        }
+        TerminalEventSendOutcome::Failed => {
+            phase_state.run_failed = true;
+            if ctx.state.storage_is_writable()
+                && !phase_state
+                    .completion_evidence
+                    .terminal_identity_failure_sent
+            {
+                let _ = live_send(
+                    ctx.live_tx,
+                    json!({
+                        "type":"error",
+                        "run_terminal":true,
+                        "run_id":ctx.run_id(),
+                        "content":"The final Agent state could not be saved.",
+                        "dismissible":true,
+                    }),
+                )
+                .await;
+            }
+            return AgentPhaseControl::Break;
+        }
+        TerminalEventSendOutcome::Committed => {}
+    }
+    if let Some(plan) = terminal_plan {
+        phase_state.approved_plan = Some(plan);
+    }
+
+    if reported_steps_incomplete || completion_failed {
+        // The preceding terminal error is the authoritative persisted fact;
+        // this compatibility done only closes clients that still expect it.
+        let _ = live_send(ctx.live_tx, done_event).await;
+    } else if !execution_incomplete {
+        let committed_snapshot = {
+            let sessions = ctx.state.sessions.lock().await;
+            sessions.get(ctx.current_session_id).cloned()
+        };
+        enqueue_success_background_work(ctx, phase_state, committed_snapshot.as_ref(), &config);
+    }
     AgentPhaseControl::Break
 }
 
@@ -5474,6 +6363,28 @@ async fn wait_for_active_run_stop_request(state: &Arc<AppState>, session_id: &st
     }
 }
 
+async fn relay_active_run_stop_to_cancellation(
+    stop_requested: Arc<AtomicBool>,
+    run_cancel: CancellationToken,
+    shutdown: CancellationToken,
+) {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {}
+        _ = async {
+            while !stop_requested.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        } => {
+            // Every long-running provider/tool/sub-agent path already selects
+            // on this exact generation-bound token. Relaying the atomic stop
+            // request here closes the gap while those futures are in flight,
+            // rather than waiting for the next Agent phase boundary.
+            run_cancel.cancel();
+        }
+    }
+}
+
 async fn apply_run_cancel_outcome(ctx: &AgentRunCtx<'_>, phase_state: &mut AgentPhaseState) {
     let shared_stop_requested = {
         let runs = ctx.state.active_runs.lock().await;
@@ -5485,6 +6396,7 @@ async fn apply_run_cancel_outcome(ctx: &AgentRunCtx<'_>, phase_state: &mut Agent
     if shared_stop_requested {
         fire_stop_command_hook(ctx.state, ctx.current_session_id, ctx.live_tx);
         phase_state.run_stopped = true;
+        phase_state.run_failed = false;
     } else if ctx.cancel.is_cancelled() {
         phase_state.shutting_down = true;
     } else {
@@ -5637,8 +6549,27 @@ pub(crate) async fn run_agent_session(
         };
     };
     let plan_action_prompt = reservation.plan_action_prompt.clone();
+    let run_id = reservation.run_id;
+    #[cfg(test)]
+    let _ = &run_id;
     let run_cancel = reservation.run_cancel;
     let deferred_interventions = reservation.deferred_interventions;
+
+    let (terminal_message_anchor, terminal_plan_identity) = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(current_session_id) {
+            Some(session) => (
+                RunMessageAnchor::from_messages(&session.messages).ok(),
+                active_terminal_plan_identity(session),
+            ),
+            None => (None, None),
+        }
+    };
+
+    #[cfg(not(test))]
+    let terminal_persistence = RunTerminalPersistenceContext {
+        started_at_ms: crate::now_epoch_millis(),
+    };
 
     let ctx = AgentRunCtx {
         state,
@@ -5648,7 +6579,19 @@ pub(crate) async fn run_agent_session(
         cancel,
         live_tx,
         run_cancel: &run_cancel,
+        #[cfg(not(test))]
+        run_id: &run_id,
+        #[cfg(not(test))]
+        connection_id,
+        #[cfg(not(test))]
+        terminal_persistence,
     };
+    let stop_relay_shutdown = CancellationToken::new();
+    let stop_relay = tokio::spawn(relay_active_run_stop_to_cancellation(
+        Arc::clone(stop_requested),
+        run_cancel.clone(),
+        stop_relay_shutdown.clone(),
+    ));
     let mut phase_state = AgentPhaseState {
         round: 0,
         pending_tool_calls: Vec::new(),
@@ -5674,12 +6617,15 @@ pub(crate) async fn run_agent_session(
         stagnation_streak: 0,
         error_streak: 0,
         recent_tool_history: Vec::new(),
+        unresolved_tool_targets: HashSet::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(show_react),
         shutting_down: false,
         run_stopped: false,
         run_failed: false,
         run_detached: false,
+        terminal_message_anchor,
+        terminal_plan_identity,
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
@@ -5752,22 +6698,24 @@ pub(crate) async fn run_agent_session(
         }
     }
 
+    stop_relay_shutdown.cancel();
+    if let Err(error) = stop_relay.await
+        && !error.is_cancelled()
+    {
+        eprintln!("Warning: active-run stop relay failed: {error}");
+    }
+
     socket_input::close_shared_interventions(
         &deferred_interventions,
         &mut phase_state.pending_interventions,
     )
     .await;
 
-    if phase_state.run_failed
-        || phase_state.run_stopped
-        || phase_state.run_detached
-        || phase_state.shutting_down
+    if (phase_state.run_detached || phase_state.shutting_down)
+        && phase_state.completion_evidence.terminal_linearization
+            == TerminalLinearizationState::PreCommit
     {
-        let terminal_status = if phase_state.run_failed {
-            crate::plan::PlanStatus::Failed
-        } else {
-            crate::plan::PlanStatus::Stopped
-        };
+        let terminal_status = crate::plan::PlanStatus::Stopped;
         let terminal_plan = if phase_state.run_mode.is_plan_only() {
             mark_planning_plan_terminal(state, current_session_id, terminal_status).await
         } else {
@@ -5795,6 +6743,130 @@ pub(crate) async fn run_agent_session(
         }
     }
 
+    if phase_state.run_stopped
+        && phase_state.completion_evidence.terminal_linearization
+            == TerminalLinearizationState::PreCommit
+    {
+        let stopped_preparation = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(current_session_id).map(|session| {
+                let base_snapshot = session.clone();
+                let mut snapshot = base_snapshot.clone();
+                session_store::trim_incomplete_tool_calls_in_session(&mut snapshot);
+                let terminal_plan = if phase_state.run_mode.is_plan_only() {
+                    mark_planning_plan_terminal_in_session(
+                        &mut snapshot,
+                        crate::plan::PlanStatus::Stopped,
+                    )
+                } else {
+                    mark_execution_plan_terminal_in_session(
+                        &mut snapshot,
+                        phase_state.approved_plan.as_ref(),
+                        crate::plan::PlanStatus::Stopped,
+                    )
+                };
+                (base_snapshot, snapshot, terminal_plan)
+            })
+        };
+        if let Some((stopped_base_snapshot, mut stopped_snapshot, terminal_plan)) =
+            stopped_preparation
+        {
+            stopped_snapshot.version = crate::SESSION_VERSION;
+            let identity_ready =
+                match ensure_terminal_run_identity(&mut phase_state, &stopped_base_snapshot) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        emit_terminal_identity_unavailable(
+                            &ctx,
+                            &mut phase_state,
+                            &format!("cannot prepare stopped run identity: {error}"),
+                        )
+                        .await;
+                        false
+                    }
+                };
+            let terminal_patch = if identity_ready {
+                match phase_state
+                    .terminal_message_anchor
+                    .as_ref()
+                    .ok_or_else(|| "stopped run has no terminal message anchor".to_string())
+                    .and_then(|anchor| {
+                        TerminalSessionPatch::new(&stopped_base_snapshot, &stopped_snapshot, anchor)
+                    }) {
+                    Ok(patch) => Some(patch),
+                    Err(error) => {
+                        emit_terminal_identity_unavailable(
+                            &ctx,
+                            &mut phase_state,
+                            &format!("cannot prepare stopped Session patch: {error}"),
+                        )
+                        .await;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(terminal_patch) = terminal_patch {
+                let usage = build_done_usage(
+                    state,
+                    current_session_id,
+                    phase_state.usage_snap_input,
+                    phase_state.usage_snap_output,
+                )
+                .await;
+                let mut done_event = json!({
+                    "type":"done",
+                    "run_id":run_id,
+                    "phase":"stopped",
+                    "reason":"user_stop",
+                    "cycles":phase_state.react_ctx.cycles,
+                    "tool_calls":phase_state.react_ctx.tool_calls
+                });
+                if let (Some(done_obj), Some(usage_obj)) =
+                    (done_event.as_object_mut(), usage.as_object())
+                {
+                    done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+                let post_commit_events = terminal_plan
+                    .as_ref()
+                    .map(|plan| vec![json!({"type":"plan_state", "plan":plan.to_live_value()})])
+                    .unwrap_or_default();
+                if persist_and_send_terminal_event(
+                    &ctx,
+                    &mut phase_state,
+                    done_event,
+                    false,
+                    Some(terminal_patch),
+                    post_commit_events,
+                )
+                .await
+                    == TerminalEventSendOutcome::Committed
+                    && let Some(plan) = terminal_plan
+                {
+                    phase_state.approved_plan = Some(plan);
+                }
+            }
+        } else {
+            emit_terminal_identity_unavailable(
+                &ctx,
+                &mut phase_state,
+                "cannot persist stopped outcome for a missing Session",
+            )
+            .await;
+        }
+        persist_pending_interventions(
+            state,
+            current_session_id,
+            &mut phase_state.pending_interventions,
+        )
+        .await;
+    }
+
+    // A natural terminal commit wins a simultaneous stop arriving after its
+    // final cancellation checkpoint. Never carry that stale bit into the next
+    // run on this connection.
+    stop_requested.store(false, Ordering::Relaxed);
     {
         let mut runs = state.active_runs.lock().await;
         if runs.get(current_session_id).map(|run| run.connection_id) == Some(connection_id) {
@@ -5816,39 +6888,6 @@ pub(crate) async fn run_agent_session(
     } else {
         false
     };
-
-    if phase_state.run_stopped {
-        {
-            let mut sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(current_session_id) {
-                session_store::trim_incomplete_tool_calls_in_session(session);
-            }
-        }
-        persist_pending_interventions(
-            state,
-            current_session_id,
-            &mut phase_state.pending_interventions,
-        )
-        .await;
-        let usage = build_done_usage(
-            state,
-            current_session_id,
-            phase_state.usage_snap_input,
-            phase_state.usage_snap_output,
-        )
-        .await;
-        let mut done_event = json!({
-            "type":"done",
-            "phase":"stopped",
-            "reason":"user_stop",
-            "cycles":phase_state.react_ctx.cycles,
-            "tool_calls":phase_state.react_ctx.tool_calls
-        });
-        if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
-            done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
-        let _ = live_send(live_tx, done_event).await;
-    }
 
     if phase_state.run_detached {
         let mut sessions = state.sessions.lock().await;

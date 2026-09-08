@@ -107,7 +107,7 @@ lingclaw db status
 lingclaw db backup
 ```
 
-Session、Group、消息、Todos、Usage、工作目录绑定和 Sub-agent 快照存放在 `~/.lingclaw/lingclaw.db`。从旧版升级时，LingClaw 会在开始提供 HTTP 请求前严格校验并迁移原有 `sessions/`、`groups/` JSON；原文件会永久保留在 `~/.lingclaw/backups/sqlite-migration-*/`，不会继续双写。
+Session、Group、消息、顶层运行终态、Todos、Usage、工作目录绑定和 Sub-agent 快照存放在 `~/.lingclaw/lingclaw.db`。因此刷新、重连或重启 daemon 后，刚完成、失败或停止的执行栈会恢复服务器记录的真实状态与耗时；只有升级前缺少终态记录的旧历史才保守显示为未完成。从旧版升级时，LingClaw 会在开始提供 HTTP 请求前严格校验并迁移原有 `sessions/`、`groups/` JSON；原文件会永久保留在 `~/.lingclaw/backups/sqlite-migration-*/`，不会继续双写。
 
 安装细节、systemd、Docker 和反向代理说明见[部署指南](docs/deploy.md)。
 
@@ -153,7 +153,7 @@ Session 可以维护人工可读的 `MEMORY.md`、每日日志、可选 Structur
 
 ### 清晰的执行过程
 
-Reasoning、Tool、Task Plan、Sub-agent 和 Orchestration 统一进入单个执行栈。完成后保留紧凑摘要，展开时可查看每一步；工具参数、结果和图片进入独立 Inspector，不挤压主对话。
+Reasoning、Tool、执行提纲、Sub-agent、Orchestration 与 ReAct 阶段统一进入单个执行栈。只有后端明确报告完成的运行才自动折叠；失败、受阻、等待、停止和未完成会持续显示可动态定位的恢复入口，用户手动展开/折叠始终优先。摘要会说明当前动作与对象、进度、验证、产物、失败点和未解决项；同一 Tool/目标重试成功后，旧失败仍可审阅但不再计作未解决。模型瞬态重试只显示短暂 attempt，最终错误不会在 notice、错误卡和栈之间重复。Reasoning 默认使用只呈现派生轨迹信息的“摘要”档，“标准”也不会把原始 thinking 写入 DOM，只有“详细”显示完整过程；Auto Debug 则作为最新消息与 Composer 之间的可关闭 dock 移到对话时间线之外，不再覆盖输入区。工具参数、结果和图片继续进入独立 Inspector，不挤压主对话。
 
 ### 面向协作的群聊
 

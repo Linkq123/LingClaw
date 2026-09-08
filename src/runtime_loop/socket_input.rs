@@ -182,6 +182,7 @@ pub(crate) async fn ensure_session_ready(
         if let Some(session) = sessions.get_mut(&existing_session_id) {
             crate::session_store::replace_session_system_prompt(session, sys);
         }
+        state.auxiliary_tasks.activate_session(&existing_session_id);
         return Ok((existing_session_id, false));
     }
 
@@ -271,6 +272,7 @@ pub(crate) async fn ensure_session_ready(
     let final_session_id = session.id.clone();
     let mut sessions = state.sessions.lock().await;
     sessions.entry(final_session_id.clone()).or_insert(session);
+    state.auxiliary_tasks.activate_session(&final_session_id);
     Ok((final_session_id, created_fresh))
 }
 
@@ -281,11 +283,16 @@ pub(crate) async fn resolve_or_create_socket_session(
     connection_id: u64,
     connection_cancel: &CancellationToken,
 ) -> String {
+    let requested_session_id = requested_id.unwrap_or(MAIN_SESSION_ID);
+    let target_lock =
+        crate::session_control::session_control_lock(state, requested_session_id).await;
+    let target_guard = target_lock.lock().await;
     match ensure_session_ready(state, requested_id).await {
         Ok((session_id, created_fresh)) => {
             replace_connection_cancel_binding(state, &session_id, connection_id, connection_cancel)
                 .await;
             bind_session_connection(state, &session_id, connection_id, tx, false).await;
+            drop(target_guard);
             send_existing_session_payloads(tx, state, &session_id).await;
             replay_live_round(tx, state, &session_id).await;
             finish_session_replay(state, &session_id, connection_id).await;
@@ -295,6 +302,10 @@ pub(crate) async fn resolve_or_create_socket_session(
             session_id
         }
         Err(error) => {
+            drop(target_guard);
+            let fallback_lock =
+                crate::session_control::session_control_lock(state, MAIN_SESSION_ID).await;
+            let fallback_guard = fallback_lock.lock().await;
             let fallback_session_id = ensure_session_ready(state, None)
                 .await
                 .map(|(session_id, _)| session_id)
@@ -307,6 +318,7 @@ pub(crate) async fn resolve_or_create_socket_session(
             )
             .await;
             bind_session_connection(state, &fallback_session_id, connection_id, tx, false).await;
+            drop(fallback_guard);
             send_existing_session_payloads(tx, state, &fallback_session_id).await;
             replay_live_round(tx, state, &fallback_session_id).await;
             finish_session_replay(state, &fallback_session_id, connection_id).await;
@@ -1923,6 +1935,11 @@ async fn build_busy_command_events(
     };
     let hook_config = state.config();
     let mut events = run_command_hooks(&state.hooks, &hook_input, &hook_config).await;
+    for event in &mut events {
+        if event["type"].as_str() == Some("error") {
+            event["run_terminal"] = json!(false);
+        }
+    }
 
     let response = if result.sessions_changed {
         format!(
@@ -1932,11 +1949,15 @@ async fn build_busy_command_events(
     } else {
         result.response
     };
-    events.push(json!({
+    let mut response_event = json!({
         "type": result.response_type,
         "content": response,
         "dismissible": result.dismissible,
-    }));
+    });
+    if result.response_type == "error" {
+        response_event["run_terminal"] = json!(false);
+    }
+    events.push(response_event);
 
     if result.sessions_changed {
         let payload = {

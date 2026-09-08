@@ -3,6 +3,7 @@ import { mentionedGroupTargets } from './groupMentions.js';
 import { normalizeSlashCommandText } from './slashCommands.js';
 import { closeComposerPopovers } from './composerPopovers.js';
 import { dom, state } from './state.js';
+import { composerTransportAvailability, composerTransportReasonKey } from './composerTransport.js';
 import type { AppConfig, ConfigApiResponse } from './types/config.js';
 
 export const CONFIG_SAVED_EVENT = 'lingclaw:config-saved';
@@ -45,6 +46,7 @@ export type ComposerModelAvailability =
   | 'ready';
 
 export type ComposerAvailabilityResolution =
+  | 'reconnect'
   | 'configure-models'
   | 'configure-agent'
   | 'choose-session-model'
@@ -283,6 +285,8 @@ export function composerAvailabilityResolution(): ComposerAvailabilityResolution
 
 function composerResolutionLabel(resolution: ComposerAvailabilityResolution): string {
   switch (resolution) {
+    case 'reconnect':
+      return tr('composer.reconnect');
     case 'configure-models':
       return tr('composer.configureModels');
     case 'configure-agent':
@@ -390,6 +394,8 @@ function setAriaDescriptionReference(
 }
 
 export function syncComposerAvailability(): void {
+  const transport = composerTransportAvailability();
+  const transportReady = transport === 'ready';
   const storageProtected = state.storageMode === 'protected';
   const ready = isComposerModelReady();
   const inputValue = dom.input?.value || '';
@@ -410,29 +416,31 @@ export function syncComposerAvailability(): void {
     targetedSwitchCommand(inputValue) &&
     (state.composerSessionIdentityPending || state.imageUploadInFlight || identityChangeBlocked),
   );
-  const key = storageProtected
-    ? 'storage.protectedDescription'
-    : groupSlashUnsupported
-      ? 'group.slashUnsupported'
-      : uploadBlocksSubmission
-        ? 'composer.uploadInProgress'
-        : modelSwitchBlocked
-          ? 'composer.modelSwitchSaving'
-          : identityChangeBlocked
-            ? 'composer.sessionChangeInProgress'
-            : state.composerModelAvailability === 'config-unavailable'
-              ? placeholderKey()
-              : groupTargetsMissing
-                ? state.groupTargetMode === 'mentions'
-                  ? 'group.mentionRequired'
-                  : 'group.selectMember'
-                : state.activeGroupId && groupReady
-                  ? state.busy
-                    ? 'composer.placeholderBusy'
-                    : 'composer.placeholder'
-                  : missingGroupTargets.length > 0
-                    ? 'composer.groupTargetsUnconfigured'
-                    : placeholderKey();
+  const key = !transportReady
+    ? composerTransportReasonKey()
+    : storageProtected
+      ? 'storage.protectedDescription'
+      : groupSlashUnsupported
+        ? 'group.slashUnsupported'
+        : uploadBlocksSubmission
+          ? 'composer.uploadInProgress'
+          : modelSwitchBlocked
+            ? 'composer.modelSwitchSaving'
+            : identityChangeBlocked
+              ? 'composer.sessionChangeInProgress'
+              : state.composerModelAvailability === 'config-unavailable'
+                ? placeholderKey()
+                : groupTargetsMissing
+                  ? state.groupTargetMode === 'mentions'
+                    ? 'group.mentionRequired'
+                    : 'group.selectMember'
+                  : state.activeGroupId && groupReady
+                    ? state.busy
+                      ? 'composer.placeholderBusy'
+                      : 'composer.placeholder'
+                    : missingGroupTargets.length > 0
+                      ? 'composer.groupTargetsUnconfigured'
+                      : placeholderKey();
   const vars =
     missingGroupTargets.length > 0
       ? {
@@ -446,6 +454,7 @@ export function syncComposerAvailability(): void {
         }
       : undefined;
   const canSubmit =
+    transportReady &&
     (!storageProtected || modelFreeSlashCommand) &&
     !groupSlashUnsupported &&
     !uploadBlocksSubmission &&
@@ -455,26 +464,41 @@ export function syncComposerAvailability(): void {
     (groupReady || modelFreeSlashCommand);
   if (dom.input) {
     dom.input.dataset.i18nPlaceholder = key;
-    dom.input.dataset.availability = canSubmit ? 'ready' : state.composerModelAvailability;
+    dom.input.dataset.availability = canSubmit
+      ? 'ready'
+      : transportReady
+        ? state.composerModelAvailability
+        : transport;
     dom.input.placeholder = tr(key, vars);
   }
   if (dom.sendBtn) {
     dom.sendBtn.disabled = !canSubmit;
+    dom.sendBtn.setAttribute('aria-disabled', String(!canSubmit));
     dom.sendBtn.title = canSubmit ? '' : tr(key, vars);
   }
+  if (dom.stopBtn) dom.stopBtn.disabled = !transportReady || !state.busy;
   const resolution =
-    !storageProtected && key === placeholderKey() ? composerAvailabilityResolution() : null;
+    transport === 'offline'
+      ? 'reconnect'
+      : transportReady && !storageProtected && key === placeholderKey()
+        ? composerAvailabilityResolution()
+        : null;
   const retryVisible =
     !canSubmit &&
     key === 'composer.configUnavailable' &&
     state.composerModelAvailability === 'config-unavailable';
   const visibleStatus =
     !canSubmit &&
-    (storageProtected || (!state.activeGroupId && resolution !== null) || retryVisible);
+    (!transportReady ||
+      storageProtected ||
+      (!state.activeGroupId && resolution !== null) ||
+      retryVisible);
   const fullReason = canSubmit ? '' : tr(key, vars);
-  const compactKey = storageProtected
-    ? 'storage.protectedLabel'
-    : compactStatusKey(state.composerModelAvailability);
+  const compactKey = !transportReady
+    ? `composer.transport.${transport}`
+    : storageProtected
+      ? 'storage.protectedLabel'
+      : compactStatusKey(state.composerModelAvailability);
   const compactLabel = compactKey ? tr(compactKey) : '';
   const useUnavailableComposerLayout =
     !canSubmit && (key.startsWith('composer.') || storageProtected);
@@ -487,13 +511,17 @@ export function syncComposerAvailability(): void {
     dom.inputArea.classList.toggle('has-composer-unavailable', useUnavailableComposerLayout);
     dom.inputArea.dataset.composerAvailability = canSubmit
       ? 'ready'
-      : state.composerModelAvailability;
+      : transportReady
+        ? state.composerModelAvailability
+        : transport;
   }
   if (dom.composerAvailabilityStatus) {
     dom.composerAvailabilityStatus.hidden = !visibleStatus;
-    dom.composerAvailabilityStatus.dataset.kind = storageProtected
-      ? 'storage-protected'
-      : state.composerModelAvailability;
+    dom.composerAvailabilityStatus.dataset.kind = !transportReady
+      ? transport
+      : storageProtected
+        ? 'storage-protected'
+        : state.composerModelAvailability;
     const message = document.getElementById('composer-availability-message');
     if (message) message.textContent = visibleStatus ? compactLabel : '';
   }
@@ -582,6 +610,7 @@ export function syncComposerAvailability(): void {
     const actionPending =
       button.closest('.plan-artifact-card')?.getAttribute('aria-busy') === 'true';
     const canUseAction =
+      transportReady &&
       !storageProtected &&
       !planIdentityChangeBlocked &&
       targetsActiveSession &&
@@ -596,8 +625,12 @@ export function syncComposerAvailability(): void {
     }
 
     const identityMismatch = planIdentityChangeBlocked || !targetsActiveSession;
-    button.title = identityMismatch ? tr('composer.sessionChangeInProgress') : tr(key, vars);
-    if (!identityMismatch && requiresModel) {
+    button.title = !transportReady
+      ? tr(key)
+      : identityMismatch
+        ? tr('composer.sessionChangeInProgress')
+        : tr(key, vars);
+    if (!transportReady || (!identityMismatch && requiresModel)) {
       button.setAttribute('aria-describedby', 'composer-availability-detail');
     } else {
       button.removeAttribute('aria-describedby');

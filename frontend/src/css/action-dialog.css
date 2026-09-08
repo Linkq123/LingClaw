@@ -105,8 +105,8 @@ body.action-dialog-open {
 
 .action-dialog-field input:focus,
 .action-dialog-search input:focus {
-  border-color: #6554d9;
-  box-shadow: 0 0 0 3px color-mix(in srgb, #6554d9 16%, transparent);
+  border-color: var(--color-focus);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-focus) 16%, transparent);
   outline: none;
 }
 
@@ -139,13 +139,13 @@ body.action-dialog-open {
 }
 
 .action-dialog-workspace-mode label:has(input:checked) {
-  border-color: #6554d9;
-  background: color-mix(in srgb, #6554d9 7%, var(--surface));
+  border-color: var(--color-selected);
+  background: color-mix(in srgb, var(--color-selected) 7%, var(--surface));
 }
 
 .action-dialog-workspace-mode input {
   margin-top: 3px;
-  accent-color: #6554d9;
+  accent-color: var(--color-selected);
 }
 
 .action-dialog-workspace-mode span {
@@ -411,13 +411,13 @@ body.action-dialog-open {
 }
 
 .action-dialog-member-option:hover {
-  background: color-mix(in srgb, #6554d9 5%, var(--surface));
+  background: color-mix(in srgb, var(--color-selected) 5%, var(--surface));
 }
 
 .action-dialog-member-option input {
   width: 16px;
   height: 16px;
-  accent-color: #6554d9;
+  accent-color: var(--color-selected);
 }
 
 .action-dialog-member-copy {
@@ -478,25 +478,29 @@ body.action-dialog-open {
 }
 
 .action-dialog-submit {
-  border-color: #6554d9;
-  background: #6554d9;
-  color: #fff;
+  border-color: var(--color-action-fill);
+  background: var(--color-action-fill);
+  color: var(--color-on-action);
 }
 
 .action-dialog-submit:hover:not(:disabled) {
-  border-color: #5848c7;
-  background: #5848c7;
+  border-color: var(--color-action-hover);
+  background: var(--color-action-hover);
 }
 
 .action-dialog-submit.danger {
-  border-color: var(--accent-error);
-  background: var(--accent-error);
+  border-color: var(--color-error-fill);
+  background: var(--color-error-fill);
+  color: var(--color-on-error);
 }
 
 .action-dialog-button:disabled,
 .action-dialog-close:disabled {
   cursor: wait;
-  opacity: 0.58;
+  border-color: var(--color-disabled-fill);
+  color: var(--color-on-disabled);
+  background: var(--color-disabled-fill);
+  opacity: 1;
 }
 
 @media (max-width: 768px) {

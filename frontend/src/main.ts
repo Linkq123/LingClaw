@@ -16,14 +16,30 @@ import { initI18n, tr, toggleLanguage, subscribeLanguageChange, translateDom } f
 import { dom, initDomRefs, state } from './state.js';
 import { HISTORY_LOAD_CHUNK_SIZE, HISTORY_RENDER_LIMIT } from './constants.js';
 import { createIcon, iconMarkup } from './icons.js';
-import { findHistoryRenderStart, splitHistoryLoadChunk } from './historyWindow.js';
+import {
+  findHistoryRenderStart,
+  historyRunScopes,
+  splitHistoryLoadChunk,
+} from './historyWindow.js';
+import { normalizeRunDiagnostic, runDiagnosticSummaryKey } from './runDiagnostics.js';
+import {
+  composerTransportAvailability,
+  confirmComposerTransportIdentity,
+  confirmComposerTransportHistory,
+  preserveComposerAttachmentsOnHistory,
+} from './composerTransport.js';
 import {
   formatTokenCount,
   formatToolDuration,
   hideWelcome,
   scheduleBackgroundTask,
 } from './utils.js';
-import type { GroupMemberDetail, SessionGroupSummary, SessionSummary } from './types.js';
+import type {
+  GroupMemberDetail,
+  SessionGroupSummary,
+  SessionSummary,
+  TopLevelRunOutcome,
+} from './types.js';
 import {
   syncToolDrawerBounds,
   cancelToolDrawerBoundsSync,
@@ -35,19 +51,23 @@ import {
   jumpToLatest,
   updateJumpToLatestVisibility,
 } from './scroll.js';
+import { animatePanelIn, animateCollapsibleSection } from './renderers/timeline.js';
+import { canonicalToolRetryKey } from './toolRecovery.js';
 import {
-  animatePanelIn,
-  animateCollapsibleSection,
-  linkCollapsibleControl,
-} from './renderers/timeline.js';
-import {
+  associateExecutionStackWithPlan,
   completeExecutionStack,
+  completeExecutionStackForClientRun,
+  completeExecutionStackForPlan,
+  clearExecutionRetryProgress,
+  doneExecutionOutcome,
+  focusExecutionStackRecovery,
   mountExecutionPanel,
   refreshExecutionStacks,
   resetExecutionStackState,
   restoreExecutionStackState,
   syncAllExecutionStackVisibility,
   toggleExecutionStack,
+  updateExecutionRetryProgress,
 } from './renderers/execution-stack.js';
 import {
   addMsg,
@@ -99,6 +119,7 @@ import {
 import {
   connect,
   cancelReconnect,
+  failCloseCurrentExecutionProtocol,
   reconnectToActiveSession,
   refreshConnectionStatus,
 } from './socket.js';
@@ -156,6 +177,7 @@ import {
   closeSubagentModal,
   openSubagentToolDrawer,
   refreshSubagentPanelsLanguage,
+  syncSubagentReasoningDensity,
   trapSubagentModalFocus,
 } from './renderers/subagent.js';
 import {
@@ -213,8 +235,17 @@ import {
 } from './composerAvailability.js';
 import {
   buildHistoryReasoningPanel,
+  createLiveReasoningPanel,
   finalizeOrDiscardLiveReasoningPanel,
+  syncReasoningPanelsDensity,
 } from './renderers/reasoning.js';
+import {
+  loadReasoningDensity,
+  normalizeReasoningDensity,
+  persistReasoningDensity,
+  reasoningDensityForNavigationKey,
+  type ReasoningDensity,
+} from './reasoningDensity.js';
 import {
   applyCompressionOutcome,
   applyTopLevelAutoTrace,
@@ -222,6 +253,7 @@ import {
   clearCompressionOutcome,
   clearCompressionOutcomeForNewAnalyzeCycle,
   clearCompressionOutcomeForNewRound,
+  setAutoDebugEnabled,
   toggleAutoDebug,
   updateAutoDebugToggleButton,
 } from './renderers/auto-trace.js';
@@ -294,6 +326,7 @@ import {
 // ── Initialize DOM ──
 initDomRefs();
 initI18n();
+state.reasoningDensity = loadReasoningDensity();
 const persistedActiveSessionId = loadActiveSessionId();
 state.activeSessionId = 'main';
 const persistedActiveGroupId = loadActiveGroupId();
@@ -344,7 +377,18 @@ function updateViewToggleButtons() {
     syncButton(dom.toggleToolsBtn, tr('common.tools'), state.showTools);
   }
   if (dom.toggleReasoningBtn) {
-    syncButton(dom.toggleReasoningBtn, tr('common.reasoning'), state.showReasoning);
+    const label = dom.toggleReasoningBtn.querySelector('.control-label');
+    if (label) label.textContent = tr('common.reasoning');
+    const current = dom.toggleReasoningBtn.querySelector<HTMLElement>('.reasoning-density-current');
+    if (current) current.textContent = tr(`reasoning.${state.reasoningDensity}Hint`);
+    dom.toggleReasoningBtn
+      .querySelectorAll<HTMLButtonElement>('[data-density]')
+      .forEach((button) => {
+        const selected = button.dataset.density === state.reasoningDensity;
+        button.classList.toggle('is-active', selected);
+        button.setAttribute('aria-checked', String(selected));
+        button.tabIndex = selected ? 0 : -1;
+      });
   }
   updateAutoDebugToggleButton();
   const activeCount = [
@@ -375,6 +419,8 @@ function refreshLocalizedUi() {
   renderTodosPanel();
   renderReactStatus();
   refreshExecutionStacks();
+  syncReasoningPanelsDensity();
+  syncSubagentReasoningDensity();
   refreshActionDialog();
   refreshPlanLanguage();
   refreshLocalizedComposerModelPicker();
@@ -427,12 +473,15 @@ function toggleToolsVisibility() {
   sendCmd(`/tool ${nextShowTools ? 'on' : 'off'}`);
 }
 
-function toggleReasoningVisibility() {
-  if (!state.ws || state.ws.readyState !== 1) return;
-  const nextShowReasoning = !state.showReasoning;
-  applyViewState({ show_reasoning: nextShowReasoning });
-  if (state.activeGroupId) return;
-  sendCmd(`/reasoning ${nextShowReasoning ? 'on' : 'off'}`);
+function setReasoningDensity(density: ReasoningDensity) {
+  state.reasoningDensity = density;
+  persistReasoningDensity(density);
+  syncReasoningPanelsDensity();
+  syncSubagentReasoningDensity();
+  updateViewToggleButtons();
+  if (state.showReasoning) return;
+  applyViewState({ show_reasoning: true });
+  if (!state.activeGroupId && state.ws?.readyState === WebSocket.OPEN) sendCmd('/reasoning on');
 }
 
 // ── Usage badge ──
@@ -1251,20 +1300,7 @@ async function applyGroupFeatureStatus(enabled: boolean, initial = false): Promi
   if (wasInGroup && !initial) {
     beginComposerSessionTransition(false, state.activeSessionId);
     state.sessionSwitchInFlight = true;
-    reconnectToActiveSession(handleMessage);
-  }
-}
-
-async function discoverClientFeatures(): Promise<void> {
-  try {
-    const response = await fetch('/api/client-config', { cache: 'no-store' });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const payload = await response.json();
-    await applyGroupFeatureStatus(payload?.features?.groups === true, true);
-  } catch {
-    // Feature flags are fail-closed. In particular this guarantees that an
-    // older or unreachable daemon never receives speculative Group requests.
-    await applyGroupFeatureStatus(false, true);
+    void reconnectToActiveSession(handleMessage);
   }
 }
 
@@ -1307,7 +1343,7 @@ function performSwitchToSession(nextSessionId: string) {
   persistActiveSessionId(nextSessionId);
   state.sessionSwitchInFlight = true;
   renderSessionDrawer();
-  reconnectToActiveSession(handleMessage);
+  void reconnectToActiveSession(handleMessage);
 }
 
 function performSwitchToGroup(nextGroupId: string) {
@@ -1320,7 +1356,7 @@ function performSwitchToGroup(nextGroupId: string) {
   resetGroupTargetControls();
   state.sessionSwitchInFlight = true;
   renderSessionDrawer();
-  reconnectToActiveSession(handleMessage);
+  void reconnectToActiveSession(handleMessage);
 }
 
 let sessionCreateInFlight = false;
@@ -1368,7 +1404,7 @@ async function createSession() {
         state.activeSessionId = created.id;
         persistActiveSessionId(created.id);
         renderSessionDrawer();
-        reconnectToActiveSession(handleMessage);
+        void reconnectToActiveSession(handleMessage);
       } finally {
         sessionCreateInFlight = false;
         state.sessionIdentityMutationInFlight = false;
@@ -1415,7 +1451,7 @@ async function createGroup() {
         clearGroupRunState();
         setActiveGroupMembers(members);
         renderSessionDrawer();
-        reconnectToActiveSession(handleMessage);
+        void reconnectToActiveSession(handleMessage);
       } finally {
         sessionCreateInFlight = false;
         state.sessionIdentityMutationInFlight = false;
@@ -1567,7 +1603,7 @@ async function deleteGroup(groupId: string) {
           leaveActiveGroupForSession();
           beginComposerSessionTransition(false, state.activeSessionId);
           state.sessionSwitchInFlight = true;
-          reconnectToActiveSession(handleMessage);
+          void reconnectToActiveSession(handleMessage);
         }
         renderSessionDrawer();
       } finally {
@@ -1885,6 +1921,15 @@ function appendRoundUsage(messageEl, inputTokens, outputTokens, firstTokenMs = n
   content.appendChild(label);
 }
 
+function applyDoneUsageTotals(data): void {
+  if (data.daily_input_tokens == null) return;
+  state.dailyInputTokens = data.daily_input_tokens;
+  state.dailyOutputTokens = data.daily_output_tokens ?? 0;
+  state.totalInputTokens = data.total_input_tokens ?? 0;
+  state.totalOutputTokens = data.total_output_tokens ?? 0;
+  updateUsageBadge();
+}
+
 function upsertGroupSummary(group: SessionGroupSummary) {
   const existingIndex = state.sessionGroups.findIndex((existing) => existing.id === group.id);
   if (existingIndex >= 0) {
@@ -1903,6 +1948,31 @@ function markCurrentRoundFirstTokenAt() {
 function resetRoundTimers() {
   state.currentRoundStartedAt = 0;
   state.currentRoundFirstTokenAt = 0;
+}
+
+function normalizeRunConnectionId(value: unknown): string {
+  if (typeof value !== 'string' && typeof value !== 'number') return '';
+  const normalized = String(value).trim();
+  return normalized && normalized !== '0' ? normalized : '';
+}
+
+function resolvedEventRunIdentity(value: unknown): string {
+  const explicitIdentity = normalizeRunConnectionId(value);
+  if (explicitIdentity) return explicitIdentity;
+  if (
+    state.executionIdentityProtocol !== 'legacy' ||
+    state.socketGeneration <= 0 ||
+    state.socketGeneration !== state.legacyExecutionSocketGeneration
+  ) {
+    return '';
+  }
+  return `legacy-socket-${state.socketGeneration}`;
+}
+
+function clearActiveExecutionIdentity(): void {
+  state.activeExecutionRunId = 0;
+  state.activeExecutionServerRunId = '';
+  state.activeExecutionPlanId = '';
 }
 
 // ── History lazy-load ──
@@ -1952,11 +2022,105 @@ function markHistoryMessageIndex(messageEl: Element | null, messageIndex: unknow
   if (row) row.dataset.messageIndex = String(messageIndex);
 }
 
-function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
-  const { followMarkdown = true } = options;
+function applyHistoricalRunOutcome(outcome: TopLevelRunOutcome): void {
+  const stack = state.activeExecutionStack;
+  if (outcome.plan_id && stack?.isConnected) {
+    stack.dataset.executionPlanId = outcome.plan_id;
+  }
+  // A successful no-step run stays quiet, matching the live execution
+  // contract. Attention outcomes deliberately create an identity-bound stack.
+  if (outcome.status === 'completed' && !stack?.isConnected) return;
+  const mapped = doneExecutionOutcome(outcome.phase, outcome.reason);
+  const diagnostic =
+    outcome.status === 'failed' ? normalizeRunDiagnostic(outcome.diagnostic) : undefined;
+  const summary =
+    mapped.status === outcome.status
+      ? mapped.summary
+      : outcome.status === 'completed'
+        ? undefined
+        : tr(`execution.${outcome.status}Summary`);
+  const summaryKey =
+    mapped.status === outcome.status
+      ? mapped.summaryKey
+      : outcome.status === 'completed'
+        ? undefined
+        : `execution.${outcome.status}Summary`;
+  const recoveryLabel =
+    mapped.status === outcome.status
+      ? mapped.recoveryLabel
+      : outcome.status === 'failed'
+        ? tr('execution.reviewError')
+        : outcome.status === 'stopped'
+          ? tr('execution.reviewInterrupted')
+          : outcome.status === 'incomplete'
+            ? tr('execution.reviewIncomplete')
+            : tr('execution.reviewDetails');
+  const recoveryLabelKey =
+    mapped.status === outcome.status
+      ? mapped.recoveryLabelKey
+      : outcome.status === 'failed'
+        ? 'execution.reviewError'
+        : outcome.status === 'stopped'
+          ? 'execution.reviewInterrupted'
+          : outcome.status === 'incomplete'
+            ? 'execution.reviewIncomplete'
+            : 'execution.reviewDetails';
+  const completed = completeExecutionStack({
+    stack,
+    status: outcome.status,
+    summary: diagnostic ? tr(runDiagnosticSummaryKey(diagnostic)) : summary,
+    summaryKey: diagnostic ? runDiagnosticSummaryKey(diagnostic) : summaryKey,
+    diagnostic,
+    recoveryLabel,
+    recoveryLabelKey,
+    recoveryPlanId: outcome.plan_id || undefined,
+    recoveryPlanRevision: outcome.plan_revision ?? undefined,
+    immediate: true,
+    durationMs: outcome.duration_ms,
+    terminalSource: 'history',
+  });
+  if (completed) {
+    completed.dataset.executionSessionId = outcome.session_id;
+    completed.dataset.executionPersistedRunId = outcome.run_id;
+    completed.dataset.executionServerRunId = outcome.run_connection_id;
+    if (outcome.plan_id) completed.dataset.executionPlanId = outcome.plan_id;
+    if (outcome.plan_revision != null)
+      completed.dataset.executionPlanRevision = String(outcome.plan_revision);
+    // Keep the latest historical terminal stack associated until the
+    // authoritative Plan history has mounted on the next animation frame.
+    // That lets a failed/stopped Plan enrich this exact run rather than
+    // creating or updating an unrelated stack.
+    state.terminalExecutionStack = completed;
+  }
+}
+
+function completeHistoricalExecutionStack(outcomes?: TopLevelRunOutcome[]): void {
+  if (outcomes?.length) {
+    for (const outcome of outcomes) applyHistoricalRunOutcome(outcome);
+    return;
+  }
+  const stack = state.activeExecutionStack;
+  if (!stack?.isConnected || stack.dataset.executionStatus !== 'running') return;
+  completeExecutionStack({
+    stack,
+    status: 'incomplete',
+    summary: tr('execution.historyOutcomeUnavailable'),
+    summaryKey: 'execution.historyOutcomeUnavailable',
+    recoveryLabel: tr('execution.reviewIncomplete'),
+    recoveryLabelKey: 'execution.reviewIncomplete',
+    immediate: true,
+    durationMs: null,
+    terminalSource: 'history',
+  });
+}
+
+function renderHistoryMessage(m, options: { followMarkdown?: boolean; withinRun?: boolean } = {}) {
+  const { followMarkdown = true, withinRun = false } = options;
+  const outcomes = Array.isArray(m.run_outcomes) ? m.run_outcomes : [];
+  let outcomeApplied = false;
   switch (m.role) {
     case 'user': {
-      completeExecutionStack({ immediate: true, durationMs: null });
+      if (!withinRun) completeHistoricalExecutionStack();
       const el = addMsg('user', m.content, m.timestamp);
       markHistoryMessageIndex(el, m.message_index);
       if (m.images && m.images.length > 0) renderUserImageThumbnails(el, m.images);
@@ -1971,7 +2135,8 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
       // Thinking-only cycles (no text, tool call follows) have empty content.
       // Only create a bubble when there is actual message text.
       if (m.content) {
-        completeExecutionStack({ immediate: true, durationMs: null });
+        if (outcomes.length) completeHistoricalExecutionStack(outcomes);
+        outcomeApplied = outcomes.length > 0;
         const el = addMsg('assistant', m.content, m.timestamp);
         markHistoryMessageIndex(el, m.message_index);
         el._rawText = m.content;
@@ -1984,7 +2149,8 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
         try {
           const args = JSON.parse(m.arguments || '{}');
           const ref = { task_id: m.id, agent: args.agent || 'sub-agent' };
-          createSubagentPanel(ref.agent, args.prompt || '', ref.task_id);
+          const panel = createSubagentPanel(ref.agent, args.prompt || '', ref.task_id, m.id);
+          panel.dataset.executionRetryKey = canonicalToolRetryKey(m.name, m.arguments || '{}');
           if (!state._historyTaskIds) state._historyTaskIds = new Map();
           state._historyTaskIds.set(m.id, ref);
         } catch {
@@ -1999,6 +2165,8 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
           const orchestrateId = `hist-${m.id || Date.now()}`;
           createOrchestratePanel({
             orchestrate_id: orchestrateId,
+            parent_tool_call_id: m.id,
+            retry_key: canonicalToolRetryKey(m.name, m.arguments || '{}'),
             task_count: tasks.length,
             layer_count: 0,
             tasks: tasks.map((t) => ({
@@ -2062,14 +2230,72 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
       break;
     }
   }
+  if (!outcomeApplied && outcomes.length) completeHistoricalExecutionStack(outcomes);
 }
 
-function loadEarlierMessages() {
+function renderHistoryMessages(messages, start = 0, followMarkdown = true): void {
+  const scopes = historyRunScopes(messages);
+  let scopeIndex = 0;
+  for (let index = start; index < messages.length; index += 1) {
+    while (scopeIndex < scopes.length && scopes[scopeIndex].end < index) scopeIndex += 1;
+    const scope = scopes[scopeIndex];
+    const withinRun = Boolean(scope && scope.start <= index && index <= scope.end);
+    if (withinRun && scope.start === index) completeHistoricalExecutionStack();
+    renderHistoryMessage(messages[index], { followMarkdown, withinRun });
+  }
+}
+
+let historyScrollGeneration = 0;
+
+function reconcileHistoricalPlanStacks(): void {
+  for (const plan of [...state.planHistory, ...(state.activePlan ? [state.activePlan] : [])]) {
+    completeExecutionStackForPlan(plan, { historical: true });
+  }
+}
+
+function revealHistoricalPlan(identity: {
+  sessionId: string;
+  planId: string;
+  revision: number;
+}): HTMLElement | null {
+  if (identity.sessionId !== (state.activeSessionId || 'main')) return null;
+  const plan = [...state.planHistory, ...(state.activePlan ? [state.activePlan] : [])].find(
+    (candidate) =>
+      candidate.plan_id === identity.planId && candidate.revision === identity.revision,
+  );
+  if (!plan || !Number.isSafeInteger(plan.message_index) || plan.message_index < 0) return null;
+  const generation = historyRenderGeneration;
+  while (
+    state.deferredHistory.some(
+      (message) => message.role === 'assistant' && message.message_index === plan.message_index,
+    )
+  ) {
+    const before = state.deferredHistory.length;
+    loadEarlierMessages({ preserveScroll: false });
+    if (state.deferredHistory.length >= before) break;
+  }
+  if (
+    generation !== historyRenderGeneration ||
+    identity.sessionId !== (state.activeSessionId || 'main')
+  )
+    return null;
+  return (
+    Array.from(dom.chat.querySelectorAll<HTMLElement>('.plan-artifact-card')).find(
+      (card) =>
+        card.dataset.planId === identity.planId &&
+        card.dataset.planRevision === String(identity.revision),
+    ) || null
+  );
+}
+
+function loadEarlierMessages({ preserveScroll = true } = {}) {
   const { remaining, chunk: msgs } = splitHistoryLoadChunk(
     state.deferredHistory,
     HISTORY_LOAD_CHUNK_SIZE,
   );
   if (msgs.length === 0) return;
+  const scrollGeneration = ++historyScrollGeneration;
+  const renderGeneration = historyRenderGeneration;
   state.deferredHistory = remaining;
   state._historyTaskIds = null;
   state._historyOrchestrateIds = null;
@@ -2086,7 +2312,7 @@ function loadEarlierMessages() {
     dom.chat.appendChild(createLoadMoreRow(state.deferredHistory.length));
     invalidateChatScrollCache();
   }
-  for (const m of msgs) renderHistoryMessage(m, { followMarkdown: false });
+  renderHistoryMessages(msgs, 0, false);
   // Finalize orphaned panels from deferred history.
   if (state._historyTaskIds && state._historyTaskIds.size > 0) {
     for (const ref of state._historyTaskIds.values()) {
@@ -2100,15 +2326,21 @@ function loadEarlierMessages() {
     }
     state._historyOrchestrateIds = null;
   }
-  completeExecutionStack({ immediate: true, durationMs: null });
+  completeHistoricalExecutionStack();
   for (const el of existing) dom.chat.appendChild(el);
   restoreExecutionStackState(liveExecutionStack);
   refreshPlanMounts();
+  reconcileHistoricalPlanStacks();
   invalidateChatScrollCache();
   requestAnimationFrame(() => {
+    if (
+      scrollGeneration !== historyScrollGeneration ||
+      renderGeneration !== historyRenderGeneration
+    )
+      return;
     state.bulkRenderingChat = false;
     dom.chat.classList.remove('no-animate');
-    if (anchor) anchor.scrollIntoView({ block: 'start' });
+    if (preserveScroll && anchor) anchor.scrollIntoView({ block: 'start' });
     requestAnimationFrame(syncChatScrollState);
   });
 }
@@ -2131,6 +2363,8 @@ function isNoReplyGroupResult(value: unknown): boolean {
 }
 
 function renderGroupHistory(data): void {
+  clearActiveExecutionIdentity();
+  state.terminalExecutionStack = null;
   clearCompressionOutcome();
   closeToolDrawer();
   closeSubagentModal();
@@ -2271,10 +2505,15 @@ function recoverFromInvalidActiveGroup(): void {
   leaveActiveGroupForSession();
   beginComposerSessionTransition(false, state.activeSessionId);
   state.sessionSwitchInFlight = true;
-  reconnectToActiveSession(handleMessage);
+  void reconnectToActiveSession(handleMessage);
 }
 
-function localizedRuntimeError(data: { code?: unknown; content?: unknown }): string {
+function runtimeErrorTranslationKey(data: {
+  code?: unknown;
+  diagnostic?: unknown;
+}): string | undefined {
+  const diagnostic = normalizeRunDiagnostic(data.diagnostic);
+  if (diagnostic) return runDiagnosticSummaryKey(diagnostic);
   const keyByCode: Record<string, string> = {
     stale_plan_revision: 'plan.error.staleRevision',
     plan_not_ready: 'plan.error.notReady',
@@ -2287,8 +2526,17 @@ function localizedRuntimeError(data: { code?: unknown; content?: unknown }): str
     invalid_plan_request: 'plan.error.invalidRequest',
     session_not_found: 'plan.error.sessionNotFound',
     storage_error: 'plan.error.storage',
+    terminal_identity_unavailable: 'execution.terminalIdentityUnavailable',
   };
-  const key = keyByCode[String(data.code || '')];
+  return keyByCode[String(data.code || '')];
+}
+
+function localizedRuntimeError(data: {
+  code?: unknown;
+  content?: unknown;
+  diagnostic?: unknown;
+}): string {
+  const key = runtimeErrorTranslationKey(data);
   return key ? tr(key) : String(data.content || 'Error');
 }
 
@@ -2316,7 +2564,9 @@ function applyStorageStatus(data: unknown): void {
     if (changed && hasOpenActionDialog()) forceDismissActionDialog();
     state.pendingDeleteSessionId = '';
     state.activeGroupRunIds.clear();
-    if (state.busy) {
+    const clientRunId = state.activeExecutionRunId;
+    const hasActiveClientRun = clientRunId > 0;
+    if (hasActiveClientRun) {
       clearCompressionOutcome();
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
@@ -2326,9 +2576,23 @@ function applyStorageStatus(data: unknown): void {
       }
       finishTaskPlanPanel();
       clearReactStatus();
-      completeExecutionStack({ failed: true });
+      const completedStorageStack = completeExecutionStackForClientRun(clientRunId, {
+        failed: true,
+        mergeWithExisting: true,
+        summary: tr('storage.protectedDescription'),
+        summaryKey: 'storage.protectedDescription',
+        recoveryLabel: tr('execution.reviewError'),
+        recoveryLabelKey: 'execution.reviewError',
+        terminalSource: 'error',
+      });
+      if (completedStorageStack?.isConnected) {
+        state.terminalExecutionStack = completedStorageStack;
+      }
+      clearActiveExecutionIdentity();
       state.reasoningPanel = null;
       resetRoundTimers();
+    }
+    if (state.busy || hasActiveClientRun) {
       restorePendingPlanAction();
       restoreComposerSessionTransitionWithCapabilities();
       setBusy(false);
@@ -2377,7 +2641,10 @@ function invalidatePendingHistoryRender(): number {
 
 function handleMessage(data) {
   if (data.type === 'feature_status') {
-    return applyGroupFeatureStatus(data?.features?.groups === true);
+    return applyGroupFeatureStatus(
+      data?.features?.groups === true,
+      data?.initial_client_config === true,
+    );
   }
   if (
     !state.groupsEnabled &&
@@ -2415,6 +2682,7 @@ function handleMessage(data) {
       setActiveGroupMembers(data.members, data.member_details, data.pending_votes);
       applyGroupModelConfigurationAfterRosterUpdate(data, true, true);
       state.sessionSwitchInFlight = false;
+      confirmComposerTransportIdentity();
       syncComposerAvailability();
       updateAttachButton();
       dom.sessionNameEl.textContent = data.name || tr('group.nameFallback');
@@ -2429,6 +2697,8 @@ function handleMessage(data) {
         applyGroupModelConfiguration(data, true);
       }
       renderGroupHistory(data);
+      confirmComposerTransportHistory();
+      syncComposerAvailability();
       break;
 
     case 'group_model_configuration':
@@ -2511,6 +2781,7 @@ function handleMessage(data) {
       restorePlanModeForSession(state.activeSessionId || 'main');
       persistActiveSessionId(state.activeSessionId || 'main');
       state.sessionSwitchInFlight = false;
+      confirmComposerTransportIdentity();
       syncComposerAvailability();
       updateAttachButton();
       if (
@@ -2540,6 +2811,8 @@ function handleMessage(data) {
       break;
 
     case 'history': {
+      clearActiveExecutionIdentity();
+      state.terminalExecutionStack = null;
       const historyRenderToken = invalidatePendingHistoryRender();
       resetToolImageCompatibilityWarning();
       clearCompressionOutcome();
@@ -2551,7 +2824,7 @@ function handleMessage(data) {
       clearPendingPlanAction();
       clearBufferedChatUpdates();
       setAutoFollowChat(true);
-      state.pendingImages = [];
+      if (!preserveComposerAttachmentsOnHistory()) state.pendingImages = [];
       renderImagePreviews();
       state.inputHistoryIndex = -1;
       // replaceChildren() avoids the extra HTML parser invocation of
@@ -2577,9 +2850,7 @@ function handleMessage(data) {
           dom.chat.appendChild(createLoadMoreRow(state.deferredHistory.length));
           invalidateChatScrollCache();
         }
-        for (let i = startIdx; i < msgs.length; i++) {
-          renderHistoryMessage(msgs[i]);
-        }
+        renderHistoryMessages(msgs, startIdx);
         if (state._historyTaskIds && state._historyTaskIds.size > 0) {
           for (const ref of state._historyTaskIds.values()) {
             finishSubagentPanel(ref, false, {}, { immediate: true });
@@ -2593,17 +2864,21 @@ function handleMessage(data) {
           }
           state._historyOrchestrateIds = null;
         }
-        completeExecutionStack({ immediate: true, durationMs: null });
+        completeHistoricalExecutionStack();
         requestAnimationFrame(() => {
           if (historyRenderToken !== historyRenderGeneration) return;
           state.bulkRenderingChat = false;
           dom.chat.classList.remove('no-animate');
           const plans = Array.isArray(data.plans) ? data.plans : [];
-          if (plans.length > 0) renderPlanHistory(plans);
-          else if (data.pending_plan) renderPendingPlanAction(data.pending_plan);
+          if (plans.length > 0) {
+            renderPlanHistory(plans);
+            reconcileHistoricalPlanStacks();
+          } else if (data.pending_plan) renderPendingPlanAction(data.pending_plan);
           scrollDown(true);
         });
       }
+      confirmComposerTransportHistory();
+      syncComposerAvailability();
       break;
     }
 
@@ -2613,16 +2888,51 @@ function handleMessage(data) {
 
     case 'start': {
       if (data.subagent) break;
+      const incomingServerRunId = resolvedEventRunIdentity(data.run_connection_id);
+      if (!incomingServerRunId) {
+        failCloseCurrentExecutionProtocol('socket.executionIdentityMissing');
+        break;
+      }
       clearCompressionOutcomeForNewRound(data.cycle);
       clearActiveAutoTrace();
       supersedeTaskPlanPanel(data.round, data.cycle);
-      const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
+      const serverRunChanged =
+        Boolean(state.activeExecutionServerRunId) &&
+        Boolean(incomingServerRunId) &&
+        state.activeExecutionServerRunId !== incomingServerRunId;
+      const isNewTurn = !state.busy || state.currentRoundStartedAt === 0 || serverRunChanged;
       setBusy(true);
       if (isNewTurn) {
+        const interruptedStack = state.activeExecutionStack;
+        if (
+          interruptedStack?.isConnected &&
+          interruptedStack.dataset.executionStatus === 'running'
+        ) {
+          completeExecutionStack({
+            stack: interruptedStack,
+            status: 'incomplete',
+            summary: tr('execution.interruptedByNewRun'),
+            summaryKey: 'execution.interruptedByNewRun',
+            recoveryLabel: tr('execution.reviewIncomplete'),
+            recoveryLabelKey: 'execution.reviewIncomplete',
+            immediate: true,
+          });
+        }
+        clearReactStatus();
+        state.terminalExecutionStack = null;
+        state.executionRunSequence += 1;
+        state.activeExecutionRunId = state.executionRunSequence;
+        state.activeExecutionServerRunId = incomingServerRunId;
+        state.activeExecutionPlanId =
+          state.pendingPlanExecutionId ||
+          (state.activePlan && ['planning', 'executing'].includes(state.activePlan.status)
+            ? state.activePlan.plan_id
+            : '');
         resetToolImageCompatibilityWarning();
-        completeExecutionStack({ immediate: true });
         state.currentRoundStartedAt = performance.now();
         state.currentRoundFirstTokenAt = 0;
+      } else if (!state.activeExecutionServerRunId && incomingServerRunId) {
+        state.activeExecutionServerRunId = incomingServerRunId;
       }
       finishAssistantStream({ discardIfEmpty: true });
       beginAssistantStream();
@@ -2646,7 +2956,13 @@ function handleMessage(data) {
 
     case 'plan_state':
       invalidatePendingHistoryRender();
-      if (data.plan) renderPlanState(data.plan);
+      if (data.plan) {
+        if (renderPlanState(data.plan)) {
+          associateExecutionStackWithPlan(data.plan);
+          completeExecutionStackForPlan(data.plan);
+          refreshExecutionStacks();
+        }
+      }
       break;
 
     case 'plan_stale':
@@ -2687,6 +3003,7 @@ function handleMessage(data) {
 
     case 'delta':
       if (data.subagent) break;
+      clearExecutionRetryProgress();
       if (data.content) markCurrentRoundFirstTokenAt();
       if (state.currentMsg) {
         state.pendingAssistantText += data.content;
@@ -2695,37 +3012,82 @@ function handleMessage(data) {
       break;
 
     case 'done': {
-      clearCompressionOutcome();
-      const finishedAssistantMsg = finishAssistantStream({ discardIfEmpty: true });
-      const activeReasoningPanel = state.reasoningPanel;
-      finishReasoningStream();
-      if (activeReasoningPanel) {
-        activeReasoningPanel.classList.remove('reasoning-active');
-        const body = activeReasoningPanel.querySelector('.reasoning-body') as Element | null;
-        const chevron = activeReasoningPanel.querySelector('.chevron') as Element | null;
-        if (finalizeOrDiscardLiveReasoningPanel(activeReasoningPanel)) {
-          setTimeout(() => {
-            if (body) animateCollapsibleSection(body, false);
-            if (chevron) chevron.classList.remove('open');
-          }, 600);
+      const incomingServerRunId = resolvedEventRunIdentity(data.run_connection_id);
+      const activeClientRunId = state.activeExecutionRunId;
+      const activeRunMatches =
+        activeClientRunId > 0 &&
+        Boolean(incomingServerRunId) &&
+        incomingServerRunId === state.activeExecutionServerRunId;
+      const matchingStack = [state.activeExecutionStack, state.terminalExecutionStack].find(
+        (stack) =>
+          stack?.isConnected &&
+          stack.dataset.executionClientRunId === String(activeClientRunId) &&
+          stack.dataset.executionServerRunId === incomingServerRunId,
+      );
+      const terminalStack = state.terminalExecutionStack;
+      const terminalRunMatches =
+        activeClientRunId === 0 &&
+        Boolean(incomingServerRunId) &&
+        terminalStack?.isConnected === true &&
+        Boolean(terminalStack.dataset.executionClientRunId) &&
+        terminalStack.dataset.executionServerRunId === incomingServerRunId;
+
+      applyDoneUsageTotals(data);
+      if (!activeRunMatches && !terminalRunMatches) break;
+
+      let finishedAssistantMsg: HTMLElement | null = null;
+      if (activeRunMatches) {
+        clearCompressionOutcome();
+        finishedAssistantMsg = finishAssistantStream({ discardIfEmpty: true });
+        const activeReasoningPanel = state.reasoningPanel;
+        finishReasoningStream();
+        if (activeReasoningPanel) {
+          activeReasoningPanel.classList.remove('reasoning-active');
+          const body = activeReasoningPanel.querySelector('.reasoning-body') as Element | null;
+          const chevron = activeReasoningPanel.querySelector('.chevron') as Element | null;
+          if (finalizeOrDiscardLiveReasoningPanel(activeReasoningPanel)) {
+            setTimeout(() => {
+              if (body) animateCollapsibleSection(body, false);
+              if (chevron) chevron.classList.remove('open');
+            }, 600);
+          }
         }
+        requestClearReactStatus();
+        finishTaskPlanPanel();
       }
-      requestClearReactStatus();
-      finishTaskPlanPanel();
-      completeExecutionStack({
-        durationMs: state.currentRoundStartedAt
+
+      const terminalOutcome = doneExecutionOutcome(data.phase, data.reason);
+      const targetStack = activeRunMatches ? matchingStack : terminalStack;
+      const preservedTerminalDuration = Number(targetStack?.dataset.executionDuration || '');
+      const durationMs = activeRunMatches
+        ? state.currentRoundStartedAt
           ? Math.max(1, performance.now() - state.currentRoundStartedAt)
-          : null,
-      });
-      state.reasoningPanel = null;
-      if (data.daily_input_tokens != null) {
-        state.dailyInputTokens = data.daily_input_tokens;
-        state.dailyOutputTokens = data.daily_output_tokens ?? 0;
-        state.totalInputTokens = data.total_input_tokens ?? 0;
-        state.totalOutputTokens = data.total_output_tokens ?? 0;
-        updateUsageBadge();
+          : null
+        : Number.isFinite(preservedTerminalDuration) && preservedTerminalDuration > 0
+          ? preservedTerminalDuration
+          : null;
+      if (targetStack) {
+        completeExecutionStack({
+          ...terminalOutcome,
+          stack: targetStack,
+          mergeWithExisting: true,
+          terminalSource: 'done',
+          durationMs,
+        });
+      } else if (activeRunMatches && terminalOutcome.status !== 'completed') {
+        completeExecutionStackForClientRun(activeClientRunId, {
+          ...terminalOutcome,
+          mergeWithExisting: true,
+          terminalSource: 'done',
+          durationMs,
+        });
       }
-      if (data.round_input_tokens != null || data.round_output_tokens != null) {
+      state.terminalExecutionStack = null;
+      if (activeRunMatches) clearActiveExecutionIdentity();
+      if (
+        activeRunMatches &&
+        (data.round_input_tokens != null || data.round_output_tokens != null)
+      ) {
         const firstTokenMs = state.currentRoundFirstTokenAt
           ? Math.max(0, state.currentRoundFirstTokenAt - state.currentRoundStartedAt)
           : null;
@@ -2736,8 +3098,11 @@ function handleMessage(data) {
           firstTokenMs,
         );
       }
-      resetRoundTimers();
-      setBusy(false);
+      if (activeRunMatches) {
+        state.reasoningPanel = null;
+        resetRoundTimers();
+        setBusy(false);
+      }
       break;
     }
 
@@ -2754,24 +3119,7 @@ function handleMessage(data) {
         startSubagentReasoning({ task_id: data.task_id, agent: data.subagent });
         break;
       }
-      const panel = document.createElement('div');
-      panel.className = 'reasoning-panel reasoning-active';
-      const header = document.createElement('button');
-      header.type = 'button';
-      header.className = 'reasoning-header';
-      header.dataset.action = 'toggle-tool';
-      header.setAttribute('aria-expanded', 'true');
-      header.innerHTML = `
-          <span class="reasoning-icon">${iconMarkup('reasoning')}</span>
-          <span class="reasoning-label" data-i18n="common.reasoning">${tr('common.reasoning')}</span>
-          <span class="reasoning-status" data-i18n="execution.reasoningActive">${tr('execution.reasoningActive')}</span>
-          <span class="chevron open">${iconMarkup('chevron-right')}</span>
-      `;
-      const body = document.createElement('div');
-      body.className = 'reasoning-body show';
-      linkCollapsibleControl(header, body, 'reasoning-body');
-      panel.appendChild(header);
-      panel.appendChild(body);
+      const panel = createLiveReasoningPanel();
       const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
       mountExecutionPanel(panel, 'reasoning', currentRow);
       invalidateChatScrollCache();
@@ -2831,6 +3179,7 @@ function handleMessage(data) {
 
     case 'tool_call':
       if (data.subagent) break;
+      clearExecutionRetryProgress();
       markCurrentRoundFirstTokenAt();
       setReactActTool(data.name, 0);
       addToolCall(data.name, data.arguments, data.id);
@@ -2890,7 +3239,7 @@ function handleMessage(data) {
       break;
 
     case 'task_started':
-      createSubagentPanel(data.agent, data.prompt, data.task_id);
+      createSubagentPanel(data.agent, data.prompt, data.task_id, data.parent_tool_call_id);
       break;
     case 'task_progress':
       updateSubagentProgress({ task_id: data.task_id, agent: data.agent }, data.cycle);
@@ -2948,50 +3297,94 @@ function handleMessage(data) {
       break;
 
     case 'progress':
-      addSystem(localizedRuntimeProgress(data));
+      if (data.kind === 'llm_retry') {
+        updateExecutionRetryProgress(Number(data.attempt || 1), Number(data.max_attempts || 2));
+      } else {
+        addSystem(localizedRuntimeProgress(data));
+      }
       break;
 
     case 'success':
-      clearReactStatus();
-      completeExecutionStack();
+      if (!state.activeExecutionRunId) {
+        clearReactStatus();
+        completeExecutionStack();
+      }
       addSystem(data.content, 'success', { dismissible: data.dismissible === true });
       restoreComposerSessionTransitionWithCapabilities();
-      setBusy(false);
+      if (!state.activeExecutionRunId) setBusy(false);
       break;
 
     case 'system':
-      clearReactStatus();
-      completeExecutionStack();
+      if (!state.activeExecutionRunId) clearReactStatus();
       addSystem(data.content, 'info', { dismissible: data.dismissible === true });
       restorePendingPlanAction();
       restoreComposerSessionTransitionWithCapabilities();
-      setBusy(false);
+      if (!state.activeExecutionRunId) setBusy(false);
       break;
 
-    case 'error':
-      clearCompressionOutcome();
-      finishAssistantStream({ discardIfEmpty: true });
-      finishReasoningStream();
-      if (state.reasoningPanel) {
-        state.reasoningPanel.classList.remove('reasoning-active');
-        finalizeOrDiscardLiveReasoningPanel(state.reasoningPanel);
+    case 'error': {
+      const clientRunId = state.activeExecutionRunId;
+      const hasActiveClientRun = clientRunId > 0;
+      const incomingServerRunId = resolvedEventRunIdentity(data.run_connection_id);
+      const terminatesActiveRun =
+        hasActiveClientRun &&
+        data.run_terminal === true &&
+        Boolean(incomingServerRunId) &&
+        incomingServerRunId === state.activeExecutionServerRunId;
+      if (terminatesActiveRun) {
+        clearCompressionOutcome();
+        finishAssistantStream({ discardIfEmpty: true });
+        finishReasoningStream();
+        if (state.reasoningPanel) {
+          state.reasoningPanel.classList.remove('reasoning-active');
+          finalizeOrDiscardLiveReasoningPanel(state.reasoningPanel);
+        }
+        finishTaskPlanPanel();
+        clearReactStatus();
       }
-      finishTaskPlanPanel();
-      clearReactStatus();
-      completeExecutionStack({ failed: true });
+      {
+        const errorText = localizedRuntimeError(data);
+        if (terminatesActiveRun) {
+          const terminalOutcome = doneExecutionOutcome(
+            String(data.phase || '').trim() || 'failed',
+            data.reason || data.code || 'failed',
+          );
+          const summaryKey = runtimeErrorTranslationKey(data);
+          const completedErrorStack = completeExecutionStackForClientRun(clientRunId, {
+            status: terminalOutcome.status === 'completed' ? 'failed' : terminalOutcome.status,
+            mergeWithExisting: true,
+            summary: errorText,
+            summaryKey,
+            diagnostic: normalizeRunDiagnostic(data.diagnostic),
+            recoveryLabel: terminalOutcome.recoveryLabel || tr('execution.reviewError'),
+            recoveryLabelKey: terminalOutcome.recoveryLabelKey || 'execution.reviewError',
+            terminalSource: 'error',
+          });
+          if (completedErrorStack?.isConnected) {
+            state.terminalExecutionStack = completedErrorStack;
+          }
+        } else {
+          addError(errorText, { dismissible: data.dismissible === true });
+        }
+      }
+      if (terminatesActiveRun) clearActiveExecutionIdentity();
       if (data.code === 'stale_plan_revision' && data.plan) {
         handlePlanRevisionConflict(data.plan);
       }
-      addError(localizedRuntimeError(data), { dismissible: data.dismissible === true });
-      state.reasoningPanel = null;
-      resetRoundTimers();
-      restorePendingPlanAction();
-      restoreComposerSessionTransitionWithCapabilities();
-      setBusy(false);
+      if (terminatesActiveRun) {
+        state.reasoningPanel = null;
+        resetRoundTimers();
+      }
+      if (!hasActiveClientRun || terminatesActiveRun) {
+        restorePendingPlanAction();
+        restoreComposerSessionTransitionWithCapabilities();
+        setBusy(false);
+      }
       if (isActiveGroupConnectionError(String(data.content || ''))) {
         recoverFromInvalidActiveGroup();
       }
       break;
+    }
   }
 }
 
@@ -3002,8 +3395,11 @@ const handleCommandMenuAction = createCommandMenuActionHandler(sendCmd);
 const actionHandlers = {
   'toggle-tools': () => toggleToolsVisibility(),
   'toggle-todos': () => toggleTodosVisibility(),
-  'toggle-reasoning': () => toggleReasoningVisibility(),
+  'set-reasoning-density': (el) => {
+    setReasoningDensity(normalizeReasoningDensity(el.dataset.density));
+  },
   'toggle-auto-debug': () => toggleAutoDebug(),
+  'close-auto-debug': () => setAutoDebugEnabled(false),
   'nav-settings': () => {
     closeMobileMenu();
     closeShellPopovers();
@@ -3062,6 +3458,10 @@ const actionHandlers = {
     openSettingsPage(state.activeSessionId || 'main', 'tab-agents');
   },
   'resolve-composer-availability': () => {
+    if (composerTransportAvailability() === 'offline') {
+      void reconnectToActiveSession(handleMessage);
+      return;
+    }
     const resolution = composerAvailabilityResolution();
     if (resolution === 'configure-models') {
       openSettingsPage(state.activeSessionId || 'main', 'tab-models');
@@ -3082,6 +3482,16 @@ const actionHandlers = {
   'preview-tool-image': (el) => previewToolImage(el),
   'toggle-tool': (el) => toggleTool(el),
   'toggle-execution-stack': (el) => toggleExecutionStack(el),
+  'execution-recovery': (el) => focusExecutionStackRecovery(el, revealHistoricalPlan),
+  'execution-diagnostic-models': (el: Element) => {
+    const stack = el.closest<HTMLElement>('.execution-stack');
+    if (
+      stack?.isConnected &&
+      stack.dataset.executionSessionId === (state.activeSessionId || 'main')
+    ) {
+      openSettingsPage(state.activeSessionId || 'main', 'tab-models');
+    }
+  },
   'subagent-copy-summary': (el) => copySubagentSummary(el),
   'subagent-open-tool-drawer': (el) => openSubagentToolDrawer(el),
   'open-subagent-modal': (el) => {
@@ -3138,6 +3548,23 @@ function handleDocumentKeydown(e: KeyboardEvent) {
   // open hidden UI while the Console is active.
   if (isConsoleSurfaceActive()) return;
 
+  const densityControl =
+    e.target instanceof HTMLButtonElement &&
+    e.target.matches('[data-action="set-reasoning-density"][role="radio"]')
+      ? e.target
+      : null;
+  if (densityControl) {
+    const density = reasoningDensityForNavigationKey(state.reasoningDensity, e.key);
+    if (density) {
+      e.preventDefault();
+      setReasoningDensity(density);
+      dom.toggleReasoningBtn
+        ?.querySelector<HTMLButtonElement>(`[data-density="${density}"]`)
+        ?.focus();
+      return;
+    }
+  }
+
   if (e.key === 'Escape' && hasOpenActionDialog()) {
     e.preventDefault();
     dismissActionDialog();
@@ -3159,6 +3586,7 @@ function handleDocumentKeydown(e: KeyboardEvent) {
     return;
   }
   if (e.key === 'Escape') {
+    if (state.autoDebugEnabled) setAutoDebugEnabled(false);
     closeToolDrawer();
     closeShellPopovers({ restoreFocus: true });
     closeMobileNavigation({ restoreFocus: true });
@@ -3452,8 +3880,7 @@ async function bootstrapWorkspace(): Promise<void> {
     sessionList?.sessionIdsCaseSensitive ?? true,
   );
   persistActiveSessionId(state.activeSessionId);
-  await discoverClientFeatures();
-  connect(handleMessage);
+  void connect(handleMessage, { initialFeatureDiscovery: true });
 }
 
 void bootstrapWorkspace();

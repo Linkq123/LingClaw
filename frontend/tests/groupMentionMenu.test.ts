@@ -28,6 +28,7 @@ describe('group mention menu', () => {
       { id: 'worker-b', name: '后端助手', role: 'admin' },
     ];
     stateModule.state.pendingImages = [];
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
     const input = stateModule.dom.input!;
@@ -77,10 +78,12 @@ describe('group mention menu', () => {
       { id: 'worker-b', name: 'Worker B', role: 'member' },
     ];
     stateModule.state.groupModelConfiguredMembers = new Set(['worker-a', 'worker-b']);
+    stateModule.state.composerSessionIdentityPending = false;
     stateModule.state.groupTargetMode = 'all';
     stateModule.state.pendingImages = [];
     stateModule.state.planModeEnabled = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners, send } = await import('../src/input.js');
     initInputListeners();
     const input = stateModule.dom.input!;
@@ -109,6 +112,7 @@ describe('group mention menu', () => {
     stateModule.state.activeGroupMemberDetails = [
       { id: 'worker-a', name: 'Worker A', role: 'member' },
     ];
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
     const input = stateModule.dom.input!;
@@ -152,6 +156,7 @@ describe('group mention menu', () => {
     stateModule.state.composerModelAvailability = 'ready';
     stateModule.state.pendingImages = [];
     stateModule.state.planModeEnabled = false;
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
     const input = stateModule.dom.input!;

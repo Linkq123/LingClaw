@@ -1,15 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 import {
   addSubagentTool,
+  appendSubagentReasoning,
   appendSubagentToolOutput,
   closeSubagentModal,
   createSubagentPanel,
   finishSubagentPanel,
+  finishSubagentReasoning,
   openSubagentModal,
   refreshSubagentPanelsLanguage,
   restoreSubagentHistorySnapshot,
   startSubagentReasoning,
+  syncSubagentReasoningDensity,
   trapSubagentModalFocus,
   updateSubagentToolResult,
 } from '../src/renderers/subagent.js';
@@ -18,6 +23,27 @@ import { applyToolsVisibility } from '../src/viewState.js';
 import { setLanguage } from '../src/i18n.js';
 
 let originalScrollIntoView: typeof Element.prototype.scrollIntoView | undefined;
+const panelCss = readFileSync(resolve(process.cwd(), 'src/css/panels.css'), 'utf8');
+const workspaceCss = readFileSync(resolve(process.cwd(), 'src/css/workspace.css'), 'utf8');
+
+function expectReasoningSentinelAbsent(panel: HTMLElement, sentinel: string): void {
+  const elements = [panel, ...Array.from(panel.querySelectorAll<HTMLElement>('*'))];
+  const titleValues = elements.map((element) => element.getAttribute('title') || '').join(' ');
+  const datasetValues = elements.flatMap((element) => Object.values(element.dataset)).join(' ');
+  const ariaValues = elements
+    .flatMap((element) =>
+      Array.from(element.attributes)
+        .filter((attribute) => attribute.name.startsWith('aria-'))
+        .map((attribute) => attribute.value),
+    )
+    .join(' ');
+
+  expect(panel.textContent).not.toContain(sentinel);
+  expect(panel.outerHTML).not.toContain(sentinel);
+  expect(titleValues).not.toContain(sentinel);
+  expect(datasetValues).not.toContain(sentinel);
+  expect(ariaValues).not.toContain(sentinel);
+}
 
 describe('subagent modal hosting', () => {
   beforeEach(() => {
@@ -39,6 +65,7 @@ describe('subagent modal hosting', () => {
     state.activeToolPanel = null;
     state.autoFollowChat = true;
     state.showTools = true;
+    state.reasoningDensity = 'summary';
     setLanguage('en');
     originalScrollIntoView = Element.prototype.scrollIntoView;
     Object.defineProperty(Element.prototype, 'scrollIntoView', {
@@ -147,6 +174,44 @@ describe('subagent modal hosting', () => {
     expect(dom.sessionDrawer?.inert).toBe(false);
     expect(document.querySelector<HTMLElement>('.conversation-column')?.inert).toBe(false);
     expect(document.activeElement).toBe(header);
+  });
+
+  it('uses only the stack body scroll for long inline details while preserving modal scroll', () => {
+    const style = document.createElement('style');
+    style.textContent = `${panelCss}\n${workspaceCss}`;
+    document.head.appendChild(style);
+    createSubagentPanel('explore', 'Long prompt '.repeat(120), 'task-scroll');
+    const ref = { task_id: 'task-scroll', agent: 'explore' };
+    startSubagentReasoning(ref);
+    appendSubagentReasoning(ref, 'Long reasoning\n'.repeat(180));
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement;
+    const body = panel.querySelector<HTMLElement>('.subagent-body')!;
+    body.classList.add('show');
+    for (const className of ['subagent-preview', 'subagent-note', 'subagent-error']) {
+      const detail = document.createElement('div');
+      detail.className = className;
+      detail.textContent = 'Long detail\n'.repeat(120);
+      body.appendChild(detail);
+    }
+
+    const inlineDetails = panel.querySelectorAll<HTMLElement>(
+      '.subagent-reasoning-body, .subagent-prompt, .subagent-preview, .subagent-note, .subagent-error',
+    );
+    expect(inlineDetails.length).toBeGreaterThanOrEqual(5);
+    for (const detail of inlineDetails) {
+      expect(getComputedStyle(detail).maxHeight).toBe('none');
+      expect(getComputedStyle(detail).overflowY).toBe('visible');
+    }
+    expect(getComputedStyle(body).overflowY).toBe('visible');
+
+    openSubagentModal(panel.querySelector('.subagent-header'));
+
+    expect(getComputedStyle(body).overflowY).toBe('auto');
+    expect(getComputedStyle(body).maxHeight).not.toBe('none');
+    expect(
+      getComputedStyle(panel.querySelector('.subagent-reasoning-body') as HTMLElement).overflowY,
+    ).toBe('auto');
+    style.remove();
   });
 
   it('keeps summary copy enabled for finished panels without tools', () => {
@@ -265,7 +330,9 @@ describe('subagent modal hosting', () => {
     });
 
     expect(stack.classList.contains('is-failed')).toBe(true);
-    expect(stack.querySelector('.execution-stack-title')?.textContent).toBe('Execution failed');
+    expect(stack.querySelector('.execution-stack-title')?.textContent).toContain(
+      'Failed at: Delegate · explore',
+    );
   });
 
   it('strips delegated runtime context from the displayed prompt', () => {
@@ -296,6 +363,12 @@ describe('subagent modal hosting', () => {
     expect(header).toBeInstanceOf(HTMLButtonElement);
     expect(header?.contains(closeButton || null)).toBe(false);
     expect(panel?.querySelector('.subagent-status')?.textContent).toBe('Running');
+    expect(panel?.querySelector('.subagent-kicker')?.textContent).toBe('Delegate');
+    expect(panel?.querySelector('.subagent-label')?.textContent).toContain(
+      'explore · Inspect the logs',
+    );
+    expect(panel?.dataset.executionAction).toBe('Delegate');
+    expect(panel?.dataset.executionResult).toBe('Running');
     expect(panel?.querySelector('.subagent-icon use')?.getAttribute('href')).toBe(
       '#icon-user-node',
     );
@@ -379,6 +452,7 @@ describe('subagent modal hosting', () => {
   });
 
   it('restores reasoning, tools, and summary from a history snapshot', () => {
+    const historyReasoningSentinel = 'HISTORY_SUBAGENT_PRIVATE_SENTINEL';
     createSubagentPanel('reviewer', 'Inspect the logs and summarize the failure.', 'task-5');
 
     restoreSubagentHistorySnapshot(
@@ -390,7 +464,7 @@ describe('subagent modal hosting', () => {
         duration_ms: 480,
         input_tokens: 120,
         output_tokens: 64,
-        reasoning: '[Cycle 1]\nCheck the log file and summarize the failure.',
+        reasoning: `[Cycle 1]\n${historyReasoningSentinel}`,
         result_excerpt: 'Found the root cause in the startup logs.',
         tools: [
           {
@@ -412,7 +486,16 @@ describe('subagent modal hosting', () => {
     const toolBadges = panel?.querySelectorAll('.subagent-tool-pill') || [];
     const summary = panel?.querySelector('.subagent-summary') as HTMLElement | null;
 
-    expect(reasoningBody?.textContent).toContain('Check the log file');
+    expect(reasoningBody?.textContent).toContain('Reasoning trace retained');
+    expectReasoningSentinelAbsent(panel!, historyReasoningSentinel);
+
+    state.reasoningDensity = 'verbose';
+    syncSubagentReasoningDensity();
+    expect(reasoningBody?.textContent).toContain(historyReasoningSentinel);
+
+    state.reasoningDensity = 'normal';
+    syncSubagentReasoningDensity();
+    expectReasoningSentinelAbsent(panel!, historyReasoningSentinel);
     expect(panel?.querySelectorAll('.subagent-tool-row') || []).toHaveLength(0);
     expect(toolBadges).toHaveLength(1);
     expect(
@@ -501,6 +584,75 @@ describe('subagent modal hosting', () => {
     expect(panel.querySelector('[data-subagent-reasoning-meta]')?.textContent).toBe(
       '第 1 轮 / 思考中…',
     );
+  });
+
+  it.each(['summary', 'normal'] as const)(
+    'keeps short and long live reasoning out of the DOM after thinking_done at %s density',
+    (density) => {
+      state.reasoningDensity = density;
+      for (const [suffix, raw] of [
+        ['short', 'SHORT_SUBAGENT_PRIVATE_SENTINEL'],
+        ['long', `LONG_SUBAGENT_PRIVATE_SENTINEL ${'private reasoning '.repeat(120)}`],
+      ] as const) {
+        const taskId = `task-reasoning-${density}-${suffix}`;
+        const ref = { task_id: taskId, agent: 'reviewer' };
+        createSubagentPanel('reviewer', 'Inspect the result.', taskId);
+        startSubagentReasoning(ref);
+        appendSubagentReasoning(ref, raw);
+        finishSubagentReasoning(ref);
+        const panel = state.activeSubagentPanels.get(taskId)!;
+
+        expectReasoningSentinelAbsent(panel, raw.split(' ')[0]);
+        expect(panel.querySelector('[data-subagent-reasoning-meta]')?.textContent).toMatch(
+          /^Reasoning trace · \d+ characters$/,
+        );
+        expect(
+          panel.querySelector<HTMLElement>('[data-subagent-reasoning]')?.dataset.reasoningActive,
+        ).toBe('false');
+        expect(
+          panel.querySelector('[data-subagent-reasoning-body]')?.getAttribute('aria-label'),
+        ).toBe(density === 'summary' ? 'Concise reasoning summary' : 'Bounded reasoning detail');
+      }
+    },
+  );
+
+  it('keeps multiple Sub-agent traces isolated across density changes', () => {
+    const firstSentinel = 'FIRST_SUBAGENT_REASONING_SENTINEL';
+    const secondSentinel = 'SECOND_SUBAGENT_REASONING_SENTINEL';
+    const firstRef = { task_id: 'task-reasoning-first', agent: 'reviewer' };
+    const secondRef = { task_id: 'task-reasoning-second', agent: 'explore' };
+    createSubagentPanel('reviewer', 'Review the result.', firstRef.task_id);
+    createSubagentPanel('explore', 'Explore the result.', secondRef.task_id);
+    startSubagentReasoning(firstRef);
+    startSubagentReasoning(secondRef);
+    appendSubagentReasoning(firstRef, firstSentinel);
+    appendSubagentReasoning(secondRef, `${secondSentinel} with a longer independent trace`);
+    finishSubagentReasoning(firstRef);
+    finishSubagentReasoning(secondRef);
+
+    const firstPanel = state.activeSubagentPanels.get('task-reasoning-first')!;
+    const secondPanel = state.activeSubagentPanels.get('task-reasoning-second')!;
+    const firstMeta = firstPanel.querySelector('[data-subagent-reasoning-meta]')?.textContent;
+    const secondMeta = secondPanel.querySelector('[data-subagent-reasoning-meta]')?.textContent;
+    expect(firstMeta).not.toBe(secondMeta);
+    expectReasoningSentinelAbsent(firstPanel, firstSentinel);
+    expectReasoningSentinelAbsent(secondPanel, secondSentinel);
+
+    state.reasoningDensity = 'verbose';
+    syncSubagentReasoningDensity();
+    expect(firstPanel.querySelector('[data-subagent-reasoning-body]')?.textContent).toContain(
+      firstSentinel,
+    );
+    expect(firstPanel.textContent).not.toContain(secondSentinel);
+    expect(secondPanel.querySelector('[data-subagent-reasoning-body]')?.textContent).toContain(
+      secondSentinel,
+    );
+    expect(secondPanel.textContent).not.toContain(firstSentinel);
+
+    state.reasoningDensity = 'summary';
+    syncSubagentReasoningDensity();
+    expectReasoningSentinelAbsent(firstPanel, firstSentinel);
+    expectReasoningSentinelAbsent(secondPanel, secondSentinel);
   });
 
   it('matches empty tool ids to the earliest running badge', () => {

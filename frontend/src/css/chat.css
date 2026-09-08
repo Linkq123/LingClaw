@@ -1210,14 +1210,17 @@
 .plan-card-actions button.is-primary,
 .plan-feedback-actions button.is-primary,
 .plan-stale-notice button.is-primary {
-  border-color: #6554d9;
-  background: #6554d9;
-  color: white;
+  border-color: var(--color-plan-fill);
+  background: var(--color-plan-fill);
+  color: var(--color-on-plan);
 }
 
 .plan-card-actions button:disabled {
   cursor: not-allowed;
-  opacity: 0.48;
+  border-color: var(--color-disabled-fill);
+  color: var(--color-on-disabled);
+  background: var(--color-disabled-fill);
+  opacity: 1;
 }
 
 .plan-feedback-editor {

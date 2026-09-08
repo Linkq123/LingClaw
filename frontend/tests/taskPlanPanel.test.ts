@@ -132,7 +132,7 @@ describe('task plan timeline panel', () => {
     setLanguage('zh-CN');
     refreshTaskPlanPanelsLanguage();
 
-    expect(panel.querySelector('.tool-name')?.textContent).toBe('任务计划');
+    expect(panel.querySelector('.tool-name')?.textContent).toBe('执行提纲');
     expect(panel.querySelector('.tool-status')?.textContent).toBe('进行中');
     expect(panel.dataset.toolStatus).toBe('进行中');
     expect(panel.dataset.toolArgs).toBe('第 1 轮，第 0 周期，意图 change');

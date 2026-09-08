@@ -55,7 +55,7 @@ describe('tool image results', () => {
     expect(panel.querySelector('.tool-image-count')?.textContent).toBe('1 image');
     expect(
       panel.closest('.execution-stack')?.querySelector('.execution-stack-meta')?.textContent,
-    ).toBe('1 step · 1 image');
+    ).toBe('1/1 complete · 1 image');
 
     openToolDrawerFromHeader(panel.querySelector('.tool-header'));
     const image = dom.toolDrawerImages?.querySelector('img');

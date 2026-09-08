@@ -1,3 +1,4 @@
+import { canonicalToolRetryKey } from '../toolRecovery.js';
 import { dom, state } from '../state.js';
 import { escHtml, truncateStr, formatToolDuration, hideWelcome } from '../utils.js';
 import { scrollDown, syncToolDrawerBounds } from '../scroll.js';
@@ -198,6 +199,82 @@ function findToolPanel(id) {
   return fallback;
 }
 
+function semanticToolAction(name: string): string {
+  const normalized = String(name || '').toLowerCase();
+  if (/(?:^|_)(?:read|view|inspect|get|list)(?:_|$)/.test(normalized))
+    return tr('tool.action.read');
+  if (/(?:^|_)(?:write|create|patch|edit|save|update)(?:_|$)/.test(normalized)) {
+    return tr('tool.action.change');
+  }
+  if (/(?:^|_)(?:search|find|query)(?:_|$)/.test(normalized)) return tr('tool.action.search');
+  if (/(?:^|_)(?:test|check|verify|validate|lint|build)(?:_|$)/.test(normalized)) {
+    return tr('tool.action.verify');
+  }
+  if (/(?:^|_)(?:exec|shell|command|run)(?:_|$)/.test(normalized)) return tr('tool.action.run');
+  if (/(?:^|_)(?:delete|remove)(?:_|$)/.test(normalized)) return tr('tool.action.remove');
+  return tr('tool.action.invoke', { name: String(name || tr('common.tools')) });
+}
+
+function semanticToolObject(name: string, args: string): string {
+  try {
+    const parsed = JSON.parse(args || '{}') as Record<string, unknown>;
+    for (const key of [
+      'path',
+      'file',
+      'url',
+      'query',
+      'command',
+      'cmd',
+      'target',
+      'session',
+      'name',
+    ]) {
+      const value = parsed[key];
+      if (typeof value === 'string' && value.trim()) return truncateStr(value.trim(), 92);
+    }
+  } catch {
+    // The drawer retains the raw argument text; the run shell only needs a safe preview.
+  }
+  const preview = truncateStr(
+    String(args || '')
+      .replace(/\s+/g, ' ')
+      .trim(),
+    92,
+  );
+  return preview || String(name || '');
+}
+
+function syncToolExecutionSemantics(panel: HTMLElement): void {
+  const name = panel.dataset.toolName || '';
+  const action = semanticToolAction(name);
+  const object = semanticToolObject(name, panel.dataset.toolArgs || '');
+  const status = panel.dataset.toolStatus || tr('tool.running');
+  const resultPreview = truncateStr(
+    String(panel.dataset.toolResult || '')
+      .replace(/\s+/g, ' ')
+      .trim(),
+    110,
+  );
+  const result =
+    panel.dataset.toolHasResult === 'true' && resultPreview
+      ? `${status}: ${resultPreview}`
+      : status;
+  panel.dataset.executionAction = action;
+  panel.dataset.executionObject = object;
+  panel.dataset.executionResult = result;
+  panel.dataset.executionRetryKey = canonicalToolRetryKey(name, panel.dataset.toolArgs || '');
+  panel.dataset.executionState =
+    panel.dataset.toolIsError === 'true'
+      ? 'failed'
+      : panel.dataset.toolHasResult === 'true'
+        ? 'completed'
+        : 'running';
+  const actionEl = panel.querySelector<HTMLElement>('.tool-name');
+  const objectEl = panel.querySelector<HTMLElement>('.tool-args-preview');
+  if (actionEl) actionEl.textContent = action;
+  if (objectEl) objectEl.textContent = object;
+}
+
 export function addToolCall(name, args, id) {
   let argsDisplay = args;
   try {
@@ -210,9 +287,10 @@ export function addToolCall(name, args, id) {
     existing.dataset.toolName = name;
     existing.dataset.toolArgs = argsDisplay;
     const nameEl = existing.querySelector('.tool-name');
-    if (nameEl) nameEl.textContent = name;
+    if (nameEl) nameEl.textContent = semanticToolAction(name);
     const argsPreviewEl = existing.querySelector('.tool-args-preview');
-    if (argsPreviewEl) argsPreviewEl.textContent = truncateStr(args, 80);
+    if (argsPreviewEl) argsPreviewEl.textContent = semanticToolObject(name, args);
+    syncToolExecutionSemantics(existing);
     return existing;
   }
 
@@ -232,12 +310,13 @@ export function addToolCall(name, args, id) {
   panel.innerHTML = `
     <button type="button" class="tool-header" data-action="open-tool-drawer" aria-haspopup="dialog">
       <span class="tool-icon">${iconMarkup('bolt')}</span>
-      <span class="tool-name">${escHtml(name)}</span>
-      <span class="tool-args-preview">${escHtml(truncateStr(args, 80))}</span>
+      <span class="tool-name">${escHtml(semanticToolAction(name))}</span>
+      <span class="tool-args-preview">${escHtml(semanticToolObject(name, args))}</span>
       <span class="tool-image-count" hidden></span>
       <span class="tool-status">${escHtml(tr('tool.running'))}</span>
     </button>
   `;
+  syncToolExecutionSemantics(panel);
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
   mountExecutionPanel(panel, 'tool', currentRow);
   pinReactStatusToBottom();
@@ -261,6 +340,7 @@ export function updateToolProgress(id, elapsedMs) {
   if (state.activeToolPanel === panel) {
     syncToolDrawer(panel);
   }
+  syncToolExecutionSemantics(panel);
   refreshExecutionStackForPanel(panel);
 }
 
@@ -308,6 +388,7 @@ export function addToolResult(
     }
     panel.classList.add('tool-panel-ready');
     panel.classList.toggle('tool-panel-failed', isError);
+    syncToolExecutionSemantics(panel);
     if (state.activeToolPanel === panel) {
       syncToolDrawer(panel);
     }
@@ -345,6 +426,7 @@ export function addToolResult(
   el.classList.add('tool-panel-ready');
   syncPanelImageCount(el, normalizedImages);
   el.classList.toggle('tool-panel-failed', isError);
+  syncToolExecutionSemantics(el);
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
   mountExecutionPanel(el, 'result', currentRow);
   pinReactStatusToBottom();
@@ -459,6 +541,7 @@ export function refreshToolPanelsLanguage(): void {
       panel.dataset.toolStatus = status;
       const statusEl = panel.querySelector<HTMLElement>('.tool-status');
       if (statusEl) statusEl.textContent = status;
+      syncToolExecutionSemantics(panel);
       const imageCount = Number(panel.dataset.toolImageCount || 0);
       const imageCountEl = panel.querySelector<HTMLElement>('.tool-image-count');
       if (imageCountEl) {

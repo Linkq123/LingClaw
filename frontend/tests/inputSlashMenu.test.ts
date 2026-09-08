@@ -45,6 +45,7 @@ describe('input slash command menu', () => {
     stateModule.initDomRefs();
     stateModule.state.ws = { readyState: 0 } as WebSocket;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -72,6 +73,7 @@ describe('input slash command menu', () => {
     stateModule.initDomRefs();
     stateModule.state.ws = { readyState: 0 } as WebSocket;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -105,6 +107,7 @@ describe('input slash command menu', () => {
     stateModule.initDomRefs();
     stateModule.state.ws = { readyState: 0 } as WebSocket;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -131,6 +134,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [];
     stateModule.state.busy = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -156,6 +160,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [];
     stateModule.state.busy = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     stateModule.dom.input!.value = '/switch unconfigured-session';
     send();
@@ -185,6 +190,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [];
     stateModule.state.busy = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     stateModule.dom.input!.value = '/switch';
     send();
@@ -207,6 +213,7 @@ describe('input slash command menu', () => {
     stateModule.state.composerSessionIdentityPending = true;
     stateModule.state.composerModelAvailability = 'checking';
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     stateModule.dom.input!.value = '/switch target-session';
     send();
@@ -215,6 +222,10 @@ describe('input slash command menu', () => {
     expect(stateModule.state.composerSessionTransitionPending).toBe(false);
 
     stateModule.dom.input!.value = '/switch';
+    send();
+    expect(sendMock).not.toHaveBeenCalled();
+
+    stateModule.state.composerSessionIdentityPending = false;
     send();
     expect(sendMock).toHaveBeenCalledWith('/switch');
   });
@@ -231,6 +242,7 @@ describe('input slash command menu', () => {
     stateModule.state.busy = false;
     stateModule.state.imageUploadInFlight = true;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     stateModule.dom.input!.value = '/switch target-session';
     send();
@@ -251,6 +263,7 @@ describe('input slash command menu', () => {
     stateModule.state.busy = false;
     stateModule.state.imageUploadInFlight = true;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     stateModule.dom.input!.value = 'describe the uploaded image';
     send();
@@ -271,6 +284,7 @@ describe('input slash command menu', () => {
     stateModule.state.busy = false;
     stateModule.state.composerModelSwitchInFlight = true;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     stateModule.dom.input!.value = 'run with the new model';
     send();
@@ -290,6 +304,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [];
     stateModule.state.busy = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -315,6 +330,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [];
     stateModule.state.busy = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -339,6 +355,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [];
     stateModule.state.busy = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -366,6 +383,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [{ url: 'https://example.com/demo.png' }];
     stateModule.state.busy = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -397,6 +415,7 @@ describe('input slash command menu', () => {
     stateModule.state.busy = false;
     stateModule.state.planModeEnabled = false;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -427,6 +446,7 @@ describe('input slash command menu', () => {
     stateModule.state.busy = false;
     stateModule.state.planModeEnabled = true;
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -457,6 +477,7 @@ describe('input slash command menu', () => {
     stateModule.state.busy = false;
 
     const { setPlanMode } = await import('../src/images.js');
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     for (const command of ['/clear', '/new']) {
       stateModule.dom.input!.value = command;
@@ -476,6 +497,7 @@ describe('input slash command menu', () => {
     stateModule.state.inputHistoryIndex = -1;
     stateModule.state.inputHistoryDraft = '';
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
 
@@ -504,6 +526,7 @@ describe('input slash command menu', () => {
     stateModule.state.composerModelAvailability = 'agent-model-unconfigured';
     stateModule.dom.input!.value = 'should not be sent';
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     send();
 
@@ -535,6 +558,7 @@ describe('input slash command menu', () => {
     vi.mocked(chat.addSystem).mockClear();
     stateModule.dom.input!.value = 'do something else';
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     send();
 
@@ -571,6 +595,7 @@ describe('input slash command menu', () => {
     };
     stateModule.dom.input!.value = 'also verify the fallback path';
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     send();
 
@@ -592,6 +617,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [];
     stateModule.dom.input!.value = '/help';
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     send();
 
@@ -609,6 +635,7 @@ describe('input slash command menu', () => {
     stateModule.state.composerEffectiveModelConfigured = false;
     stateModule.state.pendingImages = [];
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     stateModule.dom.input!.value = '/status';
     send();
@@ -635,6 +662,7 @@ describe('input slash command menu', () => {
     stateModule.state.pendingImages = [];
     stateModule.dom.input!.value = '/new';
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { send } = await import('../src/input.js');
     send();
 
@@ -649,6 +677,7 @@ describe('input slash command menu', () => {
     stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
     stateModule.state.composerModelAvailability = 'agent-model-unconfigured';
 
+    (await import('./composerTransportFixture.js')).prepareComposerTransportFixture();
     const { initInputListeners } = await import('../src/input.js');
     initInputListeners();
     stateModule.dom.input!.value = '/status';

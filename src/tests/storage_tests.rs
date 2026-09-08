@@ -280,6 +280,8 @@ fn create_current_database(path: &Path) {
                 VALUES (5, 'plan_stale_override_audit', 1);
             INSERT INTO schema_migrations(version, name, applied_at)
                 VALUES (6, 'session_working_directories', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (7, 'top_level_run_outcomes', 1);
             "#,
         )
         .expect("migration ledger should initialize");
@@ -304,11 +306,18 @@ fn remove_v6_session_workspace_schema(connection: &rusqlite::Connection) {
         .expect("pre-v6 Session schema should initialize");
 }
 
+fn remove_v7_run_outcome_schema(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch("DROP TABLE session_run_outcomes;")
+        .expect("pre-v7 run outcome schema should initialize");
+}
+
 fn create_v1_plan_database(path: &Path, include_assistant_message: bool) {
     let connection = rusqlite::Connection::open(path).expect("test database should open");
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v7_run_outcome_schema(&connection);
     remove_v6_session_workspace_schema(&connection);
     connection
         .execute_batch(
@@ -377,6 +386,7 @@ fn create_v2_plan_database(path: &Path) {
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v7_run_outcome_schema(&connection);
     remove_v6_session_workspace_schema(&connection);
     connection
         .execute_batch(
@@ -404,6 +414,7 @@ fn create_v3_plan_database(path: &Path) {
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v7_run_outcome_schema(&connection);
     remove_v6_session_workspace_schema(&connection);
     connection
         .execute_batch(
@@ -432,6 +443,7 @@ fn create_v4_plan_database(path: &Path) {
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v7_run_outcome_schema(&connection);
     remove_v6_session_workspace_schema(&connection);
     connection
         .execute_batch(
@@ -461,6 +473,7 @@ fn create_v5_database(path: &Path, session_id: &str) {
     connection
         .execute_batch(schema::INITIAL_SCHEMA)
         .expect("base schema should initialize");
+    remove_v7_run_outcome_schema(&connection);
     remove_v6_session_workspace_schema(&connection);
     connection
         .execute(
@@ -494,6 +507,38 @@ fn create_v5_database(path: &Path, session_id: &str) {
         .expect("application id should initialize");
     connection
         .pragma_update(None, "user_version", 5)
+        .expect("schema version should initialize");
+}
+
+fn create_v6_database(path: &Path) {
+    let connection = rusqlite::Connection::open(path).expect("test database should open");
+    connection
+        .execute_batch(schema::INITIAL_SCHEMA)
+        .expect("base schema should initialize");
+    remove_v7_run_outcome_schema(&connection);
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (1, 'initial_core_storage', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (2, 'plan_lifecycle', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (3, 'durable_plan_feedback', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (4, 'plan_initial_submission_marker', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (5, 'plan_stale_override_audit', 1);
+            INSERT INTO schema_migrations(version, name, applied_at)
+                VALUES (6, 'session_working_directories', 1);
+            "#,
+        )
+        .expect("v6 migration ledger should initialize");
+    connection
+        .pragma_update(None, "application_id", schema::APPLICATION_ID)
+        .expect("application id should initialize");
+    connection
+        .pragma_update(None, "user_version", 6)
         .expect("schema version should initialize");
 }
 
@@ -644,6 +689,7 @@ async fn opens_an_empty_database_with_the_current_schema() {
     for required in [
         "sessions",
         "session_messages",
+        "session_run_outcomes",
         "session_todos",
         "session_usage",
         "groups",
@@ -821,6 +867,7 @@ async fn schema_v2_migration_adds_durable_plan_feedback() {
             (4, "plan_initial_submission_marker".to_string()),
             (5, "plan_stale_override_audit".to_string()),
             (6, "session_working_directories".to_string()),
+            (7, "top_level_run_outcomes".to_string()),
         ]
     );
 
@@ -965,6 +1012,52 @@ async fn schema_v5_migration_backfills_managed_working_directories() {
             .file_name()
             .to_string_lossy()
             .starts_with("lingclaw-schema-v5-")
+    }));
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn schema_v6_migration_adds_top_level_run_outcomes_after_verified_backup() {
+    let home = temp_home("schema-v6-run-outcomes");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = home.join("lingclaw.db");
+    create_v6_database(&path);
+
+    let database = Database::open(path.clone())
+        .await
+        .expect("v6 database should migrate");
+    let (version, table_count, migration_name) = database
+        .read(|connection| {
+            let version =
+                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+            let table_count = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_run_outcomes'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let migration_name = connection.query_row(
+                "SELECT name FROM schema_migrations WHERE version=7",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            Ok((version, table_count, migration_name))
+        })
+        .await
+        .expect("migrated run-outcome schema should be readable");
+    assert_eq!(version, schema::SCHEMA_VERSION);
+    assert_eq!(table_count, 1);
+    assert_eq!(migration_name, "top_level_run_outcomes");
+    let backups = std::fs::read_dir(home.join("backups"))
+        .expect("schema backup directory should exist")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("schema backups should be readable");
+    assert!(backups.iter().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("lingclaw-schema-v6-")
     }));
 
     drop(database);
@@ -1364,6 +1457,582 @@ async fn session_round_trip_preserves_fields_without_ephemeral_image_secrets() {
 
     drop(database);
     remove_home(&home);
+}
+
+#[tokio::test]
+async fn round23_terminal_diagnostic_survives_atomic_save_and_database_reopen() {
+    let (home, database) = open_temp_database("terminal-diagnostic-round23").await;
+    let mut session = basic_session("diagnostic-round23", "Diagnostic");
+    session
+        .messages
+        .push(chat_message("user", "Explain the failure", 21));
+    let outcome: crate::TopLevelRunOutcome = serde_json::from_value(serde_json::json!({
+        "session_id": session.id,
+        "run_id": "diagnostic-run-23",
+        "run_connection_id": "diagnostic-connection",
+        "status": "failed", "phase": "failed", "reason": "provider_authentication",
+        "duration_ms": 25, "start_message_index": 1, "end_message_index": 1,
+        "plan_id": null, "plan_revision": null, "started_at": 100, "finished_at": 101,
+        "diagnostic": { "code": "provider_authentication" }
+    }))
+    .expect("terminal diagnostic is structured protocol data");
+    database
+        .save_session_with_run_outcome(&session, outcome)
+        .await
+        .unwrap();
+    drop(database);
+    let reopened = Database::open(home.join("lingclaw.db")).await.unwrap();
+    let outcomes = reopened.load_run_outcomes(&session.id).await.unwrap();
+    let json = serde_json::to_value(&outcomes[0]).unwrap();
+    assert_eq!(json["diagnostic"]["code"], "provider_authentication");
+    drop(reopened);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn top_level_run_outcome_round_trips_and_changed_message_tail_invalidates_it() {
+    let (home, database) = open_temp_database("run-outcome-round-trip").await;
+    let mut session = basic_session("run-outcome", "Run outcome");
+    session
+        .messages
+        .push(chat_message("user", "Read the project", 21));
+    session
+        .messages
+        .push(chat_message("assistant", "The read completed.", 22));
+    let outcome = crate::TopLevelRunOutcome {
+        diagnostic: None,
+        session_id: session.id.clone(),
+        run_id: "run-persisted-1".to_string(),
+        run_connection_id: "42".to_string(),
+        status: "completed".to_string(),
+        phase: "finish".to_string(),
+        reason: Some("complete".to_string()),
+        duration_ms: 875,
+        start_message_index: 1,
+        end_message_index: 2,
+        plan_id: None,
+        plan_revision: None,
+        started_at: 100,
+        finished_at: 101,
+    };
+    database
+        .save_session_with_run_outcome(&session, outcome.clone())
+        .await
+        .expect("Session and terminal run fact should commit together");
+    assert_eq!(
+        database.load_run_outcomes(&session.id).await.unwrap(),
+        vec![outcome]
+    );
+
+    drop(database);
+    let database = Database::open(home.join("lingclaw.db"))
+        .await
+        .expect("database should reopen");
+    let persisted = database.load_run_outcomes(&session.id).await.unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].status, "completed");
+    assert_eq!(persisted[0].duration_ms, 875);
+
+    session.messages[2].content = Some("A rewritten, unrelated tail.".to_string());
+    database.save_session(&session).await.unwrap();
+    assert!(
+        database
+            .load_run_outcomes(&session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(database);
+    remove_home(&home);
+}
+
+fn terminal_linearization_session(id: &str, status: crate::plan::PlanStatus) -> crate::Session {
+    let mut session = basic_session(id, "Terminal linearization");
+    session
+        .messages
+        .push(chat_message("user", "Execute the approved plan", 21));
+    session.messages.push(chat_message(
+        "assistant",
+        "The plan reached its terminal boundary",
+        22,
+    ));
+    let mut plan = crate::PendingPlan::new(
+        format!("plan-{id}"),
+        1,
+        2,
+        20,
+        2,
+        status,
+        crate::plan::PlanArtifact {
+            title: "Commit one terminal fact".into(),
+            goal: "Keep Plan and run outcome atomic".into(),
+            steps: vec![crate::plan::PlanStep {
+                id: "commit".into(),
+                title: "Commit terminal state".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        Vec::new(),
+        false,
+    );
+    plan.approved_at = Some(20);
+    plan.execution_attempt = 1;
+    plan.finished_at = Some(22);
+    session.pending_plan = Some(plan);
+    session
+}
+
+fn terminal_linearization_outcome(
+    session: &crate::Session,
+    status: &str,
+    phase: &str,
+) -> crate::TopLevelRunOutcome {
+    crate::TopLevelRunOutcome {
+        diagnostic: None,
+        session_id: session.id.clone(),
+        run_id: format!("run-{}", session.id),
+        run_connection_id: "linearization-connection".to_string(),
+        status: status.to_string(),
+        phase: phase.to_string(),
+        reason: Some(phase.to_string()),
+        duration_ms: 25,
+        start_message_index: 1,
+        end_message_index: 2,
+        plan_id: session.pending_plan.as_ref().map(|plan| plan.id.clone()),
+        plan_revision: session.pending_plan.as_ref().map(|plan| plan.revision),
+        started_at: 20,
+        finished_at: 22,
+    }
+}
+
+async fn wait_for_run_outcome_gate(condition: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal database barrier should be reached");
+}
+
+struct RunOutcomeGateRelease(Arc<RunOutcomeCommitTestGate>);
+
+impl Drop for RunOutcomeGateRelease {
+    fn drop(&mut self) {
+        self.0.allow_commit();
+        self.0.allow_response();
+    }
+}
+
+#[tokio::test]
+async fn terminal_database_barriers_preserve_the_pre_enqueue_and_post_commit_winners() {
+    let (home, database) = open_temp_database("terminal-linearization-barriers").await;
+
+    // A stop observed before any natural transaction is enqueued chooses one
+    // stopped snapshot/outcome transaction.
+    let stopped = terminal_linearization_session(
+        "terminal-pre-enqueue-stop",
+        crate::plan::PlanStatus::Stopped,
+    );
+    database
+        .save_session_with_run_outcome(
+            &stopped,
+            terminal_linearization_outcome(&stopped, "stopped", "stopped"),
+        )
+        .await
+        .unwrap();
+    let stored_stopped = database.load_session(&stopped.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored_stopped.pending_plan.unwrap().status,
+        crate::plan::PlanStatus::Stopped
+    );
+    let outcomes = database.load_run_outcomes(&stopped.id).await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, "stopped");
+
+    // Once SQLite has committed the natural transaction, delaying the async
+    // completion response and observing Stop cannot change that winner.
+    let completed = terminal_linearization_session(
+        "terminal-post-commit-stop",
+        crate::plan::PlanStatus::Completed,
+    );
+    let gate = Arc::new(RunOutcomeCommitTestGate::default());
+    let _gate_release = RunOutcomeGateRelease(Arc::clone(&gate));
+    gate.allow_commit();
+    let task = {
+        let database = database.clone();
+        let completed = completed.clone();
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            database
+                .save_session_with_run_outcome_test_gated(
+                    &completed,
+                    terminal_linearization_outcome(&completed, "completed", "finish"),
+                    gate,
+                )
+                .await
+        })
+    };
+    wait_for_run_outcome_gate(|| gate.entered()).await;
+    wait_for_run_outcome_gate(|| gate.committed()).await;
+    // The runtime's exact-run Stop is observed at this barrier; because COMMIT
+    // already completed, it cannot select a second stopped transaction.
+    gate.allow_response();
+    task.await.unwrap().unwrap();
+
+    let stored_completed = database.load_session(&completed.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored_completed.pending_plan.unwrap().status,
+        crate::plan::PlanStatus::Completed
+    );
+    let outcomes = database.load_run_outcomes(&completed.id).await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, "completed");
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn cancelling_a_tokio_rusqlite_response_future_cannot_retract_its_commit() {
+    let (home, database) = open_temp_database("terminal-commit-future-cancel").await;
+    let completed = terminal_linearization_session(
+        "terminal-cancelled-response",
+        crate::plan::PlanStatus::Completed,
+    );
+    let gate = Arc::new(RunOutcomeCommitTestGate::default());
+    let _gate_release = RunOutcomeGateRelease(Arc::clone(&gate));
+    gate.allow_commit();
+    let task = {
+        let database = database.clone();
+        let completed = completed.clone();
+        let gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            database
+                .save_session_with_run_outcome_test_gated(
+                    &completed,
+                    terminal_linearization_outcome(&completed, "completed", "finish"),
+                    gate,
+                )
+                .await
+        })
+    };
+    wait_for_run_outcome_gate(|| gate.committed()).await;
+    task.abort();
+    gate.allow_response();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    // This read is queued behind the still-running SQLite closure and therefore
+    // deterministically observes the transaction after that closure returns.
+    let outcomes = database.load_run_outcomes(&completed.id).await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].status, "completed");
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn terminal_transaction_failure_rolls_back_plan_and_outcome_and_protects_storage() {
+    let (home, database) = open_temp_database("terminal-transaction-failure").await;
+    let executing = terminal_linearization_session(
+        "terminal-transaction-failure",
+        crate::plan::PlanStatus::Executing,
+    );
+    database.save_session(&executing).await.unwrap();
+    let completed = terminal_linearization_session(
+        "terminal-transaction-failure",
+        crate::plan::PlanStatus::Completed,
+    );
+    let gate = Arc::new(RunOutcomeCommitTestGate::default());
+    gate.allow_commit();
+    gate.fail_before_commit();
+    let error = database
+        .save_session_with_run_outcome_test_gated(
+            &completed,
+            terminal_linearization_outcome(&completed, "completed", "finish"),
+            gate,
+        )
+        .await
+        .expect_err("a failed terminal transaction must not be reported as committed");
+    assert!(
+        error
+            .to_string()
+            .contains("simulated terminal transaction failure")
+    );
+    assert_eq!(database.status().mode, StorageMode::Protected);
+    let stored = database.load_session(&executing.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.pending_plan.unwrap().status,
+        crate::plan::PlanStatus::Executing
+    );
+    assert!(
+        database
+            .load_run_outcomes(&executing.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn round23_diagnostic_failure_rolls_back_with_its_plan_and_session() {
+    let (home, database) = open_temp_database("diagnostic-atomic-failure").await;
+    let executing = terminal_linearization_session(
+        "diagnostic-atomic-failure",
+        crate::plan::PlanStatus::Executing,
+    );
+    database.save_session(&executing).await.unwrap();
+    let mut failed = executing.clone();
+    failed.pending_plan.as_mut().unwrap().status = crate::plan::PlanStatus::Failed;
+    failed.name = "must roll back".to_string();
+    let mut outcome = terminal_linearization_outcome(&failed, "failed", "failed");
+    outcome.reason = Some("provider_authentication".to_string());
+    outcome.diagnostic =
+        crate::run_diagnostics::RunDiagnostic::from_reason(outcome.reason.as_deref());
+    let gate = Arc::new(RunOutcomeCommitTestGate::default());
+    gate.allow_commit();
+    gate.fail_before_commit();
+    assert!(
+        database
+            .save_session_with_run_outcome_test_gated(&failed, outcome, gate)
+            .await
+            .is_err()
+    );
+    let stored = database.load_session(&executing.id).await.unwrap().unwrap();
+    assert_eq!(stored.name, executing.name);
+    assert_eq!(
+        stored.pending_plan.unwrap().status,
+        crate::plan::PlanStatus::Executing
+    );
+    assert!(
+        database
+            .load_run_outcomes(&executing.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(database.status().mode, StorageMode::Protected);
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn round23_diagnostic_codes_remain_isolated_between_adjacent_runs_and_legacy_rows() {
+    let (home, database) = open_temp_database("diagnostic-adjacent").await;
+    let mut session = basic_session("diagnostic-adjacent", "Adjacent diagnostics");
+    for (index, code) in [
+        "provider_authentication",
+        "provider_rate_limited",
+        "provider_unavailable",
+        "model_configuration",
+        "legacy_provider_error",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        session
+            .messages
+            .push(chat_message("user", "Synthetic request", 30 + index as u64));
+        let mut outcome = terminal_linearization_outcome(&session, "failed", "failed");
+        outcome.run_id = format!("diagnostic-adjacent-{index}");
+        outcome.start_message_index = index + 1;
+        outcome.end_message_index = index + 1;
+        outcome.plan_id = None;
+        outcome.plan_revision = None;
+        outcome.reason = Some(code.to_string());
+        outcome.diagnostic = crate::run_diagnostics::RunDiagnostic::from_reason(Some(code));
+        database
+            .save_session_with_run_outcome(&session, outcome)
+            .await
+            .unwrap();
+    }
+    drop(database);
+    let reopened = Database::open(home.join("lingclaw.db")).await.unwrap();
+    let outcomes = reopened.load_run_outcomes(&session.id).await.unwrap();
+    assert_eq!(outcomes.len(), 5);
+    for (index, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(outcome.run_id, format!("diagnostic-adjacent-{index}"));
+        assert_eq!(outcome.start_message_index, index + 1);
+        assert_eq!(outcome.diagnostic.is_none(), index == 4);
+        if let Some(diagnostic) = outcome.diagnostic {
+            assert_eq!(Some(diagnostic.reason()), outcome.reason.as_deref());
+        }
+    }
+    drop(reopened);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn restart_before_terminal_transaction_never_leaves_a_completed_plan_without_outcome() {
+    let (home, database) = open_temp_database("terminal-precommit-restart").await;
+    let executing = terminal_linearization_session(
+        "terminal-precommit-restart",
+        crate::plan::PlanStatus::Executing,
+    );
+    database.save_session(&executing).await.unwrap();
+
+    // The prepared completed snapshot is intentionally never submitted. This
+    // models process loss while the terminal state machine is still PreCommit.
+    let _uncommitted = terminal_linearization_session(
+        "terminal-precommit-restart",
+        crate::plan::PlanStatus::Completed,
+    );
+    let path = database.path().to_path_buf();
+    drop(database);
+
+    let database = Database::open(path).await.unwrap();
+    assert!(
+        database
+            .load_run_outcomes(&executing.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(database.recover_interrupted_plans().await.unwrap(), (0, 1));
+    let recovered = database.load_session(&executing.id).await.unwrap().unwrap();
+    assert_eq!(
+        recovered.pending_plan.unwrap().status,
+        crate::plan::PlanStatus::Stopped
+    );
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn corrupt_top_level_run_outcome_enters_storage_protection_on_read() {
+    let (home, database) = open_temp_database("corrupt-run-outcome").await;
+    let mut session = basic_session("corrupt-run-outcome", "Corrupt run outcome");
+    session
+        .messages
+        .push(chat_message("user", "Run a task", 21));
+    database
+        .save_session_with_run_outcome(
+            &session,
+            crate::TopLevelRunOutcome {
+                diagnostic: None,
+                session_id: session.id.clone(),
+                run_id: "corrupt-run".to_string(),
+                run_connection_id: "7".to_string(),
+                status: "completed".to_string(),
+                phase: "finish".to_string(),
+                reason: Some("complete".to_string()),
+                duration_ms: 5,
+                start_message_index: 1,
+                end_message_index: 1,
+                plan_id: None,
+                plan_revision: None,
+                started_at: 100,
+                finished_at: 101,
+            },
+        )
+        .await
+        .unwrap();
+    let database_path = database.path().to_path_buf();
+    drop(database);
+
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection
+        .execute(
+            "UPDATE session_run_outcomes SET status='invented-success' WHERE run_id='corrupt-run'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let database = Database::open(database_path).await.unwrap();
+    let error = database
+        .load_run_outcomes(&session.id)
+        .await
+        .expect_err("invalid terminal facts must fail closed");
+    assert!(error.to_string().contains("Invalid top-level run status"));
+    assert_eq!(database.status().mode, StorageMode::Protected);
+
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn corrupt_top_level_run_boundaries_are_checked_against_the_stored_transcript() {
+    let cases = [
+        (
+            "negative-start",
+            "UPDATE session_run_outcomes SET start_message_index=-1 WHERE run_id='boundary-run'",
+        ),
+        (
+            "reversed",
+            "UPDATE session_run_outcomes SET start_message_index=1, end_message_index=0 WHERE run_id='boundary-run'",
+        ),
+        (
+            "end-at-count",
+            "UPDATE session_run_outcomes SET end_message_index=2 WHERE run_id='boundary-run'",
+        ),
+        (
+            "far-out-of-range",
+            "UPDATE session_run_outcomes SET end_message_index=9223372036854775807 WHERE run_id='boundary-run'",
+        ),
+        (
+            "empty-transcript",
+            "DELETE FROM session_messages WHERE session_id='boundary-session'",
+        ),
+    ];
+
+    for (case, corruption) in cases {
+        let (home, database) = open_temp_database(&format!("corrupt-run-boundary-{case}")).await;
+        let mut session = basic_session("boundary-session", "Boundary Session");
+        session
+            .messages
+            .push(chat_message("user", "Run a bounded task", 21));
+        database
+            .save_session_with_run_outcome(
+                &session,
+                crate::TopLevelRunOutcome {
+                    diagnostic: None,
+                    session_id: session.id.clone(),
+                    run_id: "boundary-run".to_string(),
+                    run_connection_id: "9".to_string(),
+                    status: "completed".to_string(),
+                    phase: "finish".to_string(),
+                    reason: Some("complete".to_string()),
+                    duration_ms: 5,
+                    start_message_index: 1,
+                    end_message_index: 1,
+                    plan_id: None,
+                    plan_revision: None,
+                    started_at: 100,
+                    finished_at: 101,
+                },
+            )
+            .await
+            .unwrap();
+        let database_path = database.path().to_path_buf();
+        drop(database);
+
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection.execute(corruption, []).unwrap();
+        drop(connection);
+
+        let database = Database::open(database_path).await.unwrap();
+        let error = database
+            .load_run_outcomes(&session.id)
+            .await
+            .expect_err("a terminal boundary outside the stored transcript must fail closed");
+        assert!(
+            error.to_string().contains("run message boundary")
+                || error.to_string().contains("run start message index"),
+            "unexpected {case} error: {error}"
+        );
+        assert_eq!(database.status().mode, StorageMode::Protected, "{case}");
+
+        drop(database);
+        remove_home(&home);
+    }
 }
 
 #[tokio::test]
@@ -4412,6 +5081,160 @@ async fn cancelled_failed_read_still_protects_before_a_queued_write_runs() {
         None
     );
 
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn round21_unrelated_message_changes_preserve_exact_run_intervals() {
+    let (home, database) = open_temp_database("round21-run-intervals").await;
+    let mut session = basic_session("intervals", "Intervals");
+    for round in 0..3 {
+        let start = session.messages.len();
+        session.messages.extend([
+            chat_message("user", &format!("goal {round}"), 100 + round * 2),
+            chat_message("assistant", &format!("result {round}"), 101 + round * 2),
+        ]);
+        let outcome = crate::TopLevelRunOutcome {
+            diagnostic: None,
+            session_id: session.id.clone(),
+            run_id: format!("interval-{round}"),
+            run_connection_id: "21".into(),
+            status: "completed".into(),
+            phase: "finish".into(),
+            reason: Some("complete".into()),
+            duration_ms: 10,
+            start_message_index: start,
+            end_message_index: start + 1,
+            plan_id: None,
+            plan_revision: None,
+            started_at: 100,
+            finished_at: 101,
+        };
+        session.messages[0].content = Some(format!(
+            "system time {round}; Goal {round}; Observation {round}"
+        ));
+        database
+            .save_session_with_run_outcome(&session, outcome)
+            .await
+            .unwrap();
+        assert_eq!(
+            database.load_run_outcomes(&session.id).await.unwrap().len(),
+            (round + 1) as usize
+        );
+    }
+    // Editing an earlier run must leave a later unchanged interval trustworthy.
+    session.messages[2].content = Some("rewritten first answer".into());
+    database.save_session(&session).await.unwrap();
+    let kept = database.load_run_outcomes(&session.id).await.unwrap();
+    assert_eq!(
+        kept.iter().map(|o| o.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["interval-1", "interval-2"]
+    );
+    session.messages.swap(3, 4);
+    database.save_session(&session).await.unwrap();
+    assert_eq!(
+        database.load_run_outcomes(&session.id).await.unwrap()[0].run_id,
+        "interval-2"
+    );
+    session.messages.remove(3);
+    database.save_session(&session).await.unwrap();
+    assert!(
+        database
+            .load_run_outcomes(&session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn round21_system_inside_a_run_is_not_exempt_from_boundary_validation() {
+    let (home, database) = open_temp_database("round21-system-in-run").await;
+    let mut session = basic_session("system-in-run", "System inside run");
+    session.messages.extend([
+        chat_message("user", "start", 10),
+        chat_message("system", "run-owned intervention", 11),
+        chat_message("assistant", "answer", 12),
+    ]);
+    let outcome = crate::TopLevelRunOutcome {
+        diagnostic: None,
+        session_id: session.id.clone(),
+        run_id: "system-run".into(),
+        run_connection_id: "21".into(),
+        status: "completed".into(),
+        phase: "finish".into(),
+        reason: Some("complete".into()),
+        duration_ms: 10,
+        start_message_index: 1,
+        end_message_index: 3,
+        plan_id: None,
+        plan_revision: None,
+        started_at: 10,
+        finished_at: 12,
+    };
+    database
+        .save_session_with_run_outcome(&session, outcome.clone())
+        .await
+        .unwrap();
+    session.messages.push(chat_message("user", "append", 13));
+    database.save_session(&session).await.unwrap();
+    assert_eq!(
+        database.load_run_outcomes(&session.id).await.unwrap(),
+        vec![outcome]
+    );
+    session.messages[2].content = Some("rewritten run intervention".into());
+    database.save_session(&session).await.unwrap();
+    assert!(
+        database
+            .load_run_outcomes(&session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(database);
+    remove_home(&home);
+}
+
+#[tokio::test]
+async fn round21_hard_cap_sqlite_failure_rolls_back_failed_plan_and_incomplete_fact() {
+    let (home, database) = open_temp_database("round21-cap-rollback").await;
+    let executing =
+        terminal_linearization_session("cap-rollback", crate::plan::PlanStatus::Executing);
+    database.save_session(&executing).await.unwrap();
+    let failed = terminal_linearization_session("cap-rollback", crate::plan::PlanStatus::Failed);
+    let gate = Arc::new(RunOutcomeCommitTestGate::default());
+    gate.allow_commit();
+    gate.fail_before_commit();
+    database
+        .save_session_with_run_outcome_test_gated(
+            &failed,
+            terminal_linearization_outcome(&failed, "incomplete", "hard_cap"),
+            gate,
+        )
+        .await
+        .expect_err("rollback the combined hard-cap transaction");
+    assert_eq!(database.status().mode, StorageMode::Protected);
+    assert_eq!(
+        database
+            .load_session(&executing.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_plan
+            .unwrap()
+            .status,
+        crate::plan::PlanStatus::Executing
+    );
+    assert!(
+        database
+            .load_run_outcomes(&executing.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     drop(database);
     remove_home(&home);
 }

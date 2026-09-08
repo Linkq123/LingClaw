@@ -145,6 +145,7 @@ async fn think_command_waits_for_session_persist_gate_before_mutating_session() 
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     });
 
@@ -369,6 +370,7 @@ async fn status_command_reports_runtime_request_estimate() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -521,6 +523,7 @@ async fn status_command_uses_runtime_auto_policy_for_idle_auto_sessions() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -670,6 +673,7 @@ async fn status_command_reports_compression_recorded_before_start_event() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -829,6 +833,7 @@ async fn status_command_reports_prune_only_state() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -983,6 +988,7 @@ async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -1143,6 +1149,7 @@ async fn status_command_reports_latest_compression_outcome() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -1304,6 +1311,7 @@ async fn status_command_prefers_live_round_effective_think() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -1466,6 +1474,7 @@ async fn status_command_prefers_live_round_effective_think_for_manual_sessions()
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -1630,6 +1639,7 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -1813,6 +1823,7 @@ async fn status_command_reports_latest_auto_trace_summary() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -2020,6 +2031,7 @@ async fn status_command_reports_live_runtime_provider_for_cross_provider_fast_mo
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -2181,6 +2193,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -2284,6 +2297,7 @@ async fn delete_command_rejects_active_session() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -2350,6 +2364,7 @@ async fn delete_command_rejects_running_session_without_active_connection() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -2426,6 +2441,7 @@ async fn delete_command_succeeds_with_a_warning_when_workspace_removal_fails() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -2509,6 +2525,8 @@ async fn delete_command_succeeds_with_a_warning_when_workspace_removal_fails() {
 #[tokio::test]
 async fn switch_command_rejects_corrupt_persisted_session_target() {
     let session_id = unique_session_id("switch-corrupt");
+    let current_session_id = unique_session_id("switch-corrupt-current");
+    let _current_cleanup = ManagedSessionCleanup::new(&current_session_id);
     let session_file = crate::session_store::sessions_dir().join(format!("{session_id}.json"));
     tokio::fs::write(&session_file, b"not valid json")
         .await
@@ -2530,13 +2548,23 @@ async fn switch_command_rejects_corrupt_persisted_session_target() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
+    let current_session = Session::new_with_id(&current_session_id, "Switch Source");
+    crate::session_store::save_session_to_disk(&current_session)
+        .await
+        .expect("current Session should save");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(current_session_id.clone(), current_session);
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(
         &format!("/switch {session_id}"),
-        MAIN_SESSION_ID,
+        &current_session_id,
         1,
         &state,
         &tx,
@@ -2545,12 +2573,33 @@ async fn switch_command_rejects_corrupt_persisted_session_target() {
     .await
     .expect("command should resolve");
 
-    assert_eq!(result.response_type, "error");
+    assert_eq!(result.response_type, "system");
     assert_eq!(
         result.response,
+        format!("Switching to session: {session_id}")
+    );
+    assert_eq!(
+        result.switch_to_session.as_deref(),
+        Some(session_id.as_str())
+    );
+
+    let current_session_ref = Arc::new(Mutex::new(current_session_id.clone()));
+    let mut active_session_id = current_session_id.clone();
+    let switch_error = crate::switch_socket_session(
+        &state,
+        &tx,
+        &current_session_ref,
+        &mut active_session_id,
+        &CancellationToken::new(),
+        1,
+        session_id.clone(),
+    )
+    .await
+    .expect_err("socket switch should reject the corrupt target under its control lock");
+    assert_eq!(
+        switch_error,
         format!("Session '{session_id}' is corrupt and could not be loaded.")
     );
-    assert_eq!(result.switch_to_session, None);
     assert!(state.sessions.lock().await.get(&session_id).is_none());
 
     let persisted_contents = tokio::fs::read_to_string(&session_file)
@@ -2585,6 +2634,7 @@ async fn delete_command_allows_targeting_corrupt_persisted_session() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -2613,7 +2663,9 @@ async fn delete_command_allows_targeting_corrupt_persisted_session() {
 }
 
 #[tokio::test]
-async fn switch_command_creates_or_switches_session() {
+async fn switch_command_defers_session_creation_to_socket_binding() {
+    let session_id = unique_session_id("switch-deferred");
+    let cleanup = ManagedSessionCleanup::new(&session_id);
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
             explicit_primary_model_configured: true,
@@ -2663,12 +2715,13 @@ async fn switch_command_creates_or_switches_session() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(
-        "/switch another-session",
+        &format!("/switch {session_id}"),
         MAIN_SESSION_ID,
         1,
         &state,
@@ -2678,8 +2731,18 @@ async fn switch_command_creates_or_switches_session() {
     .await
     .expect("command should resolve");
 
-    assert_eq!(result.response, "Switching to session: another-session");
-    assert_eq!(result.switch_to_session.as_deref(), Some("another-session"));
+    assert_eq!(
+        result.response,
+        format!("Switching to session: {session_id}")
+    );
+    assert_eq!(
+        result.switch_to_session.as_deref(),
+        Some(session_id.as_str())
+    );
+    assert!(!result.session_list_changed);
+    assert!(!state.sessions.lock().await.contains_key(&session_id));
+    assert!(crate::session_store::load_session_from_disk(&session_id).is_none());
+    assert!(!cleanup.session_root.exists());
 }
 
 #[tokio::test]
@@ -2740,6 +2803,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -2867,6 +2931,7 @@ async fn memory_command_rejects_unknown_subcommand() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -3014,6 +3079,7 @@ async fn reflection_command_disabled_shows_hint() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -3062,7 +3128,7 @@ async fn reflection_command_disabled_shows_hint() {
         .lock()
         .await
         .insert(MAIN_SESSION_ID.to_string(), session);
-    state.apply_runtime_config(config.as_ref().clone());
+    state.apply_runtime_config(config.as_ref().clone()).await;
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(
@@ -3161,6 +3227,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -3209,7 +3276,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         .lock()
         .await
         .insert(MAIN_SESSION_ID.to_string(), session);
-    state.apply_runtime_config(base_config.clone());
+    state.apply_runtime_config(base_config.clone()).await;
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let disabled = handle_command(
@@ -3240,7 +3307,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
     .expect("config-only reflection command should resolve");
     assert!(config_only.response.contains("disabled"));
 
-    state.apply_runtime_config(enabled_config);
+    state.apply_runtime_config(enabled_config).await;
 
     let enabled = handle_command(
         "/reflection",
@@ -3255,7 +3322,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
     assert!(enabled.response.contains("enabled"));
     assert!(enabled.response.contains("Last reflection:"));
 
-    state.apply_runtime_config(config.as_ref().clone());
+    state.apply_runtime_config(config.as_ref().clone()).await;
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
 
@@ -3347,6 +3414,7 @@ async fn reflection_command_disabled_allows_read_today() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -3492,6 +3560,7 @@ async fn reflection_command_enabled_shows_status() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -3540,7 +3609,7 @@ async fn reflection_command_enabled_shows_status() {
         .lock()
         .await
         .insert(MAIN_SESSION_ID.to_string(), session);
-    state.apply_runtime_config(config.as_ref().clone());
+    state.apply_runtime_config(config.as_ref().clone()).await;
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(
@@ -3649,6 +3718,7 @@ async fn reflection_command_today_shows_content() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -3812,6 +3882,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -3978,6 +4049,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -4147,6 +4219,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 
@@ -4293,6 +4366,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        auxiliary_tasks: crate::auxiliary_tasks::AuxiliaryTaskRegistry::new(true, true),
         memory_queue: std::sync::Mutex::new(None),
     };
 

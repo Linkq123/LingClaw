@@ -493,7 +493,7 @@ pub(crate) async fn execute_orchestration(
     replay_ctx: Option<crate::LiveOutputReplayCtx>,
 ) -> OrchestrationOutcome {
     execute_orchestration_with_working_directory(
-        plan, config, http, workspace, workspace, live_tx, cancel, hooks, replay_ctx,
+        plan, config, http, workspace, workspace, live_tx, cancel, hooks, replay_ctx, None,
     )
     .await
 }
@@ -512,6 +512,7 @@ pub(crate) async fn execute_orchestration_with_working_directory(
     cancel: CancellationToken,
     hooks: &HookRegistry,
     replay_ctx: Option<crate::LiveOutputReplayCtx>,
+    parent_tool_call_id: Option<&str>,
 ) -> OrchestrationOutcome {
     let orchestration_start = std::time::Instant::now();
     let orchestrate_id = generate_orchestrate_id();
@@ -539,6 +540,7 @@ pub(crate) async fn execute_orchestration_with_working_directory(
         json!({
             "type": "orchestrate_started",
             "orchestrate_id": orchestrate_id,
+            "parent_tool_call_id": parent_tool_call_id,
             "task_count": plan.tasks.len(),
             "layer_count": layers.len(),
             "tasks": task_summary,

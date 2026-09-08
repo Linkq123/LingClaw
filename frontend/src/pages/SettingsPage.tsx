@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef, useId } from 'react';
 import type {
   AppConfig,
   ConfigApiResponse,
@@ -311,17 +311,44 @@ function subAgentNameFromOverrideKey(key: string): string | null {
 }
 
 function SettingsRow({ label, children }: { label: string; children: React.ReactNode }) {
+  const generatedId = useId();
+  const labelId = `${generatedId}-label`;
+  const onlyChild = React.Children.only(children);
+  if (!React.isValidElement(onlyChild)) return null;
+  const childProps = onlyChild.props as {
+    id?: string;
+    'aria-labelledby'?: string;
+  };
+  const controlId = childProps.id || `${generatedId}-control`;
+  const control = React.cloneElement(onlyChild as React.ReactElement<Record<string, unknown>>, {
+    id: controlId,
+    'aria-labelledby': childProps['aria-labelledby'] || labelId,
+  });
   return (
     <div className="settings-row">
-      <label>{label}</label>
-      {children}
+      <label id={labelId} htmlFor={controlId}>
+        {label}
+      </label>
+      {control}
     </div>
   );
 }
 
-function TriSelect({ value, onChange }: { value: TriBool; onChange: (v: TriBool) => void }) {
+function TriSelect({
+  value,
+  onChange,
+  id,
+  'aria-labelledby': ariaLabelledBy,
+}: {
+  value: TriBool;
+  onChange: (v: TriBool) => void;
+  id?: string;
+  'aria-labelledby'?: string;
+}) {
   return (
     <select
+      id={id}
+      aria-labelledby={ariaLabelledBy}
       value={triStateToString(value)}
       onChange={(e) => onChange(stringToTriBool(e.target.value))}
     >
@@ -336,16 +363,25 @@ const ModelSelect = React.memo(function ModelSelect({
   value,
   options,
   onChange,
+  id,
+  'aria-labelledby': ariaLabelledBy,
 }: {
   value: string | undefined;
   options: string[];
   onChange: (v: string) => void;
+  id?: string;
+  'aria-labelledby'?: string;
 }) {
   useLanguageVersion();
   const v = value || '';
   const includesValue = v && options.includes(v);
   return (
-    <select value={v} onChange={(e) => onChange(e.target.value)}>
+    <select
+      id={id}
+      aria-labelledby={ariaLabelledBy}
+      value={v}
+      onChange={(e) => onChange(e.target.value)}
+    >
       <option value="">-- {tr('common.none')} --</option>
       {options.map((opt) => (
         <option key={opt} value={opt}>
@@ -2416,21 +2452,8 @@ function SettingsShell({
               </span>
               <span className="console-brand-copy">
                 <strong>LingClaw</strong>
-                <span>{tr('console.title')}</span>
               </span>
             </div>
-            <button
-              className="console-return-button"
-              type="button"
-              title={tr('console.backToWorkspace')}
-              aria-label={tr('console.backToWorkspace')}
-              onClick={onRequestClose}
-            >
-              <svg className="icon" aria-hidden="true">
-                <use href="#icon-chevron-left" />
-              </svg>
-              <span>{tr('console.backToWorkspace')}</span>
-            </button>
           </div>
           <label className="settings-mobile-section-picker">
             <span>{tr('settings.sectionPicker')}</span>
@@ -2492,9 +2515,9 @@ function SettingsShell({
         </aside>
 
         <section className="settings-main">
-          <div className="settings-topbar">
+          <div className={`settings-topbar${configConflict ? ' has-config-conflict' : ''}`}>
             <button
-              className="console-mobile-back"
+              className="console-return-button"
               type="button"
               title={tr('console.backToWorkspace')}
               aria-label={tr('console.backToWorkspace')}
@@ -2503,11 +2526,12 @@ function SettingsShell({
               <svg className="icon" aria-hidden="true">
                 <use href="#icon-chevron-left" />
               </svg>
+              <span>{tr('console.backToWorkspace')}</span>
             </button>
             <div className="settings-title-block">
-              <h2 id="settings-dialog-title" ref={titleRef} tabIndex={-1}>
+              <h1 id="settings-dialog-title" ref={titleRef} tabIndex={-1}>
                 {showConfigError ? tr('settings.configError') : activeMeta.label}
-              </h2>
+              </h1>
               <p>{showConfigError ? tr('settings.configErrorSubtitle') : activeMeta.description}</p>
             </div>
             <div className="settings-topbar-actions">
@@ -2583,27 +2607,6 @@ function SettingsShell({
                     ? tr('settings.skillsIndependent')
                     : tr('settings.noUnsaved')}
               </div>
-              {canSaveConfig && (
-                <div className="settings-footer-actions">
-                  {configConflict && (
-                    <button
-                      className="btn-secondary settings-mobile-reload"
-                      type="button"
-                      onClick={onReloadConfig}
-                      disabled={status.type === 'loading'}
-                    >
-                      {tr('settings.reloadLatest')}
-                    </button>
-                  )}
-                  <button
-                    className="btn-primary settings-mobile-save"
-                    onClick={onSaveConfig}
-                    disabled={!configDirty || configConflict || status.type === 'loading'}
-                  >
-                    {tr('settings.save')}
-                  </button>
-                </div>
-              )}
             </div>
           )}
         </section>

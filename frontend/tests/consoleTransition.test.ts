@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 import {
   CONSOLE_TRANSITION_CLASSES,
@@ -18,14 +19,17 @@ import { isConsoleSurfaceActive } from '../src/workspacePortal.js';
 interface Deferred<T> {
   promise: Promise<T>;
   resolve(value: T): void;
+  reject(reason?: unknown): void;
 }
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function setReducedMotion(matches: boolean): void {
@@ -193,6 +197,55 @@ describe('console transition controller', () => {
     ).toBe(false);
   });
 
+  it('round23 removes a hidden flex workspace from layout during Console capture', async () => {
+    setReducedMotion(true);
+    const { workspace, consolePage } = elements();
+    workspace.className = 'main';
+    const style = document.createElement('style');
+    style.textContent = '.main { display: flex; }\n' + readFileSync('src/css/console.css', 'utf8');
+    document.head.appendChild(style);
+    try {
+      const controller = createConsoleTransitionController({ workspace, consolePage });
+      await controller.showConsole();
+      expect(workspace.hidden).toBe(true);
+      expect(getComputedStyle(workspace).display).toBe('none');
+      await controller.showWorkspace();
+      expect(getComputedStyle(workspace).display).toBe('flex');
+    } finally {
+      style.remove();
+    }
+  });
+
+  it('round23 handles native ready rejection with a real directional fallback', async () => {
+    vi.useFakeTimers();
+    const { workspace, consolePage, title } = elements();
+    const ready = Promise.reject(new Error('Native capture failed'));
+    // Observe this test promise too, so the red run reports the missing fallback
+    // assertion without an unrelated test-runner unhandled-rejection failure.
+    void ready.catch(() => undefined);
+    Object.defineProperty(document, 'startViewTransition', {
+      configurable: true,
+      value: (update: () => void) => {
+        update();
+        return { ready, updateCallbackDone: Promise.resolve(), finished: Promise.resolve() };
+      },
+    });
+    const controller = createConsoleTransitionController(
+      { workspace, consolePage },
+      { fallbackDurationMs: 220 },
+    );
+    const transition = controller.showConsole({ focusTarget: title });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.documentElement.classList.contains(CONSOLE_TRANSITION_CLASSES.fallback)).toBe(
+      true,
+    );
+    expect(document.activeElement).toBe(title);
+    await vi.advanceTimersByTimeAsync(220);
+    await expect(transition).resolves.toBe(true);
+    expect(workspace.inert).toBe(true);
+    expect(consolePage.hidden).toBe(false);
+  });
+
   it('uses directional CSS fallback classes when native transitions are unavailable', async () => {
     vi.useFakeTimers();
     const { workspace, consolePage } = elements();
@@ -352,6 +405,48 @@ describe('console transition controller', () => {
     expect(controller.surface).toBe('workspace');
     expect(controller.desiredSurface).toBe('workspace');
     expect(workspace.hidden).toBe(false);
+    expect(consolePage.hidden).toBe(true);
+    expect(document.activeElement).toBe(opener);
+    expect(document.documentElement.className).toBe('');
+  });
+
+  it('round23 keeps the newer native transition when an older ready promise rejects', async () => {
+    const { workspace, consolePage, opener, title } = elements();
+    const transitions = Array.from({ length: 2 }, () => ({
+      ready: deferred<void>(),
+      finished: deferred<void>(),
+    }));
+    let next = 0;
+    Object.defineProperty(document, 'startViewTransition', {
+      configurable: true,
+      value: (update: () => void) => {
+        const transition = transitions[next++];
+        update();
+        return {
+          ready: transition.ready.promise,
+          updateCallbackDone: Promise.resolve(),
+          finished: transition.finished.promise,
+        };
+      },
+    });
+    const controller = createConsoleTransitionController({ workspace, consolePage });
+    opener.focus();
+    const old = controller.showConsole({ focusTarget: title });
+    const latest = controller.showWorkspace();
+    transitions[0].ready.reject(new Error('Previous capture superseded'));
+    transitions[0].finished.resolve();
+    await expect(old).resolves.toBe(false);
+    expect(document.documentElement.classList.contains(CONSOLE_TRANSITION_CLASSES.leaving)).toBe(
+      true,
+    );
+    expect(document.documentElement.classList.contains(CONSOLE_TRANSITION_CLASSES.fallback)).toBe(
+      false,
+    );
+    transitions[1].ready.resolve();
+    transitions[1].finished.resolve();
+    await expect(latest).resolves.toBe(true);
+    expect(controller.surface).toBe('workspace');
+    expect(workspace.inert).toBe(false);
     expect(consolePage.hidden).toBe(true);
     expect(document.activeElement).toBe(opener);
     expect(document.documentElement.className).toBe('');

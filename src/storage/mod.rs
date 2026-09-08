@@ -26,7 +26,11 @@ use tokio_rusqlite::Connection;
 
 pub(crate) use admin::handle_db_cli;
 pub(crate) use legacy::{migrate_legacy_json_if_needed, preflight_legacy_storage_path_conflicts};
-pub(crate) use session::{SessionDeleteOutcome, SessionModelPreferences, SessionUsageSnapshot};
+#[cfg(test)]
+pub(crate) use session::RunOutcomeCommitTestGate;
+pub(crate) use session::{
+    AuxiliaryUsageApplyOutcome, SessionDeleteOutcome, SessionModelPreferences, SessionUsageSnapshot,
+};
 
 pub(crate) const GROUP_MISSING_SESSIONS_ERROR_PREFIX: &str = "Group references missing sessions: ";
 
@@ -374,6 +378,7 @@ fn validate_current_schema(connection: &rusqlite::Connection) -> Result<(), Stor
         (4, "plan_initial_submission_marker".to_string()),
         (5, "plan_stale_override_audit".to_string()),
         (6, "session_working_directories".to_string()),
+        (7, "top_level_run_outcomes".to_string()),
     ];
     if migrations != expected_migrations {
         return Err(StorageError::new(format!(
@@ -496,6 +501,14 @@ impl Database {
         Ok(database)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn close_for_test(self) -> Result<(), StorageError> {
+        self.connection
+            .close()
+            .await
+            .map_err(|error| StorageError::new(error.to_string()))
+    }
+
     pub(crate) fn default_path() -> Result<PathBuf, StorageError> {
         crate::config_dir_path()
             .map(|path| path.join("lingclaw.db"))
@@ -587,6 +600,10 @@ impl Database {
                     )?;
                     transaction.execute(
                         "INSERT INTO schema_migrations(version, name, applied_at) VALUES (6, 'session_working_directories', ?1)",
+                        [applied_at],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (7, 'top_level_run_outcomes', ?1)",
                         [applied_at],
                     )?;
                     transaction.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;
@@ -797,7 +814,7 @@ fn migrate_schema(
     connection: &mut rusqlite::Connection,
     from_version: i64,
 ) -> Result<(), StorageError> {
-    if !matches!(from_version, 1..=5) {
+    if !matches!(from_version, 1..=6) {
         return Err(StorageError::new(format!(
             "No SQLite schema migration is registered from version {from_version} to {}",
             schema::SCHEMA_VERSION
@@ -903,28 +920,35 @@ fn migrate_schema(
             [crate::now_epoch() as i64],
         )?;
     }
-    transaction.execute_batch(schema::SESSION_WORKSPACE_SCHEMA)?;
-    let session_ids = {
-        let mut statement = transaction.prepare("SELECT id FROM sessions ORDER BY id")?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for session_id in session_ids {
-        let path = crate::session_workspace_path(&session_id);
-        let path_text = path.to_str().ok_or_else(|| {
-            StorageError::new(format!(
-                "Managed workspace for Session '{session_id}' is not valid UTF-8"
-            ))
-        })?;
-        let key = crate::working_directory_key(&path).map_err(StorageError::new)?;
+    if from_version <= 5 {
+        transaction.execute_batch(schema::SESSION_WORKSPACE_SCHEMA)?;
+        let session_ids = {
+            let mut statement = transaction.prepare("SELECT id FROM sessions ORDER BY id")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for session_id in session_ids {
+            let path = crate::session_workspace_path(&session_id);
+            let path_text = path.to_str().ok_or_else(|| {
+                StorageError::new(format!(
+                    "Managed workspace for Session '{session_id}' is not valid UTF-8"
+                ))
+            })?;
+            let key = crate::working_directory_key(&path).map_err(StorageError::new)?;
+            transaction.execute(
+                "UPDATE sessions SET workspace_kind='managed', working_directory=?1, working_directory_key=?2 WHERE id=?3",
+                rusqlite::params![path_text, key, session_id],
+            )?;
+        }
         transaction.execute(
-            "UPDATE sessions SET workspace_kind='managed', working_directory=?1, working_directory_key=?2 WHERE id=?3",
-            rusqlite::params![path_text, key, session_id],
+            "INSERT INTO schema_migrations(version, name, applied_at) VALUES (6, 'session_working_directories', ?1)",
+            [crate::now_epoch() as i64],
         )?;
     }
+    transaction.execute_batch(schema::SESSION_RUN_OUTCOMES_SCHEMA)?;
     transaction.execute(
-        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (6, 'session_working_directories', ?1)",
+        "INSERT INTO schema_migrations(version, name, applied_at) VALUES (7, 'top_level_run_outcomes', ?1)",
         [crate::now_epoch() as i64],
     )?;
     transaction.pragma_update(None, "user_version", schema::SCHEMA_VERSION)?;

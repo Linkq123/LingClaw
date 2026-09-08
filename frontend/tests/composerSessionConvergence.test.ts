@@ -127,6 +127,7 @@ describe('active Session model convergence', () => {
               upload_token: 'upload-token',
               s3_config_id: '',
               features: { groups: false },
+              protocols: { execution_identity: 1 },
             }),
           );
         }
@@ -200,6 +201,7 @@ describe('active Session model convergence', () => {
     const initialSocket = FakeWebSocket.instances[0];
     initialSocket.onopen?.();
     initialSocket.receive(sessionPayload('main', 1));
+    initialSocket.receive({ type: 'history', messages: [] });
 
     await vi.waitFor(() => {
       expect(stateModule.state.composerConfigRevision).toBe(2);
@@ -223,6 +225,7 @@ describe('active Session model convergence', () => {
     const targetSocket = FakeWebSocket.instances[1];
     targetSocket.onopen?.();
     targetSocket.receive(sessionPayload('target-session', 2));
+    targetSocket.receive({ type: 'history', messages: [] });
 
     await vi.waitFor(() => {
       expect(stateModule.state.activeSessionId).toBe('target-session');
@@ -245,6 +248,7 @@ describe('active Session model convergence', () => {
     const returnSocket = FakeWebSocket.instances[2];
     returnSocket.onopen?.();
     returnSocket.receive(sessionPayload('main', 2));
+    returnSocket.receive({ type: 'history', messages: [] });
 
     await vi.waitFor(() => {
       expect(stateModule.state.activeSessionId).toBe('main');
@@ -260,6 +264,7 @@ describe('active Session model convergence', () => {
     const createdSocket = FakeWebSocket.instances[3];
     createdSocket.onopen?.();
     createdSocket.receive(sessionPayload('created-session', 3));
+    createdSocket.receive({ type: 'history', messages: [] });
 
     await vi.waitFor(() => {
       expect(stateModule.state.activeSessionId).toBe('created-session');

@@ -1,8 +1,8 @@
 .usage-console-view {
-  --usage-accent: #6554d9;
-  --usage-accent-hover: #5848c7;
-  --usage-input: #6554d9;
-  --usage-output: #42a5c7;
+  --usage-accent: var(--color-info);
+  --usage-accent-hover: color-mix(in srgb, var(--color-info) 82%, var(--text));
+  --usage-input: var(--color-info);
+  --usage-output: color-mix(in srgb, var(--color-info) 64%, var(--color-success));
   width: 100%;
   min-width: 0;
   min-height: 100%;
@@ -636,10 +636,16 @@
   margin-top: 4px;
   padding: 0 14px;
   border-radius: 8px;
-  color: #fff;
-  background: var(--usage-accent);
+  color: var(--color-on-info);
+  background: var(--color-info-fill);
   font-size: 12px;
   font-weight: 700;
+}
+
+.usage-console-state button:disabled {
+  color: var(--color-on-disabled);
+  background: var(--color-disabled-fill);
+  opacity: 1;
 }
 
 .usage-console-skeleton {

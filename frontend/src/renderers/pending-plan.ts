@@ -8,6 +8,7 @@ import type {
 import { invalidateChatScrollCache, scrollDown } from '../scroll.js';
 import { setBusy } from './chat.js';
 import { isComposerModelReady, syncComposerAvailability } from '../composerAvailability.js';
+import { getComposerTransportSocket, sendComposerTransportMessage } from '../composerTransport.js';
 import { createIcon } from '../icons.js';
 import { tr } from '../i18n.js';
 import { setPlanMode, syncPlanModeToggle } from '../images.js';
@@ -242,6 +243,36 @@ function appendTextSection(
   });
   section.appendChild(list);
   card.appendChild(section);
+}
+
+function buildPlanContractDetails(plan: PlanStatePayload): HTMLDetailsElement | null {
+  const itemCount =
+    (plan.artifact.assumptions?.length || 0) +
+    (plan.artifact.risks?.length || 0) +
+    (plan.artifact.acceptance_criteria?.length || 0) +
+    (plan.artifact.verification?.length || 0) +
+    (plan.artifact.completion_checks?.length || 0);
+  if (!itemCount) return null;
+
+  const details = document.createElement('details');
+  details.className = 'plan-contract-details';
+  details.open = plan.status === 'failed' || plan.status === 'stopped';
+  const summary = document.createElement('summary');
+  summary.textContent = tr('plan.contractDetails', { count: itemCount });
+  details.appendChild(summary);
+  const content = document.createElement('div');
+  content.className = 'plan-contract-content';
+  appendTextSection(content, tr('plan.assumptions'), plan.artifact.assumptions);
+  appendTextSection(content, tr('plan.risks'), plan.artifact.risks, 'is-risk');
+  appendTextSection(content, tr('plan.acceptance'), plan.artifact.acceptance_criteria);
+  appendTextSection(content, tr('plan.verification'), plan.artifact.verification);
+  appendTextSection(
+    content,
+    tr('plan.completionChecks'),
+    plan.artifact.completion_checks?.map(completionCheckText),
+  );
+  details.appendChild(content);
+  return details;
 }
 
 function completionCheckText(check: PlanCompletionCheck): string {
@@ -510,7 +541,7 @@ function buildPlanCard(plan: PlanStatePayload, historical = false): HTMLElement 
   const headingGroup = document.createElement('div');
   const eyebrow = document.createElement('span');
   eyebrow.className = 'plan-card-eyebrow';
-  eyebrow.textContent = `${tr('plan.title')} · v${plan.revision}`;
+  eyebrow.textContent = `${tr('plan.formalPlan')} · v${plan.revision}`;
   const title = document.createElement('h3');
   title.textContent = displayTitle;
   headingGroup.append(eyebrow, title);
@@ -542,16 +573,12 @@ function buildPlanCard(plan: PlanStatePayload, historical = false): HTMLElement 
     card.appendChild(warning);
   }
   if (plan.artifact.steps?.length) card.appendChild(buildPlanSteps(plan));
-  appendTextSection(card, tr('plan.assumptions'), plan.artifact.assumptions);
-  appendTextSection(card, tr('plan.risks'), plan.artifact.risks, 'is-risk');
-  appendTextSection(card, tr('plan.acceptance'), plan.artifact.acceptance_criteria);
-  appendTextSection(card, tr('plan.verification'), plan.artifact.verification);
-  appendTextSection(
-    card,
-    tr('plan.completionChecks'),
-    plan.artifact.completion_checks?.map(completionCheckText),
-  );
-  const questions = buildQuestions(plan, historical);
+  const contractDetails = buildPlanContractDetails(plan);
+  if (contractDetails) card.appendChild(contractDetails);
+  const questions =
+    historical || !['completed', 'discarded'].includes(plan.status)
+      ? buildQuestions(plan, historical)
+      : null;
   if (questions) card.appendChild(questions);
   if (!historical) {
     const stale = buildStaleNotice();
@@ -634,6 +661,21 @@ function renderPlanCollection(
   focusedAction?: string,
   followScroll = true,
 ): void {
+  const disclosures = new Map<string, { history?: boolean; contract?: boolean }>();
+  dom.chat.querySelectorAll<HTMLElement>('.plan-artifact-card').forEach((card) => {
+    disclosures.set(`${card.dataset.planId}:${card.dataset.planRevision}`, {
+      history: card.closest<HTMLDetailsElement>('.plan-revision-history')?.open,
+      contract: card.querySelector<HTMLDetailsElement>('.plan-contract-details')?.open,
+    });
+  });
+  const restoreDisclosures = (card: HTMLElement | null) => {
+    if (!card) return;
+    const previous = disclosures.get(`${card.dataset.planId}:${card.dataset.planRevision}`);
+    const history = card.closest<HTMLDetailsElement>('.plan-revision-history');
+    const contract = card.querySelector<HTMLDetailsElement>('.plan-contract-details');
+    if (history && previous?.history != null) history.open = previous.history;
+    if (contract && previous?.contract != null) contract.open = previous.contract;
+  };
   restoreHiddenPlanMessages();
   document
     .querySelectorAll('.plan-execute-action, .plan-artifact-row')
@@ -646,6 +688,8 @@ function renderPlanCollection(
     .map((revision) => mountPlanCard(revision, true))
     .filter((card): card is HTMLElement => Boolean(card));
   const card = mountPlanCard(plan, false);
+  historicalCards.forEach(restoreDisclosures);
+  restoreDisclosures(card);
   const currentRow = card?.closest('.msg-row');
   if (currentRow?.parentElement === dom.chat) {
     historicalCards.forEach((historicalCard) => {
@@ -669,8 +713,25 @@ export function refreshPlanMounts(): void {
   }
 }
 
-export function renderPlanState(plan: PlanStatePayload, acknowledgeAction = true): void {
-  if (!plan?.plan_id || !dom.chat) return;
+export function renderPlanState(plan: PlanStatePayload, acknowledgeAction = true): boolean {
+  if (!plan?.plan_id || !dom.chat) return false;
+  const current =
+    activePlanSessionId === (state.activeSessionId || 'main') ? state.activePlan : null;
+  if (
+    current?.plan_id === plan.plan_id &&
+    (plan.revision < current.revision ||
+      (plan.revision === current.revision &&
+        (plan.updated_at < current.updated_at ||
+          (plan.execution_attempt || 0) < (current.execution_attempt || 0) ||
+          (['completed', 'discarded'].includes(current.status) && plan.status !== current.status))))
+  )
+    return false;
+  if (
+    current &&
+    current.plan_id !== plan.plan_id &&
+    state.planHistory.some((old) => old.plan_id === plan.plan_id)
+  )
+    return false;
   if (acknowledgeAction) setPlanActionInFlight(false);
   captureCurrentPlanDraft();
   const focusedAction =
@@ -712,6 +773,7 @@ export function renderPlanState(plan: PlanStatePayload, acknowledgeAction = true
     : false;
   setSessionPlanModeForStatus(plan.status);
   renderPlanCollection(state.activePlan, focusedAction);
+  return true;
 }
 
 export function renderPlanHistory(plans: PlanStatePayload[]): void {
@@ -777,11 +839,13 @@ function sendPlanRequest(payload: Record<string, unknown>): boolean {
     state.storageMode === 'protected' ||
     planIdentityTransitionInFlight() ||
     !activePlanTargetsCurrentSession() ||
-    !state.ws ||
-    state.ws.readyState !== WebSocket.OPEN
+    !getComposerTransportSocket()
   )
     return false;
-  state.ws.send(JSON.stringify(payload));
+  if (!sendComposerTransportMessage(JSON.stringify(payload))) {
+    syncComposerAvailability();
+    return false;
+  }
   setPlanActionInFlight(true);
   return true;
 }
@@ -804,14 +868,7 @@ function sendPlanAction(
 
 export function executePendingPlan(button: HTMLButtonElement | null | undefined): void {
   const planId = button?.dataset?.planId || state.pendingPlanId;
-  if (
-    !planId ||
-    !canExecutePendingPlan() ||
-    state.busy ||
-    !state.ws ||
-    state.ws.readyState !== WebSocket.OPEN
-  )
-    return;
+  if (!planId || !canExecutePendingPlan() || state.busy || !getComposerTransportSocket()) return;
   const sent = state.activePlan
     ? sendPlanAction('execute')
     : sendPlanRequest({ execute_plan_id: planId });
@@ -836,6 +893,7 @@ export function executeStalePlan(): void {
       stale_confirmation_token: state.planStaleConfirmationToken,
     })
   ) {
+    state.pendingPlanExecutionId = state.activePlan?.plan_id || '';
     state.planStalePaths = [];
     state.planStaleConfirmationToken = '';
     setPlanMode(false);
@@ -864,6 +922,7 @@ export function refreshPlan(): void {
 export function resumePlan(): void {
   if (!canExecutePendingPlan() || state.busy) return;
   if (sendPlanAction('resume')) {
+    state.pendingPlanExecutionId = state.activePlan?.plan_id || '';
     setPlanMode(false);
     setBusy(true);
   }

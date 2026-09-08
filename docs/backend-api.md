@@ -510,6 +510,9 @@ Group 功能由 `settings.enableGroups` 显式启用，缺省为 `false`。关�
   "s3_config_id": "...",
   "features": {
     "groups": false
+  },
+  "protocols": {
+    "execution_identity": 1
   }
 }
 ```
@@ -520,6 +523,11 @@ Group 功能由 `settings.enableGroups` 显式启用，缺省为 `false`。关�
 - `upload_token` 由前端拿到后用于 `POST /api/upload-images`
 - `s3_config_id` 是不包含明文凭据的当前 S3 配置身份；未配置 S3 时为 `null`
 - `features.groups` 是当前热更新的 Group 开关；字段缺失的旧服务端应按 `false` 处理
+- WebUI 的发送门禁同时要求当前连接意图已成功协商协议、准确的 socket generation 处于 OPEN、当前 Session/Group 身份与历史已准备完成，以及原有模型、Group 目标、存储、上传和身份锁条件通过。Send、Enter、Plan、Stop 与 socket slash 命令共享这一事实；模型无关命令不能绕过传输门禁。协商中、会话准备中、离线或协议 fail-close 时，按钮保持中性禁用，并提供简短本地化状态与完整无障碍说明。连接失败可在同页显式重新连接；同一 Session 的首次重连历史重放保留仍有效的待发送附件，实际目标切换和普通清空历史继续清理附件。重连不排队、不自动重发、不伪造用户消息；恢复后仅用户再次明确提交才发送一个 frame。旧连接 open/close/error/message 与迟到协商或模型 HTTP 结果不得解锁或关闭新连接。
+- `protocols.execution_identity = 1` 表示顶层 `start`、终态 `error` 和 `done` 提供服务器运行身份。WebUI/TUI 必须在**每一个** socket generation 建立前重新读取该字段，并把响应绑定到当次连接意图及 Session/Group 目标；迟到的旧协商不得覆盖新目标或创建 WebSocket。WebUI 的读取使用覆盖响应头和完整 JSON body 的统一硬截止，并由每个连接意图独立持有 AbortController；新意图、取消、目标切换或协议 fail-close 会主动 abort 旧请求。Bootstrap 不再发起独立的首次特性请求，而是由首个连接意图用同一次 `/api/client-config` 响应完成特性应用、目标复核/重定向与 WebSocket 创建；任一步骤前 token 或目标失效都必须放弃。Group close 恢复探测使用独立的有界 owner，不会取消合法连接意图。值为 `1` 时使用严格双身份门禁；字段缺失明确表示 legacy daemon，只能在首个、未重连的 socket generation 内把无身份终态绑定到同连接的无身份 `start`
+- legacy socket 一旦断开、Session/Group 切换需要第二连接，客户端必须清除 busy/run 状态并 fail-closed，显示刷新客户端或以当前版本重启 daemon 的提示；TUI 还会立即恢复尚未由 History 确认的文本、附件和 Plan mode 草稿。未知的非空协议版本、HTTP/JSON 失败或与当前连接意图不匹配的协商响应同样在网络连接前拒绝，且不得造成重试风暴、假在线或永久 busy。daemon 从 legacy 升级为当前严格协议后，后续显式连接可由新协商安全恢复
+- 严格协议连接若收到缺少 `run_connection_id` 的顶层 `start`，属于连接级协议错误：客户端必须关闭产生该事件的准确 socket generation，撤销发送前的乐观 busy/stream/ReAct/timer/Plan action 状态并显示恢复提示。若该事件发生在已经渲染过程步骤的精确活动 run，WebUI 会先把同一身份栈收口为可恢复的 `incomplete`、保留用户手动展开状态，再清除 active 指针；不得留下 running DOM/ARIA 状态，也不得改写新 generation、Group busy、历史或无关终态栈。TUI 只能在身份验证成功后确认 pending outbound；缺身份终态不得认领新 run，非终态 `error` 则继续只作为错误提示
+- TUI 协商发现 Groups 从关闭变为开启时，先完成本次 WebSocket 握手，再异步获取 `/api/session-groups`；每个请求绑定 socket generation、Session/Group 目标和独立 feature-cycle token。每次 enable/disable 状态变化或目标重置都会更换 token；重复的 `enabled=true` 不会开启新周期或重复请求。token 采用仍被旧任务/结果持有的分配身份而非可 wrap 整数，因此同一 socket、同一目标 disable→re-enable 后，旧周期响应绝不可能与新周期相等。首次短暂失败会在同一健康 socket 上执行有限退避重试（当前最多三次总尝试），同一完整绑定最多一个请求在途；绑定变化会失效旧 timer/retry/result，新 generation 可立即建立自己的刷新。只有完整绑定仍为当前且 Groups 仍开启时才应用结果，迟到响应不得清除新周期的 pending/in-flight、消耗 attempt、改写 status 或列表，也不得阻塞连接 preflight 或形成忙循环
 - 客户端必须把 token 与同一次有效配置身份一起使用；强制刷新产生的新响应应覆盖旧的并发响应
 
 ## 4.5 GET /api/config
@@ -1929,7 +1937,7 @@ Group 从开启变为关闭时，Runtime 先把活动成员 run 持久化为 `st
 }
 ```
 
-保护模式会取消活动 Agent/Group run，并禁止普通消息、图片上传、Session/Group/Todo、Session Skills 和 MCP Session policy 等 SQLite 写操作。Session、历史、Usage 和配置读取继续可用；`.lingclaw.json` 是独立文件，仍可保存。服务端不通过协议暴露原始 SQL 错误；客户端应显示本地化修复提示并要求用户修复后重启。
+首次进入保护模式时，服务端先按精确 `(session_id, connection_id)` 删除每个被取消 direct run 的 `live_round`，再通过取消令牌终止活动 Agent/Group run。这样已释放 reservation 且不会再产生终态事件的 direct run，在重连时也不会重放伪 `start`；若同一 Session 已绑定更新的连接，其 replay 状态不会被旧 run 清理。该取消不设置用户 stop 标志、不触发 `/stop` hook，也不发送伪造的 `reason: user_stop`。随后普通消息、图片上传、Session/Group/Todo、Session Skills 和 MCP Session policy 等 SQLite 写操作被禁止。Session、历史、Usage 和配置读取继续可用；`.lingclaw.json` 是独立文件，仍可保存。服务端不通过协议暴露原始 SQL 错误；客户端应显示本地化修复提示并要求用户修复后重启。
 
 ### `session`
 
@@ -2060,19 +2068,38 @@ Group 从开启变为关闭时，Runtime 先把活动成员 run 持久化为 `st
       "content": "你好，我在。",
       "timestamp": 1710000001,
       "message_index": 2,
-      "thinking": "..."
+      "thinking": "...",
+      "run_outcomes": [
+        {
+          "session_id": "main",
+          "run_id": "run-18d077d8a3eec370-1",
+          "run_connection_id": "42",
+          "status": "completed",
+          "phase": "finish",
+          "reason": "complete",
+          "duration_ms": 840,
+          "start_message_index": 1,
+          "end_message_index": 2,
+          "plan_id": null,
+          "plan_revision": null,
+          "started_at": 1710000000,
+          "finished_at": 1710000001
+        }
+      ]
     },
     {
       "role": "tool_call",
       "name": "read_file",
       "arguments": "{\"path\":\"README.md\"}",
-      "id": "call_123"
+      "id": "call_123",
+      "message_index": 3
     },
     {
       "role": "tool_result",
       "result": "file content ...",
       "id": "call_123",
       "is_error": false,
+      "message_index": 4,
       "images": [
         {
           "url": "https://...fresh-signed-url...",
@@ -2171,6 +2198,7 @@ History 顶层还可包含结构化计划历史：
 
 - `plans[]` 按计划消息位置与 revision 排序；旧 revision 带 `historical:true`，客户端必须只读折叠展示。当前 revision 带 `historical:false`
 - `status` 取值为 `planning`、`needs_input`、`ready`、`executing`、`completed`、`failed`、`stopped`、`discarded`
+- `discarded` 是服务器权威终态：客户端收到后应按当前 Session、已验证 run 和精确 `plan_id + revision` 找到关联 execution stack，包括 done 后仍挂载的已结束栈，并收口为中性结果，移除问题表单、Answer/Resume/Revise 恢复入口，只保留只读 Plan 与复制能力；点击“丢弃”本身不能乐观伪造该状态
 - `progress[].status` 取值为 `pending`、`in_progress`、`completed`、`blocked`、`skipped`；适应性步骤可能只存在于 `progress[]`，并携带 `deviation_reason`
 - `artifact.completion_checks[]` 是批准 revision 的不可变、可展示合同；空字段可能因 `skip_serializing_if` 省略。新结构化 ready revision 必须用非 `plan_progress` 的服务器检查完整覆盖 verification/acceptance；progress check 只能作为额外门禁。旧持久化结构若包含验收/验证但缺少检查，或只有 progress 自报检查，不能只凭自由文本 note 完成，需修订后重试
 - `unfinished_steps` 表示尚未被 Agent 报告为 `completed` 或 `skipped` 的步骤；服务端不会自动补成 completed。当前执行若带着未完成步骤或失败完成检查结束，计划进入 `failed`；`run_finished_with_unreported_steps` 仅用于兼容展示旧版本已经持久化的异常 `completed` 记录
@@ -2179,7 +2207,11 @@ History 顶层还可包含结构化计划历史：
 补充说明：
 
 - `todos` 工具的 `tool_call` / `tool_result` 不会进入这里的可见历史列表
-- `user` / `assistant` 项会包含 `message_index`，用于把 `plans[].message_index` 定位回对应 assistant 计划消息
+- 可见 `user`、`assistant`、`tool_call` 和 `tool_result` 项都携带原始 `message_index`；`plans[].message_index` 用它定位对应 assistant 计划消息
+- 同一存储消息可展开为多个可见项，例如中间 assistant 文本及其 `tool_call` 具有相同 `message_index`。客户端应按 `run_outcomes[]` 的闭区间及其所在的最后可见项划分 execution stack，不得把中间文本或区间内用户补充指令当成终点；初次 History、重连和加载更早消息使用同一划分，分页边界需扩展到完整运行起点。后续 Plan revision 若复用原始 user anchor，不得重新认领前一终态已经覆盖的可见项。缺失终态或尾部截断的过程仍降级为 incomplete；无步骤成功不创建空栈
+- SQLite v7 以稳定 `run_id` 保存顶层运行终态，并将每条事实附在其不可变消息边界内最后一个可见 History 项的 `run_outcomes[]`。`status` 为 `completed`、`failed`、`blocked`、`waiting_user`、`partial`、`stopped` 或 `incomplete`；同一事实还携带 phase/reason/duration、连接身份、边界、可选 Plan 身份与时间。准确 run 的生产协程在 gate 外只冻结其消息尾、精确预期/替换 Plan、Sub-agent 快照和失败工具标记；最终按 `Session persist gate -> sessions lock -> 合并最新 Session -> 释放 sessions lock -> SQLite transaction -> 释放 gate` 提交 outcome、合并后的 Session 与最终 Plan。先提交的 Todos/revision、模型/Effort、Usage、工作目录绑定和其他非 run 字段必须保留；消息尾或 Plan 代际变化则 fail-closed。Plan 完成/失败不会先由独立保存或事件广播暴露。状态机仅允许在 `PreCommit` 做最后一次精确 Stop 仲裁；进入 `CommitChosen` 后必须等待不可撤销的 `tokio-rusqlite` 操作返回明确结果，成功后才在同一代际上字段级更新内存并广播缓存的 hook/Plan/terminal 事件。异步 live dispatcher 不会重新读取更晚的 Session。读取会在同一次数据库 read 中取得并验证真实连续消息数，负数、反向、空 transcript 或超出实际消息数的边界均视为存储损坏并进入保护模式。客户端必须以该事实恢复重启/重连后的 execution stack；只有旧数据库或确实缺失事实的过程才安全降级为 `incomplete`。保存逐项验证每条旧事实原消息区间的指纹与位置；只删除区间内实际发生修改、删除或移位的事实。区间外 system 时间/Goal/Observation 更新、无关消息编辑与普通 append 会保留该事实，不能猜测重新绑定到不同消息
+- `start_message_index` 来自 reservation 时捕获的精确 user-message 指纹锚点，而不是缓存数组下标。BeforeAnalyze 自动压缩、前缀裁剪或签名 URL 规范化后，服务端必须重新解析同一锚点；缺失或无法区分的重复锚点会安全拒绝终态提交。PlanOnly 刷新/反馈若在同一终态事务注册新 revision，`plan_id` / `plan_revision` 必须取最终 replacement Plan
+- 后台 Memory/Reflection 的 Usage 在 Provider 成功后按唯一 operation id 以增量方式提交；幂等标记、总量、日量和 Provider/role label 位于同一 SQLite 事务，并与顶层终态共用 Session persist gate。Memory 的提交发生在提取 JSON 解析、merge 和私有文件保存之前，因此 Provider 已成功后的无效 JSON 或保存失败仍保留 Usage。Session 未加载到内存不影响持久提交；SQLite Session 已被并发删除时返回正常 `Missing` 领域结果，不进入 storage protection。App-owned auxiliary registry 把任务绑定到 canonical Session allocation 与功能 enable cycle；Session 删除先关闭注册并 drain 精确 allocation，再获取 persist gate，功能热禁用、storage protection 与 graceful shutdown 也会取消并等待注册任务。私有 Memory/Reflection/audit 写入还需在注册表内取得 operation-scoped 写许可：取消先赢时不启动写入，写入先赢时 teardown 会等待任务退出。Session ready/recreate 与 connection binding 使用同一个 canonical control lock，删除取得 persist gate 后再次核对 exact closed lifetime 和活动 connection/run，并持锁至私有 Home 清理完成；并发重连不会留下已删除 Session 的幽灵连接或旧 allocation 任务
 - 顶层 `tool_result.images` 以及 `subagent_snapshot.tools[].images` 为可选字段；每项只包含新鲜签名的 `url`、展示 `name` 和经过校验的 `mime_type`，不会暴露 object key、S3 配置身份或 Base64。若历史图片所属的 S3 配置身份已失效，该图片会被跳过，文本结果仍正常回放
 - 前端应使用 `todos_state` 渲染 todo 面板，而不是从 `history.messages` 反推
 
@@ -2192,6 +2224,8 @@ History 顶层还可包含结构化计划历史：
 ```json
 {
   "type": "start",
+  "run_id": "run-18d077d8a3eec370-1",
+  "run_connection_id": "42",
   "round": 3,
   "phase": "analyze",
   "cycle": 1,
@@ -2212,6 +2246,9 @@ History 顶层还可包含结构化计划历史：
 
 - `model` / `think_level` 表示本轮实际使用的模型与思维级别；它们可能与静态配置不同，例如被运行时路由或 Hook 覆盖
 - `phase` / `cycle` 为当前顶层主代理的 live runtime 状态
+- `run_id` 是服务器为一次顶层 reservation 生成的稳定 opaque 身份，同一 run 的多个 ReAct cycle、live replay 与终态保持不变；它也作为 SQLite terminal outcome 的主身份。客户端不能自行生成或用文本内容推断
+- `run_connection_id` 是服务器分配的 opaque 字符串，标识拥有该顶层 run 的 WebSocket connection epoch；实时 `start` 与重连生成的 replay `start` 使用相同值。客户端必须把它与本地新建的 client-run 序列共同绑定，不能让任意当前 run 认领旧连接的终态
+- 仅当协商结果明确为 legacy（`protocols.execution_identity` 缺失），客户端才可为首个 socket generation 上缺少该字段的 `start` 合成连接内身份；严格协议下缺失字段的 `start` 是可见的协议错误，不能进入 busy
 - 以 `auto_*` 开头的字段仅在 `/think auto` 且当前模型支持 reasoning effort 时出现，用于给 `/status` 与重连回放提供实时摘要
 
 ### `auto_trace`
@@ -2723,8 +2760,11 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
 ```json
 {
   "type": "done",
+  "run_id": "run-18d077d8a3eec370-1",
+  "run_connection_id": "42",
   "phase": "finish",
   "reason": "complete",
+  "duration_ms": 840,
   "cycles": 3,
   "tool_calls": 5,
   "daily_input_tokens": 300,
@@ -2736,13 +2776,20 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
 }
 ```
 
+`done` 并非所有失败运行都必然发送：请求预算超限、Provider/Analyze 失败等 `run_failed` 路径会以带 `run_terminal: true` 的 `error` 独立结束本轮，之后可能再发送匹配的 `plan_state(failed)`，但不会补发 `done`。顶层 `done` 与终态 `error` 都携带和对应 `start` 相同的 `run_id + run_connection_id`；`duration_ms` 是服务端运行事实，缺失时由同一 run 的服务器开始时间计算，而不是由客户端猜测。客户端只在该服务器身份和本地 client-run 序列均匹配时收口活动 run，同时保留按 server/client run 与 Plan ID 关联的终态视图，以便同一运行的迟到 `plan_state` 或兼容性 `done` 原位更新。若精确匹配的 attention `done` 到达前没有 Tool/Reasoning/ReAct/Plan 步骤，客户端仍创建唯一、身份化的终态栈并呈现摘要、ARIA 和恢复入口；`finish/complete` 的无步骤成功运行不创建空噪音栈。若终态 user-message 指纹锚点缺失或歧义，服务端发送一次 `phase=incomplete` / `code=terminal_identity_unavailable` 的终态 error，不发送 `done`，也不猜写 SQLite outcome；客户端收口精确 live stack，但后续 History 安全显示 incomplete。若重连或 History/Session reset 已丢弃该关联，无身份或身份不匹配的迟到 `done` 不得创建/修改 execution stack、清除 busy 或结束新的 run；其中的全局 Usage 总数仍可独立应用。仅明确协商的 legacy 首连接可用 socket-generation 合成身份收口无字段终态，该连接断开后不再兼容。严格协议中，当前活动 run 的无身份 `done`/终态 `error` 会关闭该准确连接并保持 fail-closed，而没有活动/待确认 run 的迟到无身份终态只会被忽略。`run_terminal: false` 或缺失字段均为非终态，新 run、Session/History 切换或重连不得复用旧关联。服务器在终态生产点、释放 run reservation 与处理待重跑输入前，以精确 `run_id` 冻结 outcome 与 run-owned patch；取得唯一 persist gate 后才从内存读取最新 Session 并字段级合并，在一个 SQLite transaction 中不可取消地等待所选提交结果。成功确认后才按同一代际更新内存并依次发送缓存的 hook/Plan 事件与终态，再交给异步 dispatcher 转发。写入错误进入现有 storage-protected 路径，且不会假定已排队的 SQLite 事务可由丢弃 async future 撤销。
+
 补充说明：
+
+- 普通执行尚有未恢复的工具或委派失败时，发送并持久化 `done phase=partial reason=unresolved_tool_failures`。相同规范调用的成功重试会恢复旧失败；读取同一文件时允许修正行范围，搜索内容、命令、子任务输入及其他动作参数不得被忽略。失败详情仍保留，partial 不自动折叠；只有完全恢复才允许 `finish/complete`。
+- PlanOnly 提交阻塞问题时，终态为 `waiting_user/needs_input`。随后 Discard 的权威 Plan 状态会中性收口相同 Session/run/Plan revision 的栈，清除恢复文本并保留原耗时；旧 revision 或更旧更新不能回退现态。
+- `hard_cap` 等 incomplete/partial/blocked 异常出口会把相同代际的 planning/executing Plan 更新为 failed，并与 run outcome 原子保存后才广播；已报告进度、检查和批准信息保留。执行中断可 Resume/Revise/Discard，未批准规划可 Revise/Discard。数据库失败或 Plan 代际不符不会提前发布失败 Plan。
 
 - 用户主动停止时，可能是：
 
 ```json
 {
   "type": "done",
+  "run_connection_id": "42",
   "phase": "stopped",
   "reason": "user_stop"
 }
@@ -2753,6 +2800,7 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
 ```json
 {
   "type": "done",
+  "run_connection_id": "42",
   "phase": "failed",
   "reason": "incomplete_plan"
 }
@@ -2763,6 +2811,8 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
 ```json
 {
   "type": "error",
+  "run_terminal": true,
+  "run_connection_id": "42",
   "code": "plan_completion_contract_failed",
   "plan_id": "plan_...",
   "revision": 2,
@@ -2781,12 +2831,13 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
 ```json
 {
   "type": "done",
+  "run_connection_id": "42",
   "phase": "failed",
   "reason": "completion_contract_failed"
 }
 ```
 
-若 Finish 验证因 `/stop`、连接/run cancellation 或服务关闭被取消，不会发送上述错误，也不会由 verifier 写入 Completed/Failed；正常的外层运行终止流程负责持久化 `stopped`。若验证超过硬截止时间，`checks[]` 使用稳定的 `check_id: "completion-contract-timeout"` 和非敏感原因，并按合同失败结束。
+若 Finish 验证或其后的 `OnFinish` hook、Usage 聚合、persist gate/run-owned patch 准备在 `PreCommit` 因 `/stop`、连接/run cancellation 或服务关闭被取消，不会发送上述错误、Plan/hook 事件或自然 `done`，也不会排入 Memory/Reflection；正常的外层运行终止流程在唯一事务中原子持久化 stopped Plan、Session 与 outcome。数据库任务入队前会再做一次精确 Stop 仲裁；一旦进入 `CommitChosen`，该 SQLite future 不再参与 cancellation `select!`，提交成功的自然终态保持唯一权威事实，随后到达的 Stop 不会另写 `stopped`。若验证超过硬截止时间，`checks[]` 使用稳定的 `check_id: "completion-contract-timeout"` 和非敏感原因，并按合同失败结束。
 
 ## 5.3.3 上下文维护事件
 
@@ -2832,12 +2883,15 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
 
 ### `task_started`
 
+`task_id` 是独立的随机委派身份；可选 `parent_tool_call_id` 是发起该 task 的真实顶层工具调用 ID，客户端不能用 Agent 名称或事件顺序猜测关联。正常启动与根据子工具输出补发的启动事件都保留该关系，live/replay/history 按同一父调用计数一次，原工具检查器与委派详情仍可查看。没有可信父 ID 的旧事件保持兼容，但不猜测去重。Orchestration 继续使用其既有父调用字段。
+
 主代理通过 `task` 工具发起子代理任务。
 
 ```json
 {
   "type": "task_started",
   "task_id": "task-1",
+  "parent_tool_call_id": "call-1",
   "agent": "reviewer",
   "prompt": "..."
 }
@@ -2915,6 +2969,7 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
 {
   "type": "orchestrate_started",
   "orchestrate_id": "abc123",
+  "parent_tool_call_id": "call_abc123",
   "task_count": 3,
   "layer_count": 2,
   "tasks": [
@@ -2927,6 +2982,8 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
   ]
 }
 ```
+
+`parent_tool_call_id` 可选，绑定顶层 `tool_call.id`。客户端据此将工具检查器与编排面板视为一次调用，进度按真实子任务计数；旧服务端缺失该字段时不得猜测绑定。
 
 ### `orchestrate_layer`
 
@@ -3046,7 +3103,44 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
 ```json
 {
   "type": "error",
+  "run_terminal": false,
   "content": "..."
+}
+```
+
+`run_terminal` 是服务器权威的顶层运行作用域标记：只有严格等于 `true`，并且终态 `error` 的 `run_connection_id` 与当前 client-run 绑定的服务器身份匹配时，`error` 才是可独立结束该 run 的终态事实，并解除 busy/ReAct/timer 状态。终态错误由服务端自动加入该身份；非终态错误不需要它。仅协商为 legacy 的首个 socket generation 可把无字段终态绑定到该连接先前的无字段 `start`；断线、History/Session reset 或第二连接后，这条兼容路径失效。`false` 或缺失字段必须 fail-safe 为非终态；busy `/think`、command hook、Plan action、Session/模型/工作区预检等错误只展示错误卡，活动运行及其 `live_round` 继续。空闲状态错误同样不得创建或复用 execution stack。Storage protection 通过独立 `storage_status` 事件收口精确匹配的活动 direct run；Plan action、Session/Group transition 或 Group-only busy 不属于顶层 direct run，不得生成执行栈。
+
+真实顶层运行的 Provider、请求构造或上下文预算失败可携带 `diagnostic: {"code":"..."}`。该字段只有封闭类别，没有上游正文、URL、header 或凭据；`content` 使用固定安全文案，客户端按类别本地化。持久化时类别码写入同一 run outcome 的 `reason`，History 重建相同的 `diagnostic`；不新增 SQLite 列或改变 schema v7。类别/原因不一致或非 failed 事实携带诊断会被拒绝。旧记录没有可识别类别时省略该字段并安全降级。
+
+分类保留错误来源：只有本地请求发送层生成的真实 HTTP 状态、连接或请求构造错误可使用对应 transport 类别。Provider 的 JSON/SSE 错误字段先由适配器加固定协议封装，包括 Responses 根级 `message`、嵌套 error 与 incomplete detail；HTTP200 中的上游自由文本即使以 `API 401`、`HTTP error:` 或 `Provider configuration error:` 开头，也仍按上游响应失败处理，不能触发本地 transport 诊断或重试/能力降级。历史已存的错误码按原事实读取，不重新扫描旧正文猜测来源。
+
+| `diagnostic.code` | 含义 | 恢复内容 |
+|---|---|---|
+| `provider_authentication` | HTTP 401/403 | 检查 Models 中的凭据与权限 |
+| `provider_rate_limited` | HTTP 429 | 等待后重试，检查服务限额 |
+| `provider_unavailable` | HTTP 408/5xx | 稍后重试或换用已配置模型 |
+| `provider_connection` | 本地 transport 连接失败 | 检查网络及 Models 中的地址 |
+| `provider_request_rejected` | 其他 HTTP 4xx | 检查模型、协议和请求能力 |
+| `provider_response_invalid` | 无法使用的 Provider 响应 | 检查模型和协议 |
+| `model_configuration` | 本地 request builder 拒绝配置 | 检查 Provider 地址或凭据 |
+| `context_budget_exceeded` | 真实运行的输入预算不足 | 减少上下文/推理强度或选择更大窗口模型 |
+
+客户端“查看错误”打开当前精确 run 的安全诊断详情，合适时提供 Models 入口；不能复制成多条错误卡，也不能因为普通 Composer 配置预检失败而创建不存在的 run、消息锚点或 outcome。终态身份、事务、Stop 仲裁及 Plan 代际规则保持不变。
+
+终态消息锚点无法安全解析时使用以下 live-only 错误；它只负责收口准确客户端运行，不能据此生成持久 outcome：
+
+```json
+{
+  "type": "error",
+  "run_terminal": true,
+  "run_id": "run-18d077d8a3eec370-1",
+  "run_connection_id": "42",
+  "phase": "incomplete",
+  "reason": "terminal_identity_unavailable",
+  "code": "terminal_identity_unavailable",
+  "content": "LingClaw could not safely bind this run's final state to its originating message...",
+  "dismissible": true,
+  "recoverable": true
 }
 ```
 
@@ -3060,6 +3154,19 @@ OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合
   "content": "..."
 }
 ```
+
+Agent 级瞬态 LLM 重试使用结构化变体，而不是带完整 Provider 错误正文的永久 system 消息：
+
+```json
+{
+  "type": "progress",
+  "kind": "llm_retry",
+  "attempt": 2,
+  "max_attempts": 2
+}
+```
+
+客户端应在当前运行栈中短暂显示 attempt；收到 token/Tool 或终态后清除。若最终仍失败，带 `run_terminal:true` 的错误/执行栈是唯一持久可见错误正文，不能再复制 retry notice。
 
 ## 6. 图片输入协议细节
 
@@ -3135,12 +3242,13 @@ Provider 映射如下：
 如果要从零接入一个客户端，建议顺序如下：
 
 1. 轮询或请求 `GET /api/health`，确认服务可用
-2. 建立 `/ws` 连接
-3. 收到 `session`、`view_state`、`todos_state`、`history` 后初始化 UI
-4. 发送纯文本，或发送带 `text` / `plan_mode` / `images` 的 JSON 消息；通过 `plan_state` 驱动提问、修订与进度 UI，并使用带 `plan_id + revision` 的 `plan_action` 执行计划
-5. 处理 `start -> delta/thinking/tool/* -> done`
-6. 如需本地上传图片：
-   - 先调用 `GET /api/client-config`
+2. 在每一个连接意图中调用 `GET /api/client-config` 并协商 `protocols.execution_identity`，以意图 token 和目标淘汰迟到响应；未知版本或请求失败时不建立执行 WebSocket
+3. 建立 `/ws` 连接
+4. 收到 `session`、`view_state`、`todos_state`、`history` 后初始化 UI
+5. 发送纯文本，或发送带 `text` / `plan_mode` / `images` 的 JSON 消息；通过 `plan_state` 驱动提问、修订与进度 UI，并使用带 `plan_id + revision` 的 `plan_action` 执行计划
+6. 处理 `start -> delta/thinking/tool/* -> done|error(run_terminal=true)`；仅显式终态错误收口当前 run，`false`/缺失字段只显示错误并继续；终态 `error` 后仍可能收到同一 Plan 的 `plan_state`，且失败路径不保证再有 `done`
+7. 如需本地上传图片：
+   - 复用或强制刷新 `GET /api/client-config` 的上传身份
    - 再调用 `POST /api/upload-images`
    - 校验响应顶层及逐图 `s3_config_id` 与当前身份一致
    - 最后把 `url + object_key + attachment_token + s3_config_id` 带回 WebSocket 消息

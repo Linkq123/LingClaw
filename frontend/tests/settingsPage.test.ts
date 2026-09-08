@@ -1,4 +1,5 @@
 import React from 'react';
+import { readFileSync } from 'node:fs';
 import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
@@ -438,6 +439,10 @@ describe('SettingsPage shell layout and dirty state', () => {
     expect(tabs).toHaveLength(7);
     expect(tabs.map((tab) => tab.textContent?.trim()).join(' ')).toContain('Usage');
     expect(findCloseButton().getAttribute('aria-label')).toBe('Back to workspace');
+    expect(document.querySelectorAll('button.console-return-button')).toHaveLength(1);
+    expect(document.querySelectorAll('#settings-save-btn')).toHaveLength(1);
+    expect(document.querySelector('.console-mobile-back')).toBeNull();
+    expect(document.querySelector('.settings-mobile-save')).toBeNull();
     expect(
       tabs.every(
         (tab) =>
@@ -479,6 +484,57 @@ describe('SettingsPage shell layout and dirty state', () => {
       baseConfigFileEtag: 'a'.repeat(64),
     });
     expect(save.disabled).toBe(true);
+  });
+
+  it('associates common Settings labels and keeps one active Console h1 across views', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: { settings: { port: 18989, execTimeout: 30, enableGroups: false } },
+            configFileEtag: 'b'.repeat(64),
+          }),
+        ),
+      ),
+    );
+    ({ root } = await renderSettingsPage());
+    await openAndLoad('label-session');
+
+    const generalRows = Array.from(
+      document.querySelectorAll<HTMLElement>('#tab-general-panel .settings-row'),
+    );
+    expect(generalRows.length).toBeGreaterThan(5);
+    for (const row of generalRows) {
+      const label = row.querySelector<HTMLLabelElement>(':scope > label');
+      const control = row.querySelector<HTMLElement>(
+        ':scope > input, :scope > select, :scope > textarea',
+      );
+      expect(label, row.textContent || 'Settings row').not.toBeNull();
+      expect(control, row.textContent || 'Settings row').not.toBeNull();
+      expect(control?.id).not.toBe('');
+      expect(label?.htmlFor).toBe(control?.id);
+      expect(control?.getAttribute('aria-labelledby')).toBe(label?.id);
+    }
+    expect(document.querySelectorAll('h1')).toHaveLength(1);
+    expect(document.querySelector('h1')?.textContent).toContain('General');
+
+    await act(async () => {
+      findButtonByText('Models').click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelectorAll('h1')).toHaveLength(1);
+    expect(document.querySelector('h1')?.textContent).toContain('Models');
+    expect(document.querySelector('#tab-models-panel h2')).not.toBeNull();
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-tab="tab-usage"]')?.click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelectorAll('h1')).toHaveLength(1);
+    expect(document.querySelector('h1')?.textContent).toContain('Usage');
+    expect(document.querySelector('#tab-usage-panel h2')).not.toBeNull();
   });
 
   it('keeps an unsaved Settings draft mounted while visiting Usage', async () => {
@@ -1000,6 +1056,7 @@ describe('SettingsPage shell layout and dirty state', () => {
 
     expect(document.querySelectorAll('.models-console-card')).toHaveLength(2);
     expect(document.body.textContent).toContain('Configuration changed elsewhere.');
+
     expect(save.disabled).toBe(true);
   });
 
@@ -1048,11 +1105,11 @@ describe('SettingsPage shell layout and dirty state', () => {
     expect(save.disabled).toBe(true);
     expect(document.body.textContent).toContain('Configuration changed elsewhere.');
 
-    const mobileReload = document.querySelector<HTMLButtonElement>('.settings-mobile-reload');
-    expect(mobileReload?.textContent).toContain('Reload latest');
+    const reload = document.querySelector<HTMLButtonElement>('.console-reload-button');
+    expect(reload?.textContent).toContain('Reload latest');
 
     await act(async () => {
-      mobileReload?.click();
+      reload?.click();
       await flushMicrotasks();
     });
 
@@ -1061,62 +1118,151 @@ describe('SettingsPage shell layout and dirty state', () => {
     expect(save.disabled).toBe(true);
   });
 
-  it('keeps local edits on a config conflict and reloads only on request', async () => {
-    let getCount = 0;
-    const fetchMock = vi.fn<typeof fetch>((input, init) => {
-      const url = typeof input === 'string' ? input : input.url;
-      if (url === '/api/config' && init?.method === 'PUT') {
-        return Promise.resolve(
-          jsonResponse(
-            {
-              error: 'Configuration changed',
-              configRevision: 21,
-              configFileEtag: 'b'.repeat(64),
-            },
-            409,
-          ),
-        );
+  it.each(['general', 'agents'] as const)(
+    'keeps %s edits after ETag 409 and saves again after explicit mobile recovery',
+    async (section) => {
+      let getCount = 0;
+      const putBodies: Array<{ baseConfigFileEtag?: string; config?: Record<string, unknown> }> =
+        [];
+      const fetchMock = vi.fn<typeof fetch>((input, init) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url === '/api/config' && init?.method === 'PUT') {
+          putBodies.push(JSON.parse(String(init.body || '{}')));
+          if (putBodies.length > 1) {
+            return Promise.resolve(
+              jsonResponse({ ok: true, configRevision: 22, configFileEtag: 'c'.repeat(64) }),
+            );
+          }
+          return Promise.resolve(
+            jsonResponse(
+              {
+                error: 'Configuration changed',
+                configRevision: 21,
+                configFileEtag: 'b'.repeat(64),
+              },
+              409,
+            ),
+          );
+        }
+        if (url === '/api/config') {
+          getCount += 1;
+          return Promise.resolve(
+            jsonResponse({
+              path: '/tmp/config.json',
+              config:
+                getCount > 2
+                  ? putBodies.at(-1)?.config
+                  : {
+                      settings: { port: getCount === 1 ? 18989 : 19191 },
+                      models: {
+                        providers: {
+                          mock: {
+                            baseUrl: 'https://example.test/v1',
+                            apiKey: 'test',
+                            api: 'openai-completions',
+                            models: [{ id: 'one' }, { id: 'two' }],
+                          },
+                        },
+                      },
+                      agents: { defaults: { model: { primary: 'mock/one' } } },
+                    },
+              configRevision: Math.min(22, 19 + getCount),
+              configFileEtag: (getCount === 1 ? 'a' : getCount === 2 ? 'b' : 'c').repeat(64),
+            }),
+          );
+        }
+        throw new Error(`Unexpected fetch URL: ${url}`);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      ({ root } = await renderSettingsPage());
+      await openAndLoad();
+      if (section === 'agents') {
+        await act(async () => {
+          openSettingsPage('main', 'tab-agents');
+          await flushMicrotasks();
+        });
       }
-      if (url === '/api/config') {
-        getCount += 1;
-        return Promise.resolve(
-          jsonResponse({
-            path: '/tmp/config.json',
-            config: { settings: { port: getCount === 1 ? 18989 : 19191 } },
-            configRevision: getCount === 1 ? 20 : 21,
-            configFileEtag: (getCount === 1 ? 'a' : 'b').repeat(64),
-          }),
-        );
+      const save = document.getElementById('settings-save-btn');
+      if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+      const field =
+        section === 'general'
+          ? findInputByPlaceholder('18989')
+          : document.querySelector<HTMLSelectElement>('.agent-role-grid select');
+      if (!field) throw new Error('Config field not found');
+      const edit = () => {
+        if (field instanceof HTMLInputElement) setInputValue(field, '19000');
+        else {
+          field.value = 'mock/two';
+          field.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      };
+
+      await act(async () => {
+        edit();
+        await flushMicrotasks();
+        save.click();
+        await flushMicrotasks();
+      });
+
+      expect(field.value).toBe(section === 'general' ? '19000' : 'mock/two');
+      expect(save.disabled).toBe(true);
+      expect(document.body.textContent).toContain('Configuration changed elsewhere.');
+      const reload = findButtonByText('Reload latest');
+      expect(document.querySelectorAll('.console-reload-button')).toHaveLength(1);
+      expect(reload.closest('.has-config-conflict')).not.toBeNull();
+      const style = document.createElement('style');
+      style.textContent = readFileSync('src/css/console.css', 'utf8');
+      document.head.appendChild(style);
+      const hiddenRules: string[] = [];
+      for (const group of Array.from(style.sheet!.cssRules)) {
+        const media = group as CSSMediaRule;
+        if (media.conditionText !== '(max-width: 768px)') continue;
+        for (const item of Array.from(media.cssRules)) {
+          const rule = item as CSSStyleRule;
+          if (
+            rule.selectorText &&
+            reload.matches(rule.selectorText) &&
+            rule.style.getPropertyValue('display') === 'none'
+          )
+            hiddenRules.push(rule.selectorText);
+        }
       }
-      throw new Error(`Unexpected fetch URL: ${url}`);
-    });
-    vi.stubGlobal('fetch', fetchMock);
+      style.remove();
+      expect(
+        hiddenRules,
+        'mobile configuration conflicts must retain a visible Reload latest',
+      ).toHaveLength(0);
+      reload.focus();
+      expect(document.activeElement).toBe(reload);
 
-    ({ root } = await renderSettingsPage());
-    await openAndLoad();
-    const save = document.getElementById('settings-save-btn');
-    if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+      await act(async () => {
+        reload.click();
+        await flushMicrotasks();
+      });
 
-    await act(async () => {
-      setInputValue(findInputByPlaceholder('18989'), '19000');
-      await flushMicrotasks();
-      save.click();
-      await flushMicrotasks();
-    });
-
-    expect(findInputByPlaceholder('18989').value).toBe('19000');
-    expect(save.disabled).toBe(true);
-    expect(document.body.textContent).toContain('Configuration changed elsewhere.');
-
-    await act(async () => {
-      findButtonByText('Reload latest').click();
-      await flushMicrotasks();
-    });
-
-    expect(getCount).toBe(2);
-    expect(findInputByPlaceholder('18989').value).toBe('19191');
-    expect(save.disabled).toBe(true);
-  });
+      expect(getCount).toBe(2);
+      expect(field.value).toBe(section === 'general' ? '19191' : 'mock/one');
+      expect(save.disabled).toBe(true);
+      await act(async () => {
+        edit();
+        await flushMicrotasks();
+        save.click();
+        await flushMicrotasks();
+      });
+      expect(putBodies.map((body) => body.baseConfigFileEtag)).toEqual([
+        'a'.repeat(64),
+        'b'.repeat(64),
+      ]);
+      expect(putBodies[1].config).toMatchObject(
+        section === 'general'
+          ? { settings: { port: 19000 } }
+          : { agents: { defaults: { model: { primary: 'mock/two' } } } },
+      );
+      expect(document.querySelector('.console-reload-button')).toBeNull();
+      expect(save.disabled).toBe(true);
+    },
+  );
 
   it('lets the corrupt-config editor reload its ETag after a save conflict', async () => {
     let getCount = 0;
